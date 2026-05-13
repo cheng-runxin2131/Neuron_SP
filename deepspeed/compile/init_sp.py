@@ -87,8 +87,21 @@ def init_autosp(config):
     _desloc_enabled = _desloc_cfg.get('enabled', False)
     _desloc_Kx = _desloc_cfg.get('Kx', 1)
 
+    # M343-C34: Heterogeneous mesh strategy selection.
+    # Pattern: Megatron initialize_model_parallel accepts an `order` param
+    # that controls how ranks are mapped to TP/CP/DP groups.
+    # We add a `mesh_strategy` param that controls SP group formation.
+    _hetero_cfg = config._param_dict.get('hetero_mesh', {})
+    _mesh_strategy = _hetero_cfg.get('strategy', 'contiguous')
+
+    if _mesh_strategy != 'contiguous':
+        from .custom_ops.hetero_mesh import populate_hetero_registry
+        populate_hetero_registry(sp_size, dp_size, strategy=_mesh_strategy)
+    # else: populate_registry called inside apply_autosp (standard path)
+
     if dist.get_rank() == 0:
-        print(f"[AutoSP] sp={sp_size} dp={dp_size} desloc={_desloc_enabled} Kx={_desloc_Kx}")
+        print(f"[AutoSP] sp={sp_size} dp={dp_size} desloc={_desloc_enabled} "
+              f"Kx={_desloc_Kx} mesh_strategy={_mesh_strategy}")
 
     def backend_fn(gm: GraphModule, real_inputs):
         apply_autosp(gm, real_inputs, debug=False, sp_size=sp_size, dp_size=dp_size)

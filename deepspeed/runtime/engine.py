@@ -373,6 +373,22 @@ class DeepSpeedEngine(Module):
                     f"AC={self._desloc_ac_mode}"
                     f"{' ('+str(_ac_layers)+' layers)' if _ac_layers > 0 else ''}"
                 )
+
+        # M343-C34: Heterogeneous sync gate for mixed-cluster deployments.
+        # Pattern: Megatron DistributedDataParallel tracks grad-ready
+        # buckets per-parameter group; we track per-tier sync readiness.
+        self._hetero_sync_gate = None
+        _hetero_cfg = config.get('hetero_mesh', {}) if isinstance(config, dict) else {}
+        if _hetero_cfg.get('adaptive_sync', False) and self.desloc_enabled:
+            from deepspeed.compile.custom_ops.bloombee_bridge import (
+                HeteroSyncGate, HeteroSyncConfig
+            )
+            self._hetero_sync_gate = HeteroSyncGate(HeteroSyncConfig(
+                base_Kx=self.desloc_Kx,
+                adaptive_enabled=True,
+                straggler_threshold=_hetero_cfg.get('straggler_threshold', 2.0),
+                max_Kx=_hetero_cfg.get('max_Kx', 32),
+            ))
         self.enable_backward_allreduce = True
         self.inside_no_sync_ctxt = False
         self.progressive_layer_drop = None
@@ -2832,6 +2848,21 @@ class DeepSpeedEngine(Module):
     def _backward_epilogue(self):
         self._stop_timers(self.engine_timers.backward_inner_timers)
         self._start_timers(self.engine_timers.backward_reduce_timers)
+
+        # System Issue 4 fix: Enforce A2A handle high-water mark BEFORE
+        # AllReduce to prevent unbounded handle accumulation during long
+        # DES-LOC Kx periods. Without this, NCCL internal buffers grow
+        # indefinitely when handles aren't waited on.
+        # Pattern: NCCL group.cc flushes at ncclGroupEnd; we flush here.
+        if self._desloc_sp_enabled:
+            try:
+                from deepspeed.compile.custom_ops.hetero_mesh import (
+                    enforce_handle_high_water_mark
+                )
+                enforce_handle_high_water_mark()
+            except ImportError:
+                pass
+
         if self.enable_backward_allreduce and not self.inside_no_sync_ctxt:
             # Traditional code path that allreduces the module parameter grads
             self.allreduce_gradients()
@@ -5035,6 +5066,27 @@ class DeepSpeedEngine(Module):
 
         compile_config = self._config.compile_config
         compile_kwargs['fullgraph'] = True
+
+        # System Issue 3 fix: Validate dtype consistency across SP groups.
+        # Mixed compute capabilities (e.g., V100+H100) can cause NCCL A2A
+        # failures when bf16 is enabled but some GPUs don't support it.
+        _training_dtype = torch.float32
+        if hasattr(self._config, 'bf16') and self._config.bf16.get('enabled', False):
+            _training_dtype = torch.bfloat16
+        elif hasattr(self._config, 'fp16') and self._config.fp16.get('enabled', False):
+            _training_dtype = torch.float16
+
+        try:
+            from deepspeed.compile.custom_ops.hetero_mesh import (
+                get_hetero_plan, validate_sp_group_dtype_consistency
+            )
+            plan = get_hetero_plan()
+            if plan is not None:
+                dtype_warnings = validate_sp_group_dtype_consistency(plan, _training_dtype)
+                for w in dtype_warnings:
+                    logger.warning(w)
+        except ImportError:
+            pass
 
         # M354: Log composition state for experiment tracking.
         _desloc_cfg = self._config._param_dict.get('desloc', {})
