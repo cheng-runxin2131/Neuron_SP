@@ -2781,18 +2781,13 @@ class DeepSpeedEngine(Module):
                   f"sp={self._desloc_sp_enabled} "
                   f"zero={self.zero_optimization_stage()}")
 
-        # M361(f): Fence pending SP A2A handles before DP AllReduce.
-        # On heterogeneous GPUs, H100 finishes backward faster → enters AllReduce
-        # while A6000 still has A2A in flight → NCCL deadlock.
-        # Pattern: Megatron finish_grad_sync().wait() before starting next collective.
-        if self._desloc_sp_enabled:
+        if self._desloc_sp_enabled or self.compile_autosp():
             try:
                 from deepspeed.compile.custom_ops.sp_dp_registry import fence_before_dp_sync
                 fence_before_dp_sync()
             except ImportError:
                 pass
 
-        # Skip gradient reduction when DeepCompile is enabled
         if self.is_deepcompile_active() and not self.compile_autosp():
             return
 
