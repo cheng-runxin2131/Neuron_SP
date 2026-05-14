@@ -1,8 +1,3 @@
-# Copyright (c) Microsoft Corporation.
-# SPDX-License-Identifier: Apache-2.0
-
-# DeepSpeed Team
-
 from typing import Callable, Any, List, Dict, Optional
 from collections import defaultdict
 
@@ -21,7 +16,6 @@ def get_output_node(graph: Graph):
 
 def move_primals_to_head(graph: Graph):
 
-    # Move primals to the head of the graph
     primals = [n for n in graph.nodes if n.op == "placeholder"]
     non_primals = [n for n in graph.nodes if n.op != "placeholder"]
     all_nodes = primals + non_primals
@@ -42,7 +36,6 @@ def add_args_process(graph: Graph,
                      extra_args: List[int] = [],
                      name=None,
                      meta={}) -> List[Node]:
-    # Apply fn to all args of node
     new_nodes = []
     with graph.inserting_before(node):
         target_args = [arg for arg in node.args if isinstance(arg, Node)]
@@ -64,10 +57,9 @@ def add_postprocess(graph: Graph,
                     extra_kwargs: Dict[str, Any] = {},
                     name=None,
                     meta={}) -> Node:
-    # https://github.com/pytorch/examples/blob/main/fx/wrap_output_dynamically.py
     with graph.inserting_after(node):
         args = (node, )
-        for a in extra_args:  # To add ds_id
+        for a in extra_args:
             args += (a, )
 
         node_users = node.users.keys()
@@ -101,7 +93,6 @@ def add_free_activations(graph_id: int, graph: Graph, activation_node_names: Lis
     for node in graph.nodes:
         if node.target == torch.ops.dc.reload_tensor.default:
             offload_act = node.args[0]
-            # node_to_offload_id[offload_act] = node.args[2]
             offload_id_to_node[node.args[2]] = offload_act
         elif node.target == torch.ops.dc.wait_reload.default:
             offload_id = node.args[2]
@@ -135,9 +126,6 @@ def add_free_activations(graph_id: int, graph: Graph, activation_node_names: Lis
         with graph.inserting_after(last_user):
             args = (activation_args, )
             graph.create_node('call_function', torch.ops.dc.free_tensors.default, args, {}, name=node_name)
-
-            # Python version for debugging
-            # graph.create_node('call_function', free_tensors, args, {}, name=node_name)
 
 
 def find_node_by_name(gm: GraphModule, name: str) -> Optional[Node]:

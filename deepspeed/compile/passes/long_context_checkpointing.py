@@ -1,10 +1,6 @@
-# Copyright (c) Microsoft Corporation.
-# SPDX-License-Identifier: Apache-2.0
-
-# DeepSpeed Team
-
 import inspect
 import logging
+import threading
 import textwrap
 import torch._functorch.partitioners as _partitioners
 
@@ -74,50 +70,65 @@ _NEEDLE = '    def should_ban_recomputation('
 
 _ORIGINAL_SOLVE_MIN_CUT = _partitioners.solve_min_cut
 
+_PATCH_LOCK = threading.Lock()
+_PATCHED = False
+
 
 def restore_default_checkpointing():
-    _partitioners.solve_min_cut = _ORIGINAL_SOLVE_MIN_CUT
+    global _PATCHED
+    with _PATCH_LOCK:
+        _partitioners.solve_min_cut = _ORIGINAL_SOLVE_MIN_CUT
+        _PATCHED = False
+
+
+def is_checkpointing_patched():
+    return _PATCHED
 
 
 def register_long_context_checkpointing():
-    try:
-        src = inspect.getsource(_partitioners.solve_min_cut)
-    except (OSError, TypeError):
-        logger.warning("AutoSP: could not retrieve source for solve_min_cut; "
-                       "selective activation checkpointing disabled.")
-        return
+    global _PATCHED
+    with _PATCH_LOCK:
+        if _PATCHED:
+            return
 
-    if 'def should_ban_recomputation(' not in src:
-        logger.warning(
-            f"AutoSP: PyTorch {__import__('torch').__version__} changed "
-            f"solve_min_cut signature. Selective activation checkpointing disabled.")
-        return
+        try:
+            src = inspect.getsource(_partitioners.solve_min_cut)
+        except (OSError, TypeError):
+            logger.warning("AutoSP: could not retrieve source for solve_min_cut; "
+                           "selective activation checkpointing disabled.")
+            return
 
-    lines = src.split('\n')
+        if 'def should_ban_recomputation(' not in src:
+            logger.warning(
+                f"AutoSP: PyTorch {__import__('torch').__version__} changed "
+                f"solve_min_cut signature. Selective activation checkpointing disabled.")
+            return
 
-    start = None
-    end = None
-    for i, line in enumerate(lines):
-        if line.startswith(_NEEDLE) or line.lstrip().startswith('def should_ban_recomputation('):
-            if start is None:
-                start = i
-        elif start is not None and end is None and line.startswith('    def '):
-            end = i
+        lines = src.split('\n')
 
-    if start is None or end is None:
-        logger.warning(
-            "AutoSP: solve_min_cut structure does not match expected pattern; "
-            "selective activation checkpointing disabled.")
-        return
+        start = None
+        end = None
+        for i, line in enumerate(lines):
+            if line.startswith(_NEEDLE) or line.lstrip().startswith('def should_ban_recomputation('):
+                if start is None:
+                    start = i
+            elif start is not None and end is None and line.startswith('    def '):
+                end = i
 
-    replacement = textwrap.indent(_CUSTOM_SHOULD_BAN, '    ')
+        if start is None or end is None:
+            logger.warning(
+                "AutoSP: solve_min_cut structure does not match expected pattern; "
+                "selective activation checkpointing disabled.")
+            return
 
-    new_src = '\n'.join(lines[:start]) + '\n' + replacement + '\n'.join(lines[end:])
+        replacement = textwrap.indent(_CUSTOM_SHOULD_BAN, '    ')
 
-    original_solve_min_cut = _partitioners.solve_min_cut
-    try:
-        exec(new_src, _partitioners.__dict__)
-    except Exception as e:
-        _partitioners.solve_min_cut = original_solve_min_cut
-        logger.warning(f"AutoSP: failed to inject custom checkpointing policy: {e}. "
-                       "Falling back to default PyTorch checkpointing.")
+        new_src = '\n'.join(lines[:start]) + '\n' + replacement + '\n'.join(lines[end:])
+
+        try:
+            exec(new_src, _partitioners.__dict__)
+            _PATCHED = True
+        except Exception as e:
+            _partitioners.solve_min_cut = _ORIGINAL_SOLVE_MIN_CUT
+            logger.warning(f"AutoSP: failed to inject custom checkpointing policy: {e}. "
+                           "Falling back to default PyTorch checkpointing.")

@@ -5,7 +5,7 @@ from torch.fx import GraphModule
 from .passes.sp_compile import apply_autosp
 from .custom_ops.sp_dp_registry import extract_mesh_size
 from .custom_ops.sp_compat import _check_autosp_compatibility
-from .custom_ops import all_to_all as _force_register_a2a  # noqa: F401
+from .custom_ops import all_to_all as _force_register_a2a
 from .passes.long_context_checkpointing import register_long_context_checkpointing
 
 logger = logging.getLogger(__name__)
@@ -53,6 +53,8 @@ def init_autosp(config):
     if _mesh_strategy != 'contiguous':
         from .custom_ops.hetero_mesh import populate_hetero_registry
         populate_hetero_registry(sp_size, dp_size, strategy=_mesh_strategy)
+        from .custom_ops.sp_dp_registry import mark_heterogeneous
+        mark_heterogeneous(True)
 
     if _histogram_enabled:
         from .custom_ops.sp_histogram import get_histogram_kernel

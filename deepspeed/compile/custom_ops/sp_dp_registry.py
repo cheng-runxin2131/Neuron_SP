@@ -11,6 +11,7 @@ _MESH_META = {
     "sp_size": 0,
     "dp_size": 0,
     "is_registered": False,
+    "is_heterogeneous": False,
 }
 
 _PENDING_A2A_HANDLES = []
@@ -36,6 +37,14 @@ def get_group(gid):
 
 def is_setup():
     return _MESH_META["is_registered"]
+
+
+def is_heterogeneous():
+    return _MESH_META.get("is_heterogeneous", False)
+
+
+def mark_heterogeneous(flag=True):
+    _MESH_META["is_heterogeneous"] = flag
 
 
 def extract_mesh_size(param_dict):
@@ -81,22 +90,34 @@ def populate_registry(SP_SIZE, DP_SIZE):
         f"groups={[list(range(i*SP_SIZE,(i+1)*SP_SIZE)) for i in range(DP_SIZE)]}")
 
 
+def _drain_threshold():
+    if _MESH_META.get("is_heterogeneous", False):
+        return _A2A_HANDLE_HIGH_WATER // 4
+    return _A2A_HANDLE_HIGH_WATER
+
+
 def track_a2a_handle(handle):
     if handle is not None:
         _PENDING_A2A_HANDLES.append((handle, time.monotonic()))
-    if len(_PENDING_A2A_HANDLES) > _A2A_HANDLE_HIGH_WATER // 4:
+    if len(_PENDING_A2A_HANDLES) > _drain_threshold():
         _enforce_high_water()
 
 
 def _enforce_high_water():
+    target = _drain_threshold() // 2
     fenced = 0
-    while len(_PENDING_A2A_HANDLES) > _A2A_HANDLE_HIGH_WATER // 2:
-        handle, _ = _PENDING_A2A_HANDLES.pop(0)
+    while len(_PENDING_A2A_HANDLES) > target:
+        handle, t0 = _PENDING_A2A_HANDLES.pop(0)
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        if elapsed_ms > _A2A_TIMEOUT_MS:
+            logger.error(
+                f"[SP] A2A handle stale for {elapsed_ms:.0f}ms "
+                f"(limit={_A2A_TIMEOUT_MS}ms), peer may have left")
         if hasattr(handle, 'wait'):
             handle.wait()
         fenced += 1
     if fenced > 0:
-        logger.debug(f"[SP] Force-fenced {fenced} A2A handles (high-water={_A2A_HANDLE_HIGH_WATER})")
+        logger.debug(f"[SP] Force-fenced {fenced} A2A handles (threshold={_drain_threshold()})")
 
 
 def fence_all_sp_handles(timeout_ms=None):
@@ -168,6 +189,7 @@ def cleanup_sp_groups():
     _MESH_META["sp_size"] = 0
     _MESH_META["dp_size"] = 0
     _MESH_META["is_registered"] = False
+    _MESH_META["is_heterogeneous"] = False
 
 
 _BUFFER_LIFECYCLE = {

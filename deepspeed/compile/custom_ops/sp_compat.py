@@ -38,3 +38,9 @@ def _check_autosp_compatibility():
                 f"downgrade to transformers=={_TRANSFORMERS_VALIDATED_CEILING}.")
     except ImportError:
         pass
+
+
+def get_torch_version_tuple():
+    raw = torch.__version__.split("+")[0]
+    parts = raw.split(".")
+    return tuple(int(p) for p in parts[:2])

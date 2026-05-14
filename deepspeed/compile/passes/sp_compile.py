@@ -1,5 +1,6 @@
 import logging
 import operator
+import threading
 from collections import deque
 from typing import Optional, List, Callable, NamedTuple
 
@@ -14,7 +15,7 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from deepspeed.compile import constants
 
-from ..custom_ops import all_to_all, sp_dp_registry  # noqa: F401
+from ..custom_ops import all_to_all, sp_dp_registry
 from ..fx import find_node_by_name, get_node_shape_meta
 from ..util import get_input_id_node, get_label_id_node, get_position_id_node, shard_tensor_node, get_sdpa_nodes
 
@@ -60,6 +61,8 @@ def prepare_autosp_inputs(input_id: torch.Tensor,
     label_id.tag = constants.AUTOSP_LABEL_ID_KEY
     if position_id is not None:
         position_id.tag = constants.AUTOSP_POSITION_ID_KEY
+    if attention_mask is not None:
+        attention_mask.tag = constants.AUTOSP_ATTENTION_MASK_KEY
 
     return AutoSPInputs(input_id, label_id, position_id, attention_mask)
 
@@ -135,6 +138,21 @@ def pass_shard_position_ids(gm: GraphModule, example_inputs):
     shard_tensor_node(gm, position_ids_node)
 
 
+def _get_attention_mask_node(gm: GraphModule) -> Optional[Node]:
+    from ..fx import find_node_by_tag
+    return find_node_by_tag(gm, constants.AUTOSP_ATTENTION_MASK_KEY)
+
+
+def pass_shard_attention_mask(gm: GraphModule, example_inputs):
+    mask_node = _get_attention_mask_node(gm)
+    if mask_node is None:
+        return
+    try:
+        shard_tensor_node(gm, mask_node)
+    except Exception as exc:
+        logger.warning(f"[AutoSP] attention_mask sharding skipped: {exc}")
+
+
 def pass_insert_attention_all_to_all(gm: GraphModule, real_inputs):
 
     def insert_a2a(node: Node, scatter_idx: int, gather_idx: int, name: str) -> Node:
@@ -205,10 +223,19 @@ def pass_propagate_shapes(gm: torch.fx.GraphModule, real_inputs):
             if (target_dtype is not None
                     and t.is_floating_point()
                     and t.dtype != target_dtype):
+                logger.debug(
+                    f"[AutoSP] placeholder[{idx}] dtype mismatch: "
+                    f"real={t.dtype} vs graph={target_dtype}, casting")
                 t = t.to(target_dtype)
             fake_inputs.append(fake_mode.from_tensor(t))
         else:
             fake_inputs.append(t)
+
+    if len(fake_inputs) != len(_placeholder_dtypes):
+        logger.debug(
+            f"[AutoSP] real_inputs count ({len(fake_inputs)}) differs from "
+            f"placeholder count ({len(_placeholder_dtypes)}), "
+            f"likely lifted constants in graph")
 
     saved_sdpa_masks = []
     for attn_node in get_sdpa_nodes(gm):
@@ -234,6 +261,9 @@ def pass_propagate_shapes(gm: torch.fx.GraphModule, real_inputs):
             attn_node.update_kwarg("attn_mask", attn_mask)
 
 
+_APPLY_LOCK = threading.Lock()
+
+
 def apply_autosp(gm: GraphModule,
                  real_inputs,
                  debug: bool = False,
@@ -243,14 +273,16 @@ def apply_autosp(gm: GraphModule,
 
     assert sp_size * dp_size <= dist.get_world_size(), 'Insufficient device count for mesh size'
 
-    if not sp_dp_registry.is_setup():
-        sp_dp_registry.populate_registry(sp_size, dp_size)
+    with _APPLY_LOCK:
+        if not sp_dp_registry.is_setup():
+            sp_dp_registry.populate_registry(sp_size, dp_size)
 
     AUTOSP_PASSES = [
         pass_shard_seq_dim,
         pass_shard_input_ids,
         pass_shard_label_ids,
         pass_shard_position_ids,
+        pass_shard_attention_mask,
         pass_insert_attention_all_to_all,
         pass_propagate_shapes,
         pass_canonicalize,
