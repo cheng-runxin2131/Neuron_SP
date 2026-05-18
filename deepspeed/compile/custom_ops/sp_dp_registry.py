@@ -103,39 +103,43 @@ def track_a2a_handle(handle):
         _enforce_high_water()
 
 
-def _enforce_high_water():
-    target = _drain_threshold() // 2
+def _drain_handles(stop_when, on_stale):
     fenced = 0
-    while len(_PENDING_A2A_HANDLES) > target:
-        handle, t0 = _PENDING_A2A_HANDLES.pop(0)
-        elapsed_ms = (time.monotonic() - t0) * 1000
+    while _PENDING_A2A_HANDLES and not stop_when():
+        handle, submit_time = _PENDING_A2A_HANDLES.pop(0)
+        elapsed_ms = (time.monotonic() - submit_time) * 1000
         if elapsed_ms > _A2A_TIMEOUT_MS:
-            logger.error(
-                f"[SP] A2A handle stale for {elapsed_ms:.0f}ms "
-                f"(limit={_A2A_TIMEOUT_MS}ms), peer may have left")
+            on_stale(elapsed_ms)
         if hasattr(handle, 'wait'):
             handle.wait()
         fenced += 1
+    return fenced
+
+
+def _enforce_high_water():
+    target = _drain_threshold() // 2
+    fenced = _drain_handles(
+        stop_when=lambda: len(_PENDING_A2A_HANDLES) <= target,
+        on_stale=lambda ms: logger.error(
+            f"[SP] A2A handle stale for {ms:.0f}ms "
+            f"(limit={_A2A_TIMEOUT_MS}ms), peer may have left"))
     if fenced > 0:
         logger.debug(f"[SP] Force-fenced {fenced} A2A handles (threshold={_drain_threshold()})")
 
 
 def fence_all_sp_handles(timeout_ms=None):
-    timeout_ms = timeout_ms or _A2A_TIMEOUT_MS
-    fenced = 0
-    while _PENDING_A2A_HANDLES:
-        handle, submit_time = _PENDING_A2A_HANDLES.pop(0)
-        elapsed_ms = (time.monotonic() - submit_time) * 1000
-        if elapsed_ms > timeout_ms:
-            raise RuntimeError(
-                f"[SP] A2A handle timed out after {elapsed_ms:.0f}ms "
-                f"(limit={timeout_ms}ms). Possible NCCL deadlock on "
-                f"heterogeneous GPUs. Set DESLOC_SP_A2A_TIMEOUT_MS higher "
-                f"or check GPU synchronization.")
-        if hasattr(handle, 'wait'):
-            handle.wait()
-        fenced += 1
-    return fenced
+    effective_timeout = timeout_ms or _A2A_TIMEOUT_MS
+
+    def on_stale(ms):
+        raise RuntimeError(
+            f"[SP] A2A handle timed out after {ms:.0f}ms "
+            f"(limit={effective_timeout}ms). Possible NCCL deadlock on "
+            f"heterogeneous GPUs. Set DESLOC_SP_A2A_TIMEOUT_MS higher "
+            f"or check GPU synchronization.")
+
+    return _drain_handles(
+        stop_when=lambda: False,
+        on_stale=on_stale)
 
 
 def pending_handle_count():
