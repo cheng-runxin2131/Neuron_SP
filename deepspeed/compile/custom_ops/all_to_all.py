@@ -11,26 +11,30 @@ def set_fp32_sp_grad(enabled):
     _FP32_SP_GRAD = enabled
 
 
-def _scatter_heads_gather_seq(input, B, N, local_S, H, group):
+_SCATTER_HEADS = {
+    "pre_reshape": lambda B, P, d1, d2, H: (B, P, d1 // P, d2, H),
+    "pre_permute": (1, 0, 2, 3, 4),
+    "post_permute": (1, 2, 0, 3, 4),
+    "post_reshape": lambda B, P, d1, d2, H: (B, d1 // P, P * d2, H),
+}
+
+_SCATTER_SEQ = {
+    "pre_reshape": lambda B, P, d1, d2, H: (B, d1, P, d2 // P, H),
+    "pre_permute": (2, 0, 1, 3, 4),
+    "post_permute": (1, 0, 2, 3, 4),
+    "post_reshape": lambda B, P, d1, d2, H: (B, P * d1, d2 // P, H),
+}
+
+
+def _execute_a2a(input, B, dim1, dim2, H, group, plan):
     P = sp_size()
-    input_t = input.reshape(B, P, N // P, local_S, H)
-    input_t = input_t.permute(1, 0, 2, 3, 4).contiguous()
+    input_t = input.reshape(*plan["pre_reshape"](B, P, dim1, dim2, H))
+    input_t = input_t.permute(*plan["pre_permute"]).contiguous()
     output = torch.empty_like(input_t)
     handle = dist.all_to_all_single(output, input_t, group=group, async_op=False)
     track_a2a_handle(handle)
-    output = output.permute(1, 2, 0, 3, 4).contiguous()
-    return output.reshape(B, N // P, P * local_S, H)
-
-
-def _scatter_seq_gather_heads(input, B, local_N, S, H, group):
-    P = sp_size()
-    input_t = input.reshape(B, local_N, P, S // P, H)
-    input_t = input_t.permute(2, 0, 1, 3, 4).contiguous()
-    output = torch.empty_like(input_t)
-    handle = dist.all_to_all_single(output, input_t, group=group, async_op=False)
-    track_a2a_handle(handle)
-    output = output.permute(1, 0, 2, 3, 4).contiguous()
-    return output.reshape(B, P * local_N, S // P, H)
+    output = output.permute(*plan["post_permute"]).contiguous()
+    return output.reshape(*plan["post_reshape"](B, P, dim1, dim2, H))
 
 
 @torch.library.custom_op("autosp::all_to_all", mutates_args=())
@@ -58,9 +62,8 @@ def all_to_all(
     gid = dist.get_rank() // _sp
     group = get_group(gid)
 
-    if scatter_idx == 1:
-        return _scatter_heads_gather_seq(input, B, dim1, dim2, H, group)
-    return _scatter_seq_gather_heads(input, B, dim1, dim2, H, group)
+    plan = _SCATTER_HEADS if scatter_idx == 1 else _SCATTER_SEQ
+    return _execute_a2a(input, B, dim1, dim2, H, group, plan)
 
 
 @torch.library.register_fake("autosp::all_to_all")
