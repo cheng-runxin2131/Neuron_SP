@@ -49,22 +49,21 @@ def _parse_histogram_config(param_dict):
     }
 
 
-def init_autosp(config):
-    _check_autosp_compatibility()
-
+def _ensure_clean_state():
     from .custom_ops.sp_dp_registry import cleanup_sp_groups, is_setup, pending_handle_count
-    if is_setup():
-        pending = pending_handle_count()
-        if pending > 0:
-            logger.warning(
-                f"[AutoSP] Reinitializing with {pending} pending A2A handles. "
-                f"Fencing before cleanup to prevent NCCL errors.")
-        cleanup_sp_groups()
+    if not is_setup():
+        return
+    pending = pending_handle_count()
+    if pending > 0:
+        logger.warning(
+            f"[AutoSP] Reinitializing with {pending} pending A2A handles. "
+            f"Fencing before cleanup to prevent NCCL errors.")
+    cleanup_sp_groups()
 
-    sp_size, dp_size = extract_mesh_size(config._param_dict)
-    register_long_context_checkpointing()
 
+def _resolve_sp_dp(config):
     import deepspeed.comm as dist
+    sp_size, dp_size = extract_mesh_size(config._param_dict)
     n_heads, n_kv_heads, min_heads = _resolve_head_counts(config._param_dict)
 
     if min_heads > 0 and sp_size > 1 and min_heads % sp_size != 0:
@@ -83,6 +82,16 @@ def init_autosp(config):
 
     config._param_dict['_effective_sp_size'] = sp_size
     config._param_dict['_effective_dp_size'] = dp_size
+    config._param_dict['sequence_parallel_size'] = sp_size
+    return sp_size, dp_size
+
+
+def init_autosp(config):
+    _check_autosp_compatibility()
+    _ensure_clean_state()
+
+    sp_size, dp_size = _resolve_sp_dp(config)
+    register_long_context_checkpointing()
 
     desloc_cfg = _parse_desloc_config(config._param_dict)
     hetero_cfg = _parse_hetero_config(config._param_dict)
