@@ -19,12 +19,16 @@ class DoubleBuffer:
         self._allocated = False
         self._lock = threading.Lock()
 
-    def allocate(self, shape):
+    def allocate(self, shape, dtype=None):
         with self._lock:
+            if dtype is not None and dtype != self._dtype:
+                self._dtype = dtype
+                if self._allocated:
+                    self._free_unlocked()
             if self._allocated:
                 if self._data[0] is not None and self._data[0].shape == shape:
                     return
-                self.free()
+                self._free_unlocked()
             for i in range(2):
                 self._data[i] = torch.empty(shape, dtype=self._dtype, device=self._device)
                 self._index[i] = torch.empty(shape[0], dtype=self._index_dtype, device=self._device)
@@ -63,15 +67,18 @@ class DoubleBuffer:
             slot = self.selector
         self._valid[slot] = False
 
+    def _free_unlocked(self):
+        for i in range(2):
+            self._data[i] = None
+            self._index[i] = None
+            self._valid[i] = False
+        self._allocated = False
+        self.selector = 0
+        track_buffer_event("freed")
+
     def free(self):
         with self._lock:
-            for i in range(2):
-                self._data[i] = None
-                self._index[i] = None
-                self._valid[i] = False
-            self._allocated = False
-            self.selector = 0
-            track_buffer_event("freed")
+            self._free_unlocked()
 
     @property
     def allocated(self):
@@ -146,7 +153,7 @@ def execute_double_buffered_a2a(input_tensor, scatter_idx, gather_idx,
 
     if not buf.allocated or buf.current().shape != input_tensor.shape:
         buf.free()
-        buf.allocate(input_tensor.shape)
+        buf.allocate(input_tensor.shape, dtype=input_tensor.dtype)
 
     result = _raw_a2a(input_tensor, scatter_idx, sp_size_val, group)
 

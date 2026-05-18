@@ -1,8 +1,3 @@
-# Copyright (c) Microsoft Corporation.
-# SPDX-License-Identifier: Apache-2.0
-
-# DeepSpeed Team
-
 from typing import List, Optional, Literal
 from deepspeed.runtime.config_utils import DeepSpeedConfigModel
 
