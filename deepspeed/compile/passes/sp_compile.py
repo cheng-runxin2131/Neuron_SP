@@ -214,34 +214,35 @@ def _restore_meta(gm, snapshot):
             node.meta = snapshot[node.name]
 
 
+def _strip_sdpa_masks(gm):
+    saved = []
+    for attn_node in get_sdpa_nodes(gm):
+        attn_mask = attn_node.kwargs.get("attn_mask")
+        if attn_mask is not None:
+            saved.append((attn_node, attn_mask))
+            attn_node.update_kwarg("attn_mask", None)
+    return saved
+
+
+def _restore_sdpa_masks(saved):
+    for attn_node, attn_mask in saved:
+        attn_node.update_kwarg("attn_mask", attn_mask)
+
+
 def pass_propagate_shapes(gm: torch.fx.GraphModule, real_inputs):
     fake_mode = _discover_fake_mode(gm)
     placeholder_dtypes = _extract_placeholder_dtypes(gm)
     fake_inputs = _build_fake_inputs(real_inputs, fake_mode, placeholder_dtypes)
 
-    if len(fake_inputs) != len(placeholder_dtypes):
-        logger.debug(
-            f"[AutoSP] real_inputs count ({len(fake_inputs)}) differs from "
-            f"placeholder count ({len(placeholder_dtypes)}), "
-            f"likely lifted constants in graph")
-
-    saved_sdpa_masks = []
-    for attn_node in get_sdpa_nodes(gm):
-        attn_mask = attn_node.kwargs.get("attn_mask")
-        if attn_mask is not None:
-            saved_sdpa_masks.append((attn_node, attn_mask))
-            attn_node.update_kwarg("attn_mask", None)
-
+    saved_masks = _strip_sdpa_masks(gm)
     snapshot = _snapshot_meta(gm)
-    prop = FakeTensorProp(gm, mode=fake_mode)
     try:
-        prop.propagate_dont_convert_inputs(*fake_inputs)
+        FakeTensorProp(gm, mode=fake_mode).propagate_dont_convert_inputs(*fake_inputs)
     except Exception:
         _restore_meta(gm, snapshot)
         raise
     finally:
-        for attn_node, attn_mask in saved_sdpa_masks:
-            attn_node.update_kwarg("attn_mask", attn_mask)
+        _restore_sdpa_masks(saved_masks)
 
 
 def _validate_sdpa_nodes(gm, sp_size, rank):
