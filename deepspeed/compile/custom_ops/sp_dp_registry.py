@@ -188,6 +188,12 @@ def cleanup_sp_groups():
         except Exception:
             pass
 
+    try:
+        from .hetero_mesh import reset_hetero_plan
+        reset_hetero_plan()
+    except ImportError:
+        pass
+
     _PROCESS_GROUPS.clear()
     _PENDING_A2A_HANDLES.clear()
     _MESH_META["sp_size"] = 0

@@ -265,6 +265,12 @@ def populate_hetero_registry(
 def get_hetero_plan() -> Optional[HeteroMeshPlan]:
     return _HETERO_PLAN
 
+
+def reset_hetero_plan():
+    global _HETERO_PLAN
+    with _HETERO_LOCK:
+        _HETERO_PLAN = None
+
 def get_local_chunk_weight() -> float:
     plan = _HETERO_PLAN
     if plan is None:
