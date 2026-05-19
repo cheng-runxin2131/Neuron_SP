@@ -12,6 +12,8 @@ _MESH_META = {
     "dp_size": 0,
     "is_registered": False,
     "is_heterogeneous": False,
+    "loc_enabled": False,
+    "loc_sp_group_ids": [],
 }
 
 _PENDING_A2A_HANDLES = []
@@ -45,6 +47,20 @@ def is_heterogeneous():
 
 def mark_heterogeneous(flag=True):
     _MESH_META["is_heterogeneous"] = flag
+
+
+def is_loc_enabled():
+    return _MESH_META.get("loc_enabled", False)
+
+
+def enable_loc(sp_group_ids=None):
+    _MESH_META["loc_enabled"] = True
+    if sp_group_ids is not None:
+        _MESH_META["loc_sp_group_ids"] = list(sp_group_ids)
+
+
+def get_loc_sp_group_ids():
+    return _MESH_META.get("loc_sp_group_ids", [])
 
 
 def extract_mesh_size(param_dict):
@@ -88,6 +104,18 @@ def populate_registry(SP_SIZE, DP_SIZE):
         f"[SP-REG] rank={_r}/{_ws} SP={SP_SIZE} DP={DP_SIZE} "
         f"sp_group_id={_gid} sp_rank_in_group={_sp_local} "
         f"groups={[list(range(i*SP_SIZE,(i+1)*SP_SIZE)) for i in range(DP_SIZE)]}")
+
+
+def populate_registry_with_loc(SP_SIZE, DP_SIZE, loc_peer_ranks=None):
+    populate_registry(SP_SIZE, DP_SIZE)
+
+    if loc_peer_ranks is not None and len(loc_peer_ranks) > 0:
+        loc_gid = max(_PROCESS_GROUPS.keys(), default=-1) + 1
+        _PROCESS_GROUPS[loc_gid] = dist.new_group(loc_peer_ranks)
+        enable_loc(sp_group_ids=[loc_gid])
+        logger.info(
+            f"[SP-REG-LOC] rank={dist.get_rank()} LOC peer group "
+            f"gid={loc_gid} ranks={loc_peer_ranks}")
 
 
 def _drain_threshold():
@@ -200,6 +228,8 @@ def cleanup_sp_groups():
     _MESH_META["dp_size"] = 0
     _MESH_META["is_registered"] = False
     _MESH_META["is_heterogeneous"] = False
+    _MESH_META["loc_enabled"] = False
+    _MESH_META["loc_sp_group_ids"] = []
 
 
 _BUFFER_LIFECYCLE = {

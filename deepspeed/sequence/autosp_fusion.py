@@ -6,44 +6,48 @@ import deepspeed.comm as dist
 
 _DEFAULT_IMAGE_TOKEN_ID = -200
 
+
+def _fused_sp_forward(adapter, visual_features, text_embeds, input_ids):
+    visual_embeds = adapter.projection(visual_features)
+
+    parts = [torch.zeros_like(visual_embeds) for _ in range(adapter.world_size)]
+    dist.all_gather(parts, visual_embeds.contiguous(), group=adapter.process_group)
+    full_visual = torch.cat(parts, dim=1)
+
+    fused = adapter._splice_visual_into_text(text_embeds, full_visual, input_ids)
+
+    total_len = fused.shape[1]
+    pad = (adapter.world_size - total_len % adapter.world_size) % adapter.world_size
+    if pad > 0:
+        fused = F.pad(fused, (0, 0, 0, pad))
+
+    rank = dist.get_rank(adapter.process_group)
+    local_len = fused.shape[1] // adapter.world_size
+    return fused[:, rank * local_len:(rank + 1) * local_len, :].contiguous()
+
+
 class ModalityFusionSPAdapter(nn.Module):
 
-    def __init__(self, projection: nn.Module, process_group, image_token_id: int = _DEFAULT_IMAGE_TOKEN_ID) -> None:
+    def __init__(self, projection, process_group, image_token_id=_DEFAULT_IMAGE_TOKEN_ID):
         super().__init__()
         self.projection = projection
         self.process_group = process_group
         self.world_size = dist.get_world_size(process_group)
         self.image_token_id = image_token_id
 
-    def forward(self, visual_features: torch.Tensor, text_embeds: torch.Tensor,
-                input_ids: torch.Tensor) -> torch.Tensor:
-        visual_embeds = self.projection(visual_features)
+    def forward(self, visual_features, text_embeds, input_ids):
+        return _fused_sp_forward(self, visual_features, text_embeds, input_ids)
 
-        parts = [torch.zeros_like(visual_embeds) for _ in range(self.world_size)]
-        dist.all_gather(parts, visual_embeds.contiguous(), group=self.process_group)
-        full_visual = torch.cat(parts, dim=1)
+    def _splice_visual_into_text(self, text_embeds, visual_embeds, input_ids):
+        raise NotImplementedError(
+            f"{type(self).__name__}._splice_visual_into_text is not implemented. "
+            f"Subclass ModalityFusionSPAdapter and override this method to match "
+            f"your model's prepare_inputs_embeds logic.")
 
-        fused = self._splice_visual_into_text(text_embeds, full_visual, input_ids)
-
-        total_len = fused.shape[1]
-        pad = (self.world_size - total_len % self.world_size) % self.world_size
-        if pad > 0:
-            fused = F.pad(fused, (0, 0, 0, pad))
-
-        rank = dist.get_rank(self.process_group)
-        local_len = fused.shape[1] // self.world_size
-        return fused[:, rank * local_len:(rank + 1) * local_len, :].contiguous()
-
-    def _splice_visual_into_text(self, text_embeds: torch.Tensor, visual_embeds: torch.Tensor,
-                                 input_ids: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError(f"{type(self).__name__}._splice_visual_into_text is not implemented. "
-                                  "Subclass ModalityFusionSPAdapter and override this method to match "
-                                  "your model's prepare_inputs_embeds logic.")
 
 class LlavaFusionAdapter(ModalityFusionSPAdapter):
 
-    def _splice_visual_into_text(self, text_embeds: torch.Tensor, visual_embeds: torch.Tensor,
-                                 input_ids: torch.Tensor) -> torch.Tensor:
+    def _splice_visual_into_text(self, text_embeds, visual_embeds, input_ids):
         bs, text_len, hidden = text_embeds.shape
         device = text_embeds.device
 
@@ -77,10 +81,10 @@ class LlavaFusionAdapter(ModalityFusionSPAdapter):
             out[i, :s.shape[0]] = s
         return out
 
+
 class InternVLFusionAdapter(ModalityFusionSPAdapter):
 
-    def _splice_visual_into_text(self, text_embeds: torch.Tensor, visual_embeds: torch.Tensor,
-                                 input_ids: torch.Tensor) -> torch.Tensor:
+    def _splice_visual_into_text(self, text_embeds, visual_embeds, input_ids):
         out = text_embeds.clone()
         bs = text_embeds.shape[0]
 
@@ -92,10 +96,11 @@ class InternVLFusionAdapter(ModalityFusionSPAdapter):
 
         return out
 
+
 class Qwen2VLFusionAdapter(nn.Module):
 
-    def __init__(self, projection: nn.Module, process_group, vision_start_token_id: int,
-                 vision_end_token_id: int) -> None:
+    def __init__(self, projection, process_group, vision_start_token_id,
+                 vision_end_token_id):
         super().__init__()
         self.projection = projection
         self.process_group = process_group
@@ -103,27 +108,10 @@ class Qwen2VLFusionAdapter(nn.Module):
         self.vision_start_token_id = vision_start_token_id
         self.vision_end_token_id = vision_end_token_id
 
-    def forward(self, visual_features: torch.Tensor, text_embeds: torch.Tensor,
-                input_ids: torch.Tensor) -> torch.Tensor:
-        visual_embeds = self.projection(visual_features)
+    def forward(self, visual_features, text_embeds, input_ids):
+        return _fused_sp_forward(self, visual_features, text_embeds, input_ids)
 
-        parts = [torch.zeros_like(visual_embeds) for _ in range(self.world_size)]
-        dist.all_gather(parts, visual_embeds.contiguous(), group=self.process_group)
-        full_visual = torch.cat(parts, dim=1)
-
-        fused = self._splice_visual_into_text(text_embeds, full_visual, input_ids)
-
-        total_len = fused.shape[1]
-        pad = (self.world_size - total_len % self.world_size) % self.world_size
-        if pad > 0:
-            fused = F.pad(fused, (0, 0, 0, pad))
-
-        rank = dist.get_rank(self.process_group)
-        local_len = fused.shape[1] // self.world_size
-        return fused[:, rank * local_len:(rank + 1) * local_len, :].contiguous()
-
-    def _splice_visual_into_text(self, text_embeds: torch.Tensor, visual_embeds: torch.Tensor,
-                                 input_ids: torch.Tensor) -> torch.Tensor:
+    def _splice_visual_into_text(self, text_embeds, visual_embeds, input_ids):
         out = text_embeds.clone()
         bs = text_embeds.shape[0]
 

@@ -6,65 +6,65 @@ import torch._functorch.partitioners as _partitioners
 
 logger = logging.getLogger(__name__)
 
-_CUSTOM_SHOULD_BAN = """\
-def should_ban_recomputation(node):
-    if node.op != "call_function":
-        return None
-    if node.target == operator.getitem:
-        return None
-    if node.meta.get("recompute", None) == CheckpointPolicy.MUST_SAVE:
-        return "autosp: MUST_SAVE policy"
-    if config.recompute_views and op_types.is_view(node):
-        return None
-    if node.target in [aten.lift_fresh_copy.default, aten.lift_fresh.default]:
-        return None
-
-    must_save_set = [
-        aten.convolution,
-        aten.convolution_backward,
-        aten._scaled_dot_product_flash_attention,
-        aten._scaled_dot_product_efficient_attention,
-        aten._flash_attention_forward,
-        aten._efficient_attention_forward,
-        aten.upsample_bilinear2d,
-        aten.native_dropout,
-        aten.rand_like,
-        aten.randn_like,
-    ]
-
-    if get_aten_target(node) in must_save_set:
-        return "autosp: attention/stochastic op"
-
-    if hasattr(node.target, '__module__') and 'autosp' in str(node.target):
-        return "autosp: collective op"
-
-    def heuristic(node):
-        if "val" in node.meta:
-            if isinstance(node.meta["val"], torch.Tensor) and node.meta["val"].dim() >= 2:
-                return node.meta["val"].shape[1] >= 4096
-        return False
-
-    if min_cut_options.ban_if_not_in_allowlist:
-        if not op_types.is_recomputable(node):
-            return None
-
-    if min_cut_options.ban_if_materialized_backward and is_materialized_backwards(node):
-        if heuristic(node):
-            return None
-        return "autosp: materialized backward (small tensor)"
-
-    if node.dist_from_bw < 1000 and node.dist_from_bw > config.max_dist_from_bw:
-        return None
-
-    if min_cut_options.ban_if_reduction:
-        input_tensors_size = sum(
-            _size_of(i) for i in node.args if isinstance(i, fx.Node)
-        )
-        output_size = _size_of(node)
-        if output_size * 4 < input_tensors_size:
-            return "autosp: reduction op"
-    return None
-"""
+_CUSTOM_SHOULD_BAN = (
+    'def should_ban_recomputation(node):\n'
+    '    if node.op != "call_function":\n'
+    '        return None\n'
+    '    if node.target == operator.getitem:\n'
+    '        return None\n'
+    '    if node.meta.get("recompute", None) == CheckpointPolicy.MUST_SAVE:\n'
+    '        return "autosp: MUST_SAVE policy"\n'
+    '    if config.recompute_views and op_types.is_view(node):\n'
+    '        return None\n'
+    '    if node.target in [aten.lift_fresh_copy.default, aten.lift_fresh.default]:\n'
+    '        return None\n'
+    '\n'
+    '    must_save_set = [\n'
+    '        aten.convolution,\n'
+    '        aten.convolution_backward,\n'
+    '        aten._scaled_dot_product_flash_attention,\n'
+    '        aten._scaled_dot_product_efficient_attention,\n'
+    '        aten._flash_attention_forward,\n'
+    '        aten._efficient_attention_forward,\n'
+    '        aten.upsample_bilinear2d,\n'
+    '        aten.native_dropout,\n'
+    '        aten.rand_like,\n'
+    '        aten.randn_like,\n'
+    '    ]\n'
+    '\n'
+    '    if get_aten_target(node) in must_save_set:\n'
+    '        return "autosp: attention/stochastic op"\n'
+    '\n'
+    '    if hasattr(node.target, \'__module__\') and \'autosp\' in str(node.target):\n'
+    '        return "autosp: collective op"\n'
+    '\n'
+    '    def heuristic(node):\n'
+    '        if "val" in node.meta:\n'
+    '            if isinstance(node.meta["val"], torch.Tensor) and node.meta["val"].dim() >= 2:\n'
+    '                return node.meta["val"].shape[1] >= 4096\n'
+    '        return False\n'
+    '\n'
+    '    if min_cut_options.ban_if_not_in_allowlist:\n'
+    '        if not op_types.is_recomputable(node):\n'
+    '            return None\n'
+    '\n'
+    '    if min_cut_options.ban_if_materialized_backward and is_materialized_backwards(node):\n'
+    '        if heuristic(node):\n'
+    '            return None\n'
+    '        return "autosp: materialized backward (small tensor)"\n'
+    '\n'
+    '    if node.dist_from_bw < 1000 and node.dist_from_bw > config.max_dist_from_bw:\n'
+    '        return None\n'
+    '\n'
+    '    if min_cut_options.ban_if_reduction:\n'
+    '        input_tensors_size = sum(\n'
+    '            _size_of(i) for i in node.args if isinstance(i, fx.Node)\n'
+    '        )\n'
+    '        output_size = _size_of(node)\n'
+    '        if output_size * 4 < input_tensors_size:\n'
+    '            return "autosp: reduction op"\n'
+    '    return None\n'
+)
 
 _NEEDLE = '    def should_ban_recomputation('
 

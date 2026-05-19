@@ -49,6 +49,16 @@ def _parse_histogram_config(param_dict):
     }
 
 
+def _parse_loc_config(param_dict):
+    cfg = param_dict.get('loc', {})
+    return {
+        'enabled': cfg.get('enabled', False),
+        'peer_ranks': cfg.get('peer_ranks', []),
+        'model_size': cfg.get('model_size', '7B'),
+        'dht_prefix': cfg.get('dht_prefix', 'neuron_sp'),
+    }
+
+
 def _ensure_clean_state():
     from .custom_ops.sp_dp_registry import cleanup_sp_groups, is_setup, pending_handle_count
     if not is_setup():
@@ -96,8 +106,14 @@ def init_autosp(config):
     desloc_cfg = _parse_desloc_config(config._param_dict)
     hetero_cfg = _parse_hetero_config(config._param_dict)
     histogram_cfg = _parse_histogram_config(config._param_dict)
+    loc_cfg = _parse_loc_config(config._param_dict)
 
-    if hetero_cfg['strategy'] != 'contiguous':
+    if loc_cfg['enabled']:
+        from .custom_ops.sp_dp_registry import populate_registry_with_loc
+        populate_registry_with_loc(
+            sp_size, dp_size,
+            loc_peer_ranks=loc_cfg['peer_ranks'] or None)
+    elif hetero_cfg['strategy'] != 'contiguous':
         from .custom_ops.hetero_mesh import populate_hetero_registry
         populate_hetero_registry(sp_size, dp_size, strategy=hetero_cfg['strategy'])
         from .custom_ops.sp_dp_registry import mark_heterogeneous
@@ -110,7 +126,8 @@ def init_autosp(config):
     logger.info(
         f"[AutoSP] sp={sp_size} dp={dp_size} desloc={desloc_cfg['enabled']} "
         f"Kx={desloc_cfg['Kx']} mesh_strategy={hetero_cfg['strategy']} "
-        f"histogram={histogram_cfg['enabled']}")
+        f"histogram={histogram_cfg['enabled']} "
+        f"loc={loc_cfg['enabled']} loc_model={loc_cfg['model_size']}")
 
     def backend_fn(gm: GraphModule, real_inputs):
         apply_autosp(gm, real_inputs, debug=False, sp_size=sp_size, dp_size=dp_size)

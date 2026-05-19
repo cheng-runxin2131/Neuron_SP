@@ -1,7 +1,7 @@
 import torch
 import deepspeed.comm as dist
 from torch.utils._sympy.functions import FloorDiv
-from .sp_dp_registry import get_group, is_setup, sp_size, track_a2a_handle, finalize_a2a_pass
+from .sp_dp_registry import get_group, is_setup, sp_size, track_a2a_handle, finalize_a2a_pass, is_loc_enabled
 
 _FP32_SP_GRAD = False
 
@@ -37,6 +37,12 @@ def _execute_a2a(input, B, dim1, dim2, H, group, plan):
     return output.reshape(*plan["post_reshape"](B, P, dim1, dim2, H))
 
 
+def _resolve_group():
+    _sp = sp_size()
+    gid = dist.get_rank() // _sp
+    return get_group(gid)
+
+
 @torch.library.custom_op("autosp::all_to_all", mutates_args=())
 def all_to_all(
     input: torch.Tensor,
@@ -59,9 +65,8 @@ def all_to_all(
         assert dim2 % _sp == 0, (
             f"[AutoSP] all_to_all forward: S={dim2} not divisible by sp_size={_sp}. "
             f"Sequence length must be divisible by sequence_parallel_size.")
-    gid = dist.get_rank() // _sp
-    group = get_group(gid)
 
+    group = _resolve_group()
     plan = _SCATTER_HEADS if scatter_idx == 1 else _SCATTER_SEQ
     return _execute_a2a(input, B, dim1, dim2, H, group, plan)
 

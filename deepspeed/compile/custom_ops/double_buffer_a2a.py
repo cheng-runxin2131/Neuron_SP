@@ -18,6 +18,7 @@ class DoubleBuffer:
         self._valid = [False, False]
         self._allocated = False
         self._lock = threading.Lock()
+        self._swap_count = 0
 
     def allocate(self, shape, dtype=None):
         with self._lock:
@@ -50,7 +51,11 @@ class DoubleBuffer:
     def swap(self):
         with self._lock:
             self.selector ^= 1
+            self._swap_count += 1
             track_buffer_event("swapped")
+
+    def swap_count(self):
+        return self._swap_count
 
     def mark_valid(self, slot=-1):
         if slot < 0:
@@ -74,6 +79,7 @@ class DoubleBuffer:
             self._valid[i] = False
         self._allocated = False
         self.selector = 0
+        self._swap_count = 0
         track_buffer_event("freed")
 
     def free(self):
@@ -149,7 +155,8 @@ def execute_double_buffered_a2a(input_tensor, scatter_idx, gather_idx,
                                  is_last_pass, pool=None):
     pool = pool or get_buffer_pool()
 
-    buf = pool.get_or_create(f"a2a_pass_{pass_index % 2}", dtype=input_tensor.dtype)
+    buf_key = f"a2a_pass_{pass_index % 2}"
+    buf = pool.get_or_create(buf_key, dtype=input_tensor.dtype)
 
     if not buf.allocated or buf.current().shape != input_tensor.shape:
         buf.free()
@@ -162,5 +169,10 @@ def execute_double_buffered_a2a(input_tensor, scatter_idx, gather_idx,
         write_slot.copy_(result)
     buf.mark_valid(buf.selector ^ 1)
     buf.swap()
+
+    if is_last_pass:
+        idx_buf = pool.get_or_create(f"idx_{buf_key}", dtype=torch.long)
+        if idx_buf.allocated:
+            idx_buf.swap()
 
     return result

@@ -94,69 +94,106 @@ class RemoteA2AConfig:
     retry_count: int = 3
 
 
+def _compress_fp16(tensor, meta):
+    import numpy as np
+    compressed = tensor.half().cpu().numpy().tobytes()
+    return compressed, meta
+
+
+def _compress_int8(tensor, meta):
+    import torch
+    import numpy as np
+    orig_shape = tensor.shape
+    flat = tensor.reshape(-1, orig_shape[-1])
+    absmax = flat.abs().amax(dim=0)
+    scales = absmax / 127.0
+    scales = scales.clamp(min=1e-8)
+    quantized = (flat / scales.unsqueeze(0)).clamp(-127, 127).to(torch.int8)
+    compressed = quantized.cpu().numpy().tobytes()
+    meta["scales"] = scales.cpu().tolist()
+    meta["orig_shape"] = list(orig_shape)
+    meta["flat_shape"] = list(flat.shape)
+    return compressed, meta
+
+
+def _compress_none(tensor, meta):
+    import numpy as np
+    meta["codec"] = "none"
+    return tensor.cpu().numpy().tobytes(), meta
+
+
+def _decompress_fp16(data, meta, device):
+    import torch
+    import numpy as np
+    shape = meta["shape"]
+    original_dtype = getattr(torch, meta["dtype"].replace("torch.", ""))
+    arr = np.frombuffer(data, dtype=np.float16).reshape(shape)
+    return torch.from_numpy(arr.copy()).to(dtype=original_dtype, device=device)
+
+
+def _decompress_int8(data, meta, device):
+    import torch
+    import numpy as np
+    orig_shape = meta.get("orig_shape", meta["shape"])
+    hidden_dim = orig_shape[-1]
+    flat_shape = tuple(meta["flat_shape"]) if "flat_shape" in meta else (-1, hidden_dim)
+    arr = np.frombuffer(data, dtype=np.int8).reshape(flat_shape)
+    tensor = torch.from_numpy(arr.copy()).to(dtype=torch.float32, device=device)
+    scales = torch.tensor(meta["scales"], dtype=torch.float32, device=device)
+    tensor = tensor * scales.unsqueeze(0)
+    original_dtype = getattr(torch, meta["dtype"].replace("torch.", ""))
+    return tensor.reshape(orig_shape).to(original_dtype)
+
+
+def _decompress_none(data, meta, device):
+    import torch
+    import numpy as np
+    shape = meta["shape"]
+    original_dtype = getattr(torch, meta["dtype"].replace("torch.", ""))
+    arr = np.frombuffer(data, dtype=np.float32).reshape(shape)
+    return torch.from_numpy(arr.copy()).to(dtype=original_dtype, device=device)
+
+
+_COMPRESS_DISPATCH = {
+    "fp16": _compress_fp16,
+    "int8": _compress_int8,
+}
+
+_DECOMPRESS_DISPATCH = {
+    "fp16": _decompress_fp16,
+    "int8": _decompress_int8,
+    "none": _decompress_none,
+}
+
+
 class TensorCodec:
 
     def __init__(self, codec="fp16"):
         self._codec = codec
 
-    def compress(self, tensor) -> Tuple[bytes, dict]:
+    def compress(self, tensor):
         import torch
-        import numpy as np
         meta = {
             "shape": list(tensor.shape),
             "dtype": str(tensor.dtype),
             "codec": self._codec,
         }
+        compress_fn = _COMPRESS_DISPATCH.get(self._codec)
+        if compress_fn is None:
+            return _compress_none(tensor, meta)
+        if self._codec == "fp16" and tensor.dtype != torch.float32:
+            return _compress_none(tensor, meta)
+        return compress_fn(tensor, meta)
 
-        if self._codec == "fp16" and tensor.dtype == torch.float32:
-            compressed = tensor.half().cpu().numpy().tobytes()
-            return compressed, meta
-
-        if self._codec == "int8":
-            orig_shape = tensor.shape
-            flat = tensor.reshape(-1, orig_shape[-1])
-            absmax = flat.abs().amax(dim=0)
-            scales = absmax / 127.0
-            scales = scales.clamp(min=1e-8)
-            quantized = (flat / scales.unsqueeze(0)).clamp(-127, 127).to(torch.int8)
-            compressed = quantized.cpu().numpy().tobytes()
-            meta["scales"] = scales.cpu().tolist()
-            meta["orig_shape"] = list(orig_shape)
-            meta["flat_shape"] = list(flat.shape)
-            return compressed, meta
-
-        compressed = tensor.cpu().numpy().tobytes()
-        meta["codec"] = "none"
-        return compressed, meta
-
-    def decompress(self, data, meta, device) -> 'torch.Tensor':
-        import torch
-        import numpy as np
-        shape = meta["shape"]
-        original_dtype = getattr(torch, meta["dtype"].replace("torch.", ""))
-        codec = meta["codec"]
-
-        if codec == "fp16":
-            arr = np.frombuffer(data, dtype=np.float16).reshape(shape)
-            return torch.from_numpy(arr.copy()).to(dtype=original_dtype, device=device)
-
-        if codec == "int8":
-            orig_shape = meta.get("orig_shape", shape)
-            hidden_dim = orig_shape[-1]
-            flat_shape = tuple(meta["flat_shape"]) if "flat_shape" in meta else (-1, hidden_dim)
-            arr = np.frombuffer(data, dtype=np.int8).reshape(flat_shape)
-            tensor = torch.from_numpy(arr.copy()).to(dtype=torch.float32, device=device)
-            scales = torch.tensor(meta["scales"], dtype=torch.float32, device=device)
-            tensor = tensor * scales.unsqueeze(0)
-            return tensor.reshape(orig_shape).to(original_dtype)
-
-        arr = np.frombuffer(data, dtype=np.float32).reshape(shape)
-        return torch.from_numpy(arr.copy()).to(dtype=original_dtype, device=device)
+    def decompress(self, data, meta, device):
+        codec = meta.get("codec", "none")
+        decompress_fn = _DECOMPRESS_DISPATCH.get(codec, _decompress_none)
+        return decompress_fn(data, meta, device)
 
 
 class RemoteA2AProxy:
 
-    def __init__(self, config: Optional[RemoteA2AConfig] = None):
+    def __init__(self, config=None):
         self.config = config or RemoteA2AConfig()
         self._codec = TensorCodec(self.config.compression_codec)
         self._stats = {"sends": 0, "recvs": 0, "bytes_sent": 0, "bytes_recv": 0}
@@ -184,15 +221,17 @@ class HeteroSyncConfig:
 
 class HeteroSyncGate:
 
-    def __init__(self, config: Optional[HeteroSyncConfig] = None):
+    def __init__(self, config=None):
         self.config = config or HeteroSyncConfig()
         self._effective_Kx = self.config.base_Kx
         self._step = 0
         self._peer_last_seen: Dict[int, float] = {}
         self._grad_norms: List[float] = []
 
-    def should_sync(self, step):
+    def should_sync(self, step, is_last_pass=False):
         self._step = step
+        if is_last_pass:
+            return True
         if self._effective_Kx <= 1:
             return True
         return (step % self._effective_Kx) == 0
@@ -253,12 +292,13 @@ class HeteroSyncGate:
 
 class RemoteA2ADoubleBuffer:
 
-    def __init__(self, config: Optional[RemoteA2AConfig] = None):
+    def __init__(self, config=None):
         self._config = config or RemoteA2AConfig()
         self._proxy = RemoteA2AProxy(self._config)
-        self._selector = 0
+        self.selector = 0
         self._send_buffers = [None, None]
         self._recv_buffers = [None, None]
+        self._swap_count = 0
 
     def allocate(self, shape, dtype):
         import torch as _t
@@ -267,13 +307,23 @@ class RemoteA2ADoubleBuffer:
             self._recv_buffers[i] = _t.empty(shape, dtype=dtype, device='cpu')
 
     def current_send(self):
-        return self._send_buffers[self._selector]
+        return self._send_buffers[self.selector]
+
+    def alternate_send(self):
+        return self._send_buffers[self.selector ^ 1]
 
     def current_recv(self):
-        return self._recv_buffers[self._selector]
+        return self._recv_buffers[self.selector]
+
+    def alternate_recv(self):
+        return self._recv_buffers[self.selector ^ 1]
 
     def swap(self):
-        self._selector ^= 1
+        self.selector ^= 1
+        self._swap_count += 1
+
+    def swap_count(self):
+        return self._swap_count
 
     def compress_and_stage(self, tensor):
         return self._proxy.compress_tensor(tensor)
@@ -284,4 +334,5 @@ class RemoteA2ADoubleBuffer:
     def free(self):
         self._send_buffers = [None, None]
         self._recv_buffers = [None, None]
-        self._selector = 0
+        self.selector = 0
+        self._swap_count = 0

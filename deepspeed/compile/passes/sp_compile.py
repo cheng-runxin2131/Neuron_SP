@@ -78,7 +78,7 @@ def _collect_sharded_consumers(seed_nodes, sym_seq_dim_node):
 
 
 def pass_shard_seq_dim(gm: GraphModule, example_inputs):
-    sp_size = sp_dp_registry.sp_size()
+    sp_sz = sp_dp_registry.sp_size()
     input_ids_node = get_input_id_node(gm)
     val = get_node_shape_meta(input_ids_node)
     seq_symint = val.shape[1]
@@ -92,7 +92,7 @@ def pass_shard_seq_dim(gm: GraphModule, example_inputs):
         return
 
     with gm.graph.inserting_after(sym_seq_dim_node):
-        sharded_node = gm.graph.call_function(operator.floordiv, args=(sym_seq_dim_node, sp_size))
+        sharded_node = gm.graph.call_function(operator.floordiv, args=(sym_seq_dim_node, sp_sz))
 
     seed_nodes = set()
     for getter in (get_input_id_node, get_label_id_node, get_position_id_node):
@@ -144,10 +144,11 @@ def _insert_a2a(gm, node, scatter_idx, gather_idx, name):
 def pass_insert_attention_all_to_all(gm: GraphModule, real_inputs):
     attention_nodes = get_sdpa_nodes(gm)
     if len(attention_nodes) == 0:
-        raise RuntimeError("AutoSP currently supports torch.nn.functional.scaled_dot_product_attention as the "
-                           "attention backend. No SDPA attention operations were found in the compiled graph. "
-                           "Please ensure your model uses torch.nn.functional.scaled_dot_product_attention "
-                           "for AutoSP to work as expected.")
+        raise RuntimeError(
+            "AutoSP currently supports torch.nn.functional.scaled_dot_product_attention as the "
+            "attention backend. No SDPA attention operations were found in the compiled graph. "
+            "Please ensure your model uses torch.nn.functional.scaled_dot_product_attention "
+            "for AutoSP to work as expected.")
 
     for idx, attn_node in enumerate(attention_nodes):
         q, k, v = attn_node.args[:3]
@@ -245,7 +246,7 @@ def pass_propagate_shapes(gm: torch.fx.GraphModule, real_inputs):
         _restore_sdpa_masks(saved_masks)
 
 
-def _validate_sdpa_nodes(gm, sp_size, rank):
+def _validate_sdpa_nodes(gm, sp_sz, rank):
     sdpa_nodes = get_sdpa_nodes(gm)
     n_sdpa = len(sdpa_nodes)
     if n_sdpa == 0:
@@ -260,10 +261,10 @@ def _validate_sdpa_nodes(gm, sp_size, rank):
                 meta = node.meta.get("val") or node.meta.get("example_value")
                 if meta is not None and hasattr(meta, 'shape') and len(meta.shape) >= 2:
                     n_heads = meta.shape[1]
-                    if isinstance(n_heads, int) and n_heads % sp_size != 0:
+                    if isinstance(n_heads, int) and n_heads % sp_sz != 0:
                         raise RuntimeError(
                             f"[AutoSP] {arg_name} n_heads={n_heads} not divisible "
-                            f"by sp_size={sp_size}. For GQA models, "
+                            f"by sp_size={sp_sz}. For GQA models, "
                             f"set sp_size to a divisor of num_kv_heads={n_heads}.")
     return n_sdpa
 

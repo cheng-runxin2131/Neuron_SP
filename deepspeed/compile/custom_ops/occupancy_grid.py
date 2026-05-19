@@ -25,6 +25,14 @@ class OccupancyResult:
     shared_mem_per_block: int = 0
 
 
+@dataclass
+class DispatchPlan:
+    histogram_grid: OccupancyResult = None
+    filter_grid: OccupancyResult = None
+    num_passes: int = 1
+    num_sms: int = 0
+
+
 _MAX_BLOCKS_TABLE = {
     (7, 0): 32, (7, 5): 16, (8, 0): 32, (8, 6): 16,
     (8, 9): 16, (9, 0): 32, (10, 0): 32,
@@ -61,13 +69,9 @@ def get_cached_capability(device_id=-1):
     return _CAPABILITY_CACHE[device_id]
 
 
-def compute_grid(num_elements, block_threads=256, shared_mem_per_block=0,
-                 capability=None):
-    if capability is None:
-        capability = get_cached_capability()
-
+def _compute_blocks_per_sm(block_threads, shared_mem_per_block, capability):
     if capability.num_sms == 0:
-        return OccupancyResult(grid_size=1, block_threads=block_threads)
+        return 1
 
     warps_per_block = math.ceil(block_threads / capability.warp_size)
     max_warps_per_sm = capability.max_threads_per_sm // capability.warp_size
@@ -79,7 +83,18 @@ def compute_grid(num_elements, block_threads=256, shared_mem_per_block=0,
     if shared_mem_per_block > 0 and capability.max_shared_memory_per_sm > 0:
         blocks_by_smem = capability.max_shared_memory_per_sm // shared_mem_per_block
 
-    blocks_per_sm = max(min(blocks_by_warps, blocks_by_limit, blocks_by_smem), 1)
+    return max(min(blocks_by_warps, blocks_by_limit, blocks_by_smem), 1)
+
+
+def compute_grid(num_elements, block_threads=256, shared_mem_per_block=0,
+                 capability=None):
+    if capability is None:
+        capability = get_cached_capability()
+
+    if capability.num_sms == 0:
+        return OccupancyResult(grid_size=1, block_threads=block_threads)
+
+    blocks_per_sm = _compute_blocks_per_sm(block_threads, shared_mem_per_block, capability)
     max_occupancy = blocks_per_sm * capability.num_sms
     num_tiles = math.ceil(num_elements / block_threads)
     grid_size = min(max_occupancy, num_tiles)
@@ -96,12 +111,27 @@ def compute_grid(num_elements, block_threads=256, shared_mem_per_block=0,
 
 def compute_histogram_grid(num_elements, capability=None):
     return compute_grid(num_elements, block_threads=256,
-                        shared_mem_per_block=256 * 8, capability=capability).grid_size
+                        shared_mem_per_block=256 * 8, capability=capability)
 
 
 def compute_filter_grid(num_elements, capability=None):
     return compute_grid(num_elements, block_threads=256,
-                        shared_mem_per_block=256 * 4, capability=capability).grid_size
+                        shared_mem_per_block=256 * 4, capability=capability)
+
+
+def compute_dispatch_plan(num_elements, num_passes=1, capability=None):
+    if capability is None:
+        capability = get_cached_capability()
+
+    hist_occ = compute_histogram_grid(num_elements, capability)
+    filt_occ = compute_filter_grid(num_elements, capability)
+
+    return DispatchPlan(
+        histogram_grid=hist_occ,
+        filter_grid=filt_occ,
+        num_passes=num_passes,
+        num_sms=capability.num_sms,
+    )
 
 
 def compute_a2a_grid_for_tier(num_elements, tier, capability=None):
