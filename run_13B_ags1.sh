@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_TIMEOUT=3600000
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600
+export NCCL_DEBUG=WARN
+export NCCL_P2P_LEVEL=NVL
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+RESULTS_DIR="./desloc_results_13B"
+mkdir -p "$RESULTS_DIR"
+
+NGPU=3
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+LOG_DIR="./logs_13B_${TIMESTAMP}"
+mkdir -p "$LOG_DIR"
+
+echo "================================================================"
+echo " LOC+SP 13B Experiment — ags1 (2xA6000 + 1xH100 NVL)"
+echo " Start: $(date)"
+echo " NGPU: $NGPU"
+echo " M408-M409: histogram extraction + dispatch restructuring"
+echo "================================================================"
+nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
+echo "================================================================"
+
+PORT=29500
+
+run_exp() {
+    local NAME="$1"
+    local MODEL="$2"
+    local KX="$3"
+    local METHODS="$4"
+    local STEPS="$5"
+    local BATCH="${6:-1}"
+    local GRAD_ACCUM="${7:-16}"
+    local EXTRA="${8:-}"
+
+    local KU=$((KX * 3))
+    local KV=$((KX * 6))
+    if [ "$KX" -eq 1 ]; then KU=1; KV=1; fi
+
+    echo ""
+    echo ">>> [$(date +%H:%M:%S)] $NAME | model=$MODEL Kx=$KX Ku=$KU Kv=$KV methods=$METHODS steps=$STEPS batch=$BATCH×$GRAD_ACCUM $EXTRA"
+
+    CUDA_VISIBLE_DEVICES=0,1,2 torchrun \
+        --nproc_per_node=$NGPU \
+        --master_addr=127.0.0.1 \
+        --master_port=$PORT \
+        REAL_GPU_BENCHMARK.py \
+        --model_size "$MODEL" \
+        --batch_size "$BATCH" \
+        --grad_accum "$GRAD_ACCUM" \
+        --max_steps "$STEPS" \
+        --Kx "$KX" \
+        --Ku "$KU" \
+        --Kv "$KV" \
+        --methods $METHODS \
+        --output "$RESULTS_DIR" \
+        $EXTRA \
+        2>&1 | tee "$LOG_DIR/${NAME}.log"
+
+    local EXIT_CODE=${PIPESTATUS[0]}
+    if [ $EXIT_CODE -ne 0 ]; then
+        echo "!!! [$(date +%H:%M:%S)] $NAME FAILED (exit=$EXIT_CODE)"
+    else
+        echo "<<< [$(date +%H:%M:%S)] $NAME OK"
+    fi
+    PORT=$((PORT + 1))
+    sleep 3
+}
+
+echo ""
+echo "===== Phase 0: Smoke test (5 steps, 125M) ====="
+run_exp "smoke_ddp_125m" "125M" 1 "DDP" 5 4 1
+run_exp "smoke_desloc_125m" "125M" 32 "DESLOC" 5 4 1
+run_exp "smoke_sp_125m" "125M" 1 "DDP" 5 4 1 "--use_autosp"
+
+echo ""
+echo "===== Phase 1: 7B AC+SP baseline (2 seeds, 100 steps) ====="
+for S in 1 2; do
+    PYTHONHASHSEED=$((S * 7)) run_exp "p1_ddp_7b_ac_sp_s${S}" "7B" 1 "DDP" 100 1 16 "--use_ac --use_autosp --zero_stage 1"
+    PYTHONHASHSEED=$((S * 7)) run_exp "p1_desloc_7b_ac_sp_s${S}" "7B" 32 "DESLOC" 100 1 16 "--use_ac --use_autosp --zero_stage 1"
+done
+
+echo ""
+echo "===== Phase 2: 13B DDP vs DESLOC (AC+SP+ZeRO-1, 2 seeds) ====="
+for S in 1 2; do
+    PYTHONHASHSEED=$((S * 7)) run_exp "p2_ddp_13b_s${S}" "13B" 1 "DDP" 100 1 16 "--use_ac --use_autosp --zero_stage 1"
+    PYTHONHASHSEED=$((S * 7)) run_exp "p2_desloc_13b_Kx32_s${S}" "13B" 32 "DESLOC" 100 1 16 "--use_ac --use_autosp --zero_stage 1"
+done
+
+echo ""
+echo "===== Phase 3: 13B Kx ablation (1 seed) ====="
+for KX in 8 16 64; do
+    PYTHONHASHSEED=7 run_exp "p3_desloc_13b_Kx${KX}" "13B" "$KX" "DESLOC" 100 1 16 "--use_ac --use_autosp --zero_stage 1"
+done
+
+echo ""
+echo "===== Phase 4: 13B CPU offload (memory stress test, 1 seed) ====="
+PYTHONHASHSEED=7 run_exp "p4_desloc_13b_cpuoff" "13B" 32 "DESLOC" 50 1 16 "--use_ac --use_autosp --zero_stage 1 --cpu_offload"
+
+echo ""
+echo "===== Phase 5: 13B long context seq=2048 (1 seed) ====="
+PYTHONHASHSEED=7 run_exp "p5_ddp_13b_seq2048" "13B" 1 "DDP" 50 1 8 "--use_ac --use_autosp --zero_stage 1 --max_seq_len 2048"
+PYTHONHASHSEED=7 run_exp "p5_desloc_13b_seq2048" "13B" 32 "DESLOC" 50 1 8 "--use_ac --use_autosp --zero_stage 1 --max_seq_len 2048"
+
+echo ""
+echo "===== Phase 6: 13B Nesterov outer optimizer (1 seed) ====="
+PYTHONHASHSEED=7 run_exp "p6_nesterov_13b" "13B" 32 "DESLOC" 100 1 16 "--use_ac --use_autosp --zero_stage 1 --outer_optimizer nesterov --outer_momentum 0.9"
+
+echo ""
+echo "================================================================"
+echo " All experiments done — $(date)"
+echo " Logs: $LOG_DIR"
+echo " Results: $RESULTS_DIR"
+echo " JSON count: $(ls -1 $RESULTS_DIR/*.json 2>/dev/null | wc -l)"
+echo "================================================================"
+
+python3 << 'PYEOF'
+import json, glob, statistics
+
+results = {}
+for f in sorted(glob.glob('desloc_results_13B/*.json')):
+    d = json.load(open(f))
+    cfg = d.get('config', {})
+    model = cfg.get('model_size', '?')
+    kx = cfg.get('Kx', 1)
+    steps = cfg.get('max_steps', 0)
+    if steps < 10:
+        continue
+    for method, data in d.get('results', {}).items():
+        if not isinstance(data, dict):
+            continue
+        loss = data.get('final_loss')
+        tps = data.get('tokens_per_sec_per_gpu', 0)
+        peak_mem = data.get('peak_memory_gb', 0)
+        mfu = data.get('mfu', 0)
+        if loss is None:
+            continue
+        key = f'{method}_{model}_Kx{kx}'
+        results.setdefault(key, []).append({
+            'loss': loss, 'tps': tps, 'mem': peak_mem, 'mfu': mfu
+        })
+
+print(f"\n{'Key':<42} {'N':>3} {'Loss':>14} {'tok/s/gpu':>12} {'MemGB':>8} {'MFU':>8}")
+print('-' * 92)
+for key in sorted(results.keys()):
+    runs = results[key]
+    losses = [r['loss'] for r in runs]
+    tps_vals = [r['tps'] for r in runs]
+    mems = [r['mem'] for r in runs]
+    mfus = [r['mfu'] for r in runs]
+    ml = statistics.mean(losses)
+    sl = statistics.stdev(losses) if len(losses) > 1 else 0
+    mt = statistics.mean(tps_vals)
+    mm = statistics.mean(mems)
+    mf = statistics.mean(mfus)
+    print(f'{key:<42} {len(runs):>3} {ml:>7.2f}+/-{sl:<5.2f} {mt:>11.0f} {mm:>7.1f} {mf:>7.4f}')
+
+for model in ['7B', '13B']:
+    dk = f'DDP_{model}_Kx1'
+    lk = f'DESLOC_{model}_Kx32'
+    if dk in results and lk in results:
+        ddp_loss = statistics.mean([r['loss'] for r in results[dk]])
+        des_loss = statistics.mean([r['loss'] for r in results[lk]])
+        ddp_tps = statistics.mean([r['tps'] for r in results[dk]])
+        des_tps = statistics.mean([r['tps'] for r in results[lk]])
+        print(f'\n{model}: DDP loss={ddp_loss:.3f} DESLOC loss={des_loss:.3f} '
+              f'gap={abs(des_loss-ddp_loss):.3f}')
+        if ddp_tps > 0:
+            print(f'{model}: DDP tok/s={ddp_tps:.0f} DESLOC tok/s={des_tps:.0f} '
+                  f'speedup={des_tps/ddp_tps:.2f}x')
+PYEOF
