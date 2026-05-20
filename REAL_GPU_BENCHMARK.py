@@ -2142,16 +2142,82 @@ class Trainer:
                     print(f"[SP+DEC] Sequence parallel active via DeepSpeed compile")
                     print(f"[SP+DEC] DES-LOC Kx={self.config.Kx} gating on AllReduce")
             except Exception as e:
-                # M339 risk fix: previously this silently fell back to
-                # eager mode, user thought SP was active but it wasn't.
-                # Now we log explicitly and mark sp_enabled=False.
-                self._sp_enabled = False
                 if self.rank == 0:
-                    print(f"[SP+DEC] WARNING: AutoSP compile FAILED: {e}")
-                    print(f"[SP+DEC] Running WITHOUT sequence parallel")
-                    print(f"[SP+DEC] DES-LOC Kx gating still active (data parallel only)")
-                    print(f"[SP+DEC] To fix: install deepspeed[compile] or use "
-                          f"standalone SP (non-DeepSpeed path)")
+                    print(f"[SP+DEC] Compile-time AutoSP failed: {e}")
+                    print(f"[SP+DEC] Falling back to eager Ulysses SP")
+
+                model_cfg = self.config.get_model_config()
+                n_heads = model_cfg['n_head']
+                sp_size = 1
+                for candidate in range(min(self.world_size, n_heads), 0, -1):
+                    if n_heads % candidate == 0 and candidate <= self.world_size:
+                        sp_size = candidate
+                        break
+                self._sp_size = sp_size
+
+                if sp_size > 1:
+                    try:
+                        local_gpu_name = torch.cuda.get_device_name(self.engine.device)
+                        name_tensor = torch.zeros(256, dtype=torch.uint8, device=self.engine.device)
+                        name_bytes = local_gpu_name.encode('utf-8')[:256]
+                        name_tensor[:len(name_bytes)] = torch.tensor(list(name_bytes), dtype=torch.uint8)
+                        all_names = [torch.zeros(256, dtype=torch.uint8, device=self.engine.device)
+                                     for _ in range(self.world_size)]
+                        dist.all_gather(all_names, name_tensor)
+                        gpu_names = {}
+                        for r, nt in enumerate(all_names):
+                            raw = bytes(nt.cpu().tolist()).rstrip(b'\x00').decode('utf-8', errors='replace')
+                            gpu_names[r] = raw
+
+                        from collections import defaultdict
+                        type_groups = defaultdict(list)
+                        for r, name in gpu_names.items():
+                            type_groups[name].append(r)
+
+                        sp_ranks = None
+                        for name, ranks in sorted(type_groups.items(),
+                                                  key=lambda kv: (-len(kv[1]), kv[0])):
+                            usable = min(len(ranks), sp_size)
+                            for s in range(usable, 0, -1):
+                                if n_heads % s == 0:
+                                    sp_ranks = sorted(ranks[:s])
+                                    sp_size = s
+                                    break
+                            if sp_ranks:
+                                break
+
+                        if sp_ranks and len(sp_ranks) >= 2:
+                            self._sp_size = sp_size
+                            sp_group = dist.new_group(sp_ranks)
+                            self._sp_ranks = sp_ranks
+                            self._sp_group = sp_group
+
+                            if self.config.max_seq_len % sp_size != 0:
+                                self.config.max_seq_len = ((self.config.max_seq_len + sp_size - 1) // sp_size) * sp_size
+
+                            if self.rank in sp_ranks:
+                                _sp_ctx_set(on=True, grp=sp_group, sz=sp_size, rk=sp_ranks.index(self.rank))
+                                self._sp_enabled = True
+                            else:
+                                _sp_ctx_set(on=False, grp=None, sz=1, rk=0)
+                                self._sp_enabled = False
+
+                            if self.rank == 0:
+                                print(f"[SP+DEC] Eager Ulysses SP: sp_size={sp_size} "
+                                      f"ranks={sp_ranks} (GPU: {gpu_names[sp_ranks[0]]})")
+                                print(f"[SP+DEC] DES-LOC Kx={self.config.Kx} gating still active")
+                        else:
+                            self._sp_enabled = False
+                            if self.rank == 0:
+                                print(f"[SP+DEC] No valid SP group found (n_heads={n_heads} ws={self.world_size})")
+                    except Exception as e2:
+                        self._sp_enabled = False
+                        if self.rank == 0:
+                            print(f"[SP+DEC] Eager fallback also failed: {e2}")
+                else:
+                    self._sp_enabled = False
+                    if self.rank == 0:
+                        print(f"[SP+DEC] sp_size=1, no SP possible")
                 _autosp_prepare = None
 
         for step in range(1, self.config.max_steps + 1):
@@ -2173,13 +2239,23 @@ class Trainer:
             input_ids = batch['input_ids'].to(self.engine.device)
             labels = batch['labels'].to(self.engine.device)
 
-            # AutoSP: prepare inputs with sequence dimension annotation
             if _autosp_prepare is not None:
                 input_ids = _autosp_prepare(
                     input_id=input_ids,
                     label_id=labels,
                     seq_dim=1,
                 )
+            elif self._sp_enabled and self._sp_group is not None and _autosp_prepare is None:
+                _SP_CTX['step'] = step
+                sp_src = self._sp_ranks[0]
+                dist.broadcast(input_ids, src=sp_src, group=self._sp_group)
+                dist.broadcast(labels, src=sp_src, group=self._sp_group)
+                if self.rank in self._sp_ranks:
+                    local_seq = input_ids.shape[1] // self._sp_size
+                    sp_rk = self._sp_ranks.index(self.rank)
+                    start = sp_rk * local_seq
+                    input_ids = input_ids[:, start:start+local_seq].contiguous()
+                    labels = labels[:, start:start+local_seq].contiguous()
 
             _, loss = self.engine(input_ids, labels)
 
