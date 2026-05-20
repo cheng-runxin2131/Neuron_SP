@@ -211,46 +211,25 @@ def finalize_a2a_pass(is_last_pass, counter_update_fn):
 
 def cleanup_sp_groups():
     global _PROCESS_GROUPS, _PENDING_A2A_HANDLES
-    try:
-        fence_all_sp_handles(timeout_ms=5000)
-    except RuntimeError:
-        logger.warning("[SP cleanup] Timeout fencing pending A2A handles")
+    fence_all_sp_handles(timeout_ms=5000)
 
-    try:
-        from .double_buffer_a2a import get_buffer_pool
-        get_buffer_pool().free_all()
-    except ImportError:
-        pass
+    from .double_buffer_a2a import get_buffer_pool
+    get_buffer_pool().free_all()
 
-    try:
-        from .sp_histogram import get_histogram_kernel
-        get_histogram_kernel().reset()
-    except ImportError:
-        pass
+    from .sp_histogram import get_histogram_kernel
+    get_histogram_kernel().reset()
 
-    try:
-        from ..passes.long_context_checkpointing import restore_default_checkpointing
-        restore_default_checkpointing()
-    except ImportError:
-        pass
+    from ..passes.long_context_checkpointing import restore_default_checkpointing
+    restore_default_checkpointing()
 
-    try:
-        if dist.is_initialized():
-            dist.barrier()
-    except Exception:
-        pass
+    if dist.is_initialized():
+        dist.barrier()
 
     for gid, group in list(_PROCESS_GROUPS.items()):
-        try:
-            dist.destroy_process_group(group)
-        except Exception:
-            pass
+        dist.destroy_process_group(group)
 
-    try:
-        from .hetero_mesh import reset_hetero_plan
-        reset_hetero_plan()
-    except ImportError:
-        pass
+    from .hetero_mesh import reset_hetero_plan
+    reset_hetero_plan()
 
     _PROCESS_GROUPS.clear()
     _PENDING_A2A_HANDLES.clear()

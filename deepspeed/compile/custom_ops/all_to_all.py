@@ -46,10 +46,7 @@ def _resolve_group():
         from .sp_dp_registry import get_loc_sp_group_ids
         loc_gids = get_loc_sp_group_ids()
         if loc_gids:
-            try:
-                grp = get_group(loc_gids[0])
-            except KeyError:
-                pass
+            grp = get_group(loc_gids[0])
     return grp
 
 

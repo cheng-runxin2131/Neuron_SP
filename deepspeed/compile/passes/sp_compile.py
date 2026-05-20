@@ -123,10 +123,7 @@ def pass_shard_tagged_inputs(gm: GraphModule, example_inputs):
     from ..fx import find_node_by_tag
     mask_node = find_node_by_tag(gm, constants.AUTOSP_ATTENTION_MASK_KEY)
     if mask_node is not None:
-        try:
-            shard_tensor_node(gm, mask_node)
-        except (AssertionError, RuntimeError, ValueError, AttributeError) as exc:
-            logger.warning(f"[AutoSP] attention_mask sharding skipped: {exc}")
+        shard_tensor_node(gm, mask_node)
 
 
 def _insert_a2a(gm, node, scatter_idx, gather_idx, name):
