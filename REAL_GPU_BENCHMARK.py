@@ -1710,19 +1710,16 @@ class Trainer:
             max_seq_len=config.max_seq_len,
             use_ac=config.use_activation_checkpointing,
             **model_config
-        ).to(self.device)
+        )
 
-        # BF16 model parameters for memory efficiency on large models
-        # Ref: Megatron training.py:1431 — Float16Module wraps model in BF16
-        # before DDP. This halves param memory (7B: 26.6GB→13.3GB) and is
-        # required to fit 7B in 95GB H20 with Adam states.
-        # BF16 has 8 exponent bits (same as FP32) so no GradScaler needed.
         n_params = sum(p.numel() for p in self.model.parameters())
-        if n_params > 500_000_000:  # > 500M params → use BF16
+        if n_params > 500_000_000:
             self.model = self.model.bfloat16()
             if self.rank == 0:
-                print(f"[BF16] Model converted to bfloat16 ({n_params/1e6:.0f}M params, "
+                print(f"[BF16] Model converted to bfloat16 on CPU ({n_params/1e6:.0f}M params, "
                       f"saves {n_params * 2 / 1e9:.1f}GB)")
+
+        self.model = self.model.to(self.device)
 
         if config.use_activation_checkpointing and self.rank == 0:
             print(f"[AC] Layer-wise activation checkpointing enabled "
