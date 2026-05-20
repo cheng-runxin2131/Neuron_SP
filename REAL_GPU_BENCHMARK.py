@@ -2038,7 +2038,7 @@ class Trainer:
                 "outer_lr": config.outer_lr,
                 "inner_optimizer": "adam",
             },
-            "wall_clock_breakdown": True,
+            "wall_clock_breakdown": False,
         }
         _zero_stage = getattr(config, 'zero_stage', 0)
         _cpu_offload = getattr(config, 'cpu_offload', False)
