@@ -1,0 +1,33 @@
+From 05076459635ca094bc9f82997ca883a78bcbe529 Mon Sep 17 00:00:00 2001
+From: dylanyunlon <dylanyunlong@gmail.com>
+Date: Wed, 20 May 2026 04:04:21 +0000
+Subject: [PATCH] =?UTF-8?q?M433:=20Fix=20DeslocProgress()=20constructor=20?=
+ =?UTF-8?q?call=20=E2=80=94=20takes=20no=20args?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+DeslocProgress.__init__(self) accepts no positional arguments.
+Call site passed config.max_steps causing TypeError on rank 2.
+
+Signed-off-by: dylanyunlon <dylanyunlong@gmail.com>
+---
+ REAL_GPU_BENCHMARK.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/REAL_GPU_BENCHMARK.py b/REAL_GPU_BENCHMARK.py
+index b53e3dc..70efcf9 100644
+--- a/REAL_GPU_BENCHMARK.py
++++ b/REAL_GPU_BENCHMARK.py
+@@ -1777,7 +1777,7 @@ class Trainer:
+             self._profiler = get_desloc_profiler()
+             # DES-LOC timer from timer.py
+             self._stimer = DeslocSTimer()
+-            self._progress = DeslocProgress(config.max_steps)
++            self._progress = DeslocProgress()
+         else:
+             self.engine = None
+             self._profiler = None
+-- 
+2.43.0
+

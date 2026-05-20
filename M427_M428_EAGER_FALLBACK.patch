@@ -1,0 +1,170 @@
+From fe9159ac045fac7bb1e7989e768ff9431d9afb55 Mon Sep 17 00:00:00 2001
+From: dylanyunlon <dylanyunlong@gmail.com>
+Date: Wed, 20 May 2026 03:23:17 +0000
+Subject: [PATCH] M427-M428: Eager Ulysses fallback when compile-time AutoSP
+ fails
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The compile-time AutoSP path (engine.compile backend=inductor) requires
+PyTorch >=2.9 with fullgraph support and transformers <=4.50.3. On ags1,
+this compile silently fails and the except block previously set
+_autosp_prepare=None and sp_enabled=False, effectively disabling ALL
+sequence parallelism — explaining why every experiment result shows
+use_autosp=False even when --use_autosp was passed.
+
+=== M427: _train_deepspeed compile fallback ===
+
+REAL_GPU_BENCHMARK.py:
+  When engine.compile() throws, instead of disabling SP entirely:
+  - Probe GPU types via dist.all_gather (same as _train_baseline path)
+  - Group same-type GPUs, find largest SP-compatible subset
+  - Create SP process group, set _SP_CTX for eager Ulysses A2A
+  - For 13B (n_heads=40) on ags1: 2xA6000 form sp_size=2 (40%2=0)
+  - H100 remains DP-only (does not enter SP group)
+  - DES-LOC Kx gating remains active on the DP AllReduce path
+
+This mirrors the existing _train_baseline SP init logic but runs
+inside _train_deepspeed, so the DeepSpeed engine still handles
+gradient accumulation, optimizer state, and DES-LOC scheduling.
+
+=== M428: Eager scatter in DeepSpeed training loop ===
+
+REAL_GPU_BENCHMARK.py:
+  When _autosp_prepare is None but _sp_enabled is True (eager fallback):
+  - Broadcast input_ids/labels within SP group (data consistency)
+  - Scatter along seq dim: each SP rank gets seq_len/sp_size tokens
+  - _SP_CTX step counter updated for attention A2A logging
+  - CausalSelfAttention already handles _SP_CTX-gated A2A
+  - Loss computed on local sequence, DES-LOC handles gradient sync
+
+Signed-off-by: dylanyunlon <dylanyunlong@gmail.com>
+---
+ REAL_GPU_BENCHMARK.py | 96 ++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 86 insertions(+), 10 deletions(-)
+
+diff --git a/REAL_GPU_BENCHMARK.py b/REAL_GPU_BENCHMARK.py
+index e105724..06d4304 100644
+--- a/REAL_GPU_BENCHMARK.py
++++ b/REAL_GPU_BENCHMARK.py
+@@ -2142,16 +2142,82 @@ class Trainer:
+                     print(f"[SP+DEC] Sequence parallel active via DeepSpeed compile")
+                     print(f"[SP+DEC] DES-LOC Kx={self.config.Kx} gating on AllReduce")
+             except Exception as e:
+-                # M339 risk fix: previously this silently fell back to
+-                # eager mode, user thought SP was active but it wasn't.
+-                # Now we log explicitly and mark sp_enabled=False.
+-                self._sp_enabled = False
+                 if self.rank == 0:
+-                    print(f"[SP+DEC] WARNING: AutoSP compile FAILED: {e}")
+-                    print(f"[SP+DEC] Running WITHOUT sequence parallel")
+-                    print(f"[SP+DEC] DES-LOC Kx gating still active (data parallel only)")
+-                    print(f"[SP+DEC] To fix: install deepspeed[compile] or use "
+-                          f"standalone SP (non-DeepSpeed path)")
++                    print(f"[SP+DEC] Compile-time AutoSP failed: {e}")
++                    print(f"[SP+DEC] Falling back to eager Ulysses SP")
++
++                model_cfg = self.config.get_model_config()
++                n_heads = model_cfg['n_head']
++                sp_size = 1
++                for candidate in range(min(self.world_size, n_heads), 0, -1):
++                    if n_heads % candidate == 0 and candidate <= self.world_size:
++                        sp_size = candidate
++                        break
++                self._sp_size = sp_size
++
++                if sp_size > 1:
++                    try:
++                        local_gpu_name = torch.cuda.get_device_name(self.engine.device)
++                        name_tensor = torch.zeros(256, dtype=torch.uint8, device=self.engine.device)
++                        name_bytes = local_gpu_name.encode('utf-8')[:256]
++                        name_tensor[:len(name_bytes)] = torch.tensor(list(name_bytes), dtype=torch.uint8)
++                        all_names = [torch.zeros(256, dtype=torch.uint8, device=self.engine.device)
++                                     for _ in range(self.world_size)]
++                        dist.all_gather(all_names, name_tensor)
++                        gpu_names = {}
++                        for r, nt in enumerate(all_names):
++                            raw = bytes(nt.cpu().tolist()).rstrip(b'\x00').decode('utf-8', errors='replace')
++                            gpu_names[r] = raw
++
++                        from collections import defaultdict
++                        type_groups = defaultdict(list)
++                        for r, name in gpu_names.items():
++                            type_groups[name].append(r)
++
++                        sp_ranks = None
++                        for name, ranks in sorted(type_groups.items(),
++                                                  key=lambda kv: (-len(kv[1]), kv[0])):
++                            usable = min(len(ranks), sp_size)
++                            for s in range(usable, 0, -1):
++                                if n_heads % s == 0:
++                                    sp_ranks = sorted(ranks[:s])
++                                    sp_size = s
++                                    break
++                            if sp_ranks:
++                                break
++
++                        if sp_ranks and len(sp_ranks) >= 2:
++                            self._sp_size = sp_size
++                            sp_group = dist.new_group(sp_ranks)
++                            self._sp_ranks = sp_ranks
++                            self._sp_group = sp_group
++
++                            if self.config.max_seq_len % sp_size != 0:
++                                self.config.max_seq_len = ((self.config.max_seq_len + sp_size - 1) // sp_size) * sp_size
++
++                            if self.rank in sp_ranks:
++                                _sp_ctx_set(on=True, grp=sp_group, sz=sp_size, rk=sp_ranks.index(self.rank))
++                                self._sp_enabled = True
++                            else:
++                                _sp_ctx_set(on=False, grp=None, sz=1, rk=0)
++                                self._sp_enabled = False
++
++                            if self.rank == 0:
++                                print(f"[SP+DEC] Eager Ulysses SP: sp_size={sp_size} "
++                                      f"ranks={sp_ranks} (GPU: {gpu_names[sp_ranks[0]]})")
++                                print(f"[SP+DEC] DES-LOC Kx={self.config.Kx} gating still active")
++                        else:
++                            self._sp_enabled = False
++                            if self.rank == 0:
++                                print(f"[SP+DEC] No valid SP group found (n_heads={n_heads} ws={self.world_size})")
++                    except Exception as e2:
++                        self._sp_enabled = False
++                        if self.rank == 0:
++                            print(f"[SP+DEC] Eager fallback also failed: {e2}")
++                else:
++                    self._sp_enabled = False
++                    if self.rank == 0:
++                        print(f"[SP+DEC] sp_size=1, no SP possible")
+                 _autosp_prepare = None
+ 
+         for step in range(1, self.config.max_steps + 1):
+@@ -2173,13 +2239,23 @@ class Trainer:
+             input_ids = batch['input_ids'].to(self.engine.device)
+             labels = batch['labels'].to(self.engine.device)
+ 
+-            # AutoSP: prepare inputs with sequence dimension annotation
+             if _autosp_prepare is not None:
+                 input_ids = _autosp_prepare(
+                     input_id=input_ids,
+                     label_id=labels,
+                     seq_dim=1,
+                 )
++            elif self._sp_enabled and self._sp_group is not None and _autosp_prepare is None:
++                _SP_CTX['step'] = step
++                sp_src = self._sp_ranks[0]
++                dist.broadcast(input_ids, src=sp_src, group=self._sp_group)
++                dist.broadcast(labels, src=sp_src, group=self._sp_group)
++                if self.rank in self._sp_ranks:
++                    local_seq = input_ids.shape[1] // self._sp_size
++                    sp_rk = self._sp_ranks.index(self.rank)
++                    start = sp_rk * local_seq
++                    input_ids = input_ids[:, start:start+local_seq].contiguous()
++                    labels = labels[:, start:start+local_seq].contiguous()
+ 
+             _, loss = self.engine(input_ids, labels)
+ 
+-- 
+2.43.0
+

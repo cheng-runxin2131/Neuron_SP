@@ -1,0 +1,59 @@
+From bf6268daa1f7623036f6e272124c4dc4610f4127 Mon Sep 17 00:00:00 2001
+From: dylanyunlon <dylanyunlong@gmail.com>
+Date: Wed, 20 May 2026 03:57:37 +0000
+Subject: [PATCH] =?UTF-8?q?M432:=20Switch=20fp16=E2=86=92bf16=20mode,=20fo?=
+ =?UTF-8?q?rce=20ZeRO-1=20with=20cpu=5Foffload?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+FP16_UnfusedOptimizer clones fp32 master weights on GPU:
+  bf16 params 25.7GB + fp32 clone 51.4GB = 77GB > A6000 47.5GB
+
+Two fixes:
+  1. fp16.enabled→bf16.enabled: BF16Optimizer keeps params in bf16
+     without fp32 master copy on GPU (BF16 has 8 exponent bits =
+     same dynamic range as FP32, no loss scaling needed)
+  2. cpu_offload forces zero_stage >= 1: ZeRO stage 0 ignores
+     offload_optimizer config. Stage 1 partitions optimizer states
+     across ranks and offloads to CPU via DeepSpeedCPUAdam.
+
+Memory after fix on A6000:
+  bf16 params:     25.7GB (on GPU)
+  optimizer states: 0GB   (offloaded to CPU via ZeRO-1)
+  gradients:       25.7GB (but ZeRO-1 partitions across 3 GPUs → 8.6GB)
+  AC activations:  ~2-4GB (per-layer checkpointing)
+  Total:           ~36GB  < 47.5GB
+
+Signed-off-by: dylanyunlon <dylanyunlong@gmail.com>
+---
+ REAL_GPU_BENCHMARK.py | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/REAL_GPU_BENCHMARK.py b/REAL_GPU_BENCHMARK.py
+index 8de7c64..b53e3dc 100644
+--- a/REAL_GPU_BENCHMARK.py
++++ b/REAL_GPU_BENCHMARK.py
+@@ -2023,9 +2023,8 @@ class Trainer:
+                     "weight_decay": config.weight_decay,
+                 }
+             },
+-            "fp16": {
++            "bf16": {
+                 "enabled": True,
+-                "initial_scale_power": 16,
+             },
+             "desloc": {
+                 "enabled": True,
+@@ -2044,6 +2043,8 @@ class Trainer:
+         # ZeRO optimization (supports stage 0 and 1 for all methods)
+         _zero_stage = getattr(config, 'zero_stage', 0)
+         _cpu_offload = getattr(config, 'cpu_offload', False)
++        if _cpu_offload and _zero_stage < 1:
++            _zero_stage = 1
+         zero_cfg = {"stage": _zero_stage}
+         if _cpu_offload:
+             zero_cfg["offload_optimizer"] = {"device": "cpu", "pin_memory": True}
+-- 
+2.43.0
+

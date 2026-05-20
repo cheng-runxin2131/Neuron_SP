@@ -1,0 +1,318 @@
+From 780e076d3dc0bbd0c9c34fbaa08bbf3edc1aac22 Mon Sep 17 00:00:00 2001
+From: dylanyunlon <dylanyunlong@gmail.com>
+Date: Wed, 20 May 2026 03:17:13 +0000
+Subject: [PATCH] M422-M426: Extract SP AllReduce from Z1 flush into dedicated
+ method
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Following CCCL f984c90 (Extract first histogram-only pass in DeviceTopK
+into its own kernel), this commit extracts the SP-group AllReduce from
+Z1CustomOpExecutor::flushReduceBucket into the base class method
+flushSPReduceBucket, and restructures the dispatch to separate SP
+(every step) from DP (Kx-gated) AllReduce paths.
+
+=== Structural mapping to CCCL f984c90 ===
+
+  CCCL agent_topk.cuh:
+    - Removed template <bool IsFirstPass> from filter_and_histogram
+    - Extracted IsFirstPass=true body into invoke_histogram_only()
+    - filter_and_histogram now handles only pass>=1 (filter+histogram)
+
+  Neuron_SP deepcompile.h + z1.cpp:
+    - Added sp_comm_, kx_, step_ fields to CustomOpExecutor
+    - Extracted SP-sharded param AllReduce into flushSPReduceBucket()
+    - flushReduceBucket now handles only DP params (Kx-gated)
+    - No if(is_sp) branch in the hot path — two separate methods
+
+  CCCL dispatch_topk.cuh:
+    - Pass 0: dedicated histogram_kernel launch before loop
+    - Loop changed from pass=0 to pass=1
+    - DoubleBuffer selector ^= 1 moved to loop tail
+
+  Neuron_SP z1.cpp:
+    - flushReduceBucket calls flushSPReduceBucket first (pass-0)
+    - Then Kx-gates the DP AllReduce (pass-1..N)
+    - endBackward increments step_ for Kx warmup ramp
+
+=== M422: deepcompile.h — DSParam sp_group_id ===
+
+  - Add sp_group_id_ field (-1 = DP-only, >=0 = SP-sharded)
+  - Add setSpGroupId/getSpGroupId accessors
+
+=== M423: deepcompile.h — CustomOpExecutor SP members ===
+
+  - Add sp_comm_ (ncclComm_t for SP group, nullptr when unused)
+  - Add sp_size_, kx_, warmup_steps_, step_ for Kx gating
+  - Add shouldSyncDP() — returns true during warmup or on Kx boundary
+  - Add flushSPReduceBucket() — AllReduce only SP-sharded params on sp_comm_
+
+=== M424: z1.cpp — restructure flushReduceBucket ===
+
+  - Call flushSPReduceBucket first (SP params, every step)
+  - Check shouldSyncDP(); if false, performCleanup and return
+  - DP AllReduce skips SP-sharded params (already handled)
+  - Add endBackward override to increment step_
+
+=== M425: z1.cpp + z1.h — register_graph_z1_sp, register_param_sp ===
+
+  - register_graph_z1_sp: creates SP NCCL communicator via ncclCommInitRank
+  - register_param_sp: sets sp_group_id on DSParam after registration
+
+=== M426: init.cpp — pybind11 registration ===
+
+  - Add register_graph_z1_sp and register_param_sp bindings
+
+4 files changed, +132 -2. Zero new files.
+
+Signed-off-by: dylanyunlon <dylanyunlong@gmail.com>
+---
+ csrc/compile/init.cpp       |  4 ++
+ csrc/compile/z1.cpp         | 76 ++++++++++++++++++++++++++++++++++++-
+ csrc/compile/z1.h           | 11 ++++++
+ csrc/includes/deepcompile.h | 43 +++++++++++++++++++++
+ 4 files changed, 132 insertions(+), 2 deletions(-)
+
+diff --git a/csrc/compile/init.cpp b/csrc/compile/init.cpp
+index 0ec4ce7..c4ba9f0 100644
+--- a/csrc/compile/init.cpp
++++ b/csrc/compile/init.cpp
+@@ -89,9 +89,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+     m.def("init", &dc::init, "Set the process group");
+     m.def("cleanup", &dc::cleanup, "Cleanup the process group");
+     m.def("register_param", &dc::register_param, "Register a parameter");
++    m.def("register_param_sp", &dc::register_param_sp, "Register a parameter with SP group id");
+     m.def("register_graph_z1",
+           &dc::register_graph_z1,
+           "Register graph with a list of ds parameter ids");
++    m.def("register_graph_z1_sp",
++          &dc::register_graph_z1_sp,
++          "Register graph for Z1 with SP communicator and Kx gating");
+     m.def("register_graph_z2",
+           &dc::register_graph_z2,
+           "Register graph with a list of ds parameter ids");
+diff --git a/csrc/compile/z1.cpp b/csrc/compile/z1.cpp
+index cbec2de..9e81792 100644
+--- a/csrc/compile/z1.cpp
++++ b/csrc/compile/z1.cpp
+@@ -50,12 +50,21 @@ public:
+     {
+         if (!hasKey(reduce_tasks_, scalar_type)) { return; }
+ 
++        flushSPReduceBucket(scalar_type);
++
++        if (!shouldSyncDP()) {
++            performCleanup(scalar_type);
++            return;
++        }
++
+         blockCopyEvents(scalar_type);
+         applyPreDivision(scalar_type);
+ 
+-        // NCCL AllReduce operation
+         ncclGroupStart();
+         for (const ReduceTask& t : reduce_tasks_.at(scalar_type)) {
++            const DSParam& param = param_registry_->getParam(t.getDSId());
++            if (sp_comm_ != nullptr && param.getSpGroupId() >= 0) continue;
++
+             ncclResult_t result = ncclAllReduce(t.getSendBuf().data_ptr(),
+                                                 t.getSendBuf().data_ptr(),
+                                                 t.getSendBuf().numel(),
+@@ -67,7 +76,6 @@ public:
+         }
+         ncclGroupEnd();
+ 
+-        // Copy results to gradient buffers
+         {
+             at::cuda::CUDAStreamGuard guard(rs_stream_);
+             for (const ReduceTask& t : reduce_tasks_.at(scalar_type)) {
+@@ -86,6 +94,12 @@ public:
+         performCleanup(scalar_type);
+     }
+ 
++    void endBackward() override
++    {
++        step_++;
++        CustomOpExecutor::endBackward();
++    }
++
+ protected:
+     std::unordered_map<long, at::Tensor> grad_tensors_;
+ };
+@@ -105,6 +119,50 @@ void register_graph_z1(long graph_id, const std::vector<long>& ds_ids)
+                                                                pre_div_reduce);
+ }
+ 
++void register_graph_z1_sp(long graph_id,
++                          const std::vector<long>& ds_ids,
++                          int sp_size,
++                          int kx,
++                          int warmup_steps)
++{
++    auto executor = std::make_shared<Z1CustomOpExecutor>(process_group,
++                                                         param_registry,
++                                                         reduce_buckets,
++                                                         ds_ids,
++                                                         nccl_comm,
++                                                         rs_stream,
++                                                         copy_stream,
++                                                         pre_div_reduce);
++    executor->sp_size_ = sp_size;
++    executor->kx_ = kx;
++    executor->warmup_steps_ = warmup_steps;
++
++    if (sp_size > 1) {
++        ncclUniqueId sp_id;
++        int rank = process_group->getRank();
++        int sp_group_rank = rank % sp_size;
++
++        if (sp_group_rank == 0) {
++            ncclGetUniqueId(&sp_id);
++        }
++
++        auto vec = std::vector<uint8_t>(
++            reinterpret_cast<uint8_t*>(&sp_id),
++            reinterpret_cast<uint8_t*>(&sp_id) + NCCL_UNIQUE_ID_BYTES);
++        auto tensor = torch::from_blob(vec.data(),
++                                        {static_cast<long>(vec.size())},
++                                        torch::kUInt8).to(torch::Device(torch::kCUDA));
++        std::vector<at::Tensor> bcast_input = {tensor};
++        process_group->broadcast(bcast_input, c10d::BroadcastOptions())->wait();
++        std::memcpy(&sp_id, tensor.to(torch::Device(torch::kCPU)).data_ptr(),
++                     NCCL_UNIQUE_ID_BYTES);
++
++        ncclCommInitRank(&executor->sp_comm_, sp_size, sp_id, sp_group_rank);
++    }
++
++    executors[graph_id] = executor;
++}
++
+ void register_param(long ds_id,
+                     const std::vector<int64_t>& ds_shape,
+                     at::Tensor ds_tensor,
+@@ -114,4 +172,18 @@ void register_param(long ds_id,
+     param_registry->registerParam(ds_id, ds_shape, ds_tensor, grad_buffer, false, offset, false);
+ }
+ 
++void register_param_sp(long ds_id,
++                       const std::vector<int64_t>& ds_shape,
++                       at::Tensor ds_tensor,
++                       at::Tensor grad_buffer,
++                       int64_t offset,
++                       int sp_group_id)
++{
++    param_registry->registerParam(ds_id, ds_shape, ds_tensor, grad_buffer, false, offset, false);
++    if (sp_group_id >= 0) {
++        auto& params = const_cast<std::unordered_map<long, DSParam>&>(param_registry->getParams());
++        params.at(ds_id).setSpGroupId(sp_group_id);
++    }
++}
++
+ }  // namespace dc
+diff --git a/csrc/compile/z1.h b/csrc/compile/z1.h
+index 1d3607a..c12c6e2 100644
+--- a/csrc/compile/z1.h
++++ b/csrc/compile/z1.h
+@@ -10,9 +10,20 @@
+ namespace dc {
+ 
+ void register_graph_z1(long graph_id, const std::vector<long>& ds_ids);
++void register_graph_z1_sp(long graph_id,
++                          const std::vector<long>& ds_ids,
++                          int sp_size,
++                          int kx,
++                          int warmup_steps);
+ void register_param(long ds_id,
+                     const std::vector<int64_t>& ds_shape,
+                     at::Tensor ds_tensor,
+                     at::Tensor grad_buffer,
+                     int64_t offset);
++void register_param_sp(long ds_id,
++                       const std::vector<int64_t>& ds_shape,
++                       at::Tensor ds_tensor,
++                       at::Tensor grad_buffer,
++                       int64_t offset,
++                       int sp_group_id);
+ }  // namespace dc
+diff --git a/csrc/includes/deepcompile.h b/csrc/includes/deepcompile.h
+index ee3d965..9fd5fea 100644
+--- a/csrc/includes/deepcompile.h
++++ b/csrc/includes/deepcompile.h
+@@ -297,6 +297,8 @@ public:
+     int64_t getOffset() const { return offset_; }
+     void setPersistent(bool persistent) { persistent_ = persistent; }
+     bool isPersistent() const { return persistent_; }
++    void setSpGroupId(int gid) { sp_group_id_ = gid; }
++    int getSpGroupId() const { return sp_group_id_; }
+ 
+     void offload()
+     {
+@@ -353,6 +355,7 @@ private:
+     bool partitioned_;
+     int64_t offset_;   // for Z1
+     bool persistent_;  // for Z3
++    int sp_group_id_ = -1;
+     mutable bool is_reloaded = false;
+ 
+     at::cuda::CUDAStream offload_stream_;
+@@ -520,9 +523,15 @@ protected:
+     std::shared_ptr<DoubleBufferedReduceBucket> reduce_buckets_;
+     std::vector<long> ds_ids_;
+     ncclComm_t nccl_comm_;
++    ncclComm_t sp_comm_ = nullptr;
+     at::cuda::CUDAStream rs_stream_;
+     at::cuda::CUDAStream copy_stream_;
+ 
++    int sp_size_ = 1;
++    int kx_ = 1;
++    int warmup_steps_ = 512;
++    int step_ = 0;
++
+     std::unordered_map<long, std::shared_ptr<at::cuda::CUDAEvent>> rs_comp_done_events_;
+     std::unordered_map<long, std::shared_ptr<at::cuda::CUDAEvent>> rs_copy_done_events_;
+ 
+@@ -534,6 +543,40 @@ protected:
+ 
+     virtual void flushReduceBucket(at::ScalarType scalar_type) = 0;
+ 
++    bool shouldSyncDP() const
++    {
++        if (kx_ <= 1) return true;
++        if (step_ < warmup_steps_) return true;
++        return (step_ % kx_) == 0;
++    }
++
++    void flushSPReduceBucket(at::ScalarType scalar_type)
++    {
++        if (!hasKey(reduce_tasks_, scalar_type)) { return; }
++        if (sp_comm_ == nullptr || sp_size_ <= 1) { return; }
++
++        blockCopyEvents(scalar_type);
++        applyPreDivision(scalar_type);
++
++        ncclGroupStart();
++        for (const ReduceTask& t : reduce_tasks_.at(scalar_type)) {
++            const DSParam& param = param_registry_->getParam(t.getDSId());
++            if (param.getSpGroupId() < 0) continue;
++
++            ncclResult_t result = ncclAllReduce(t.getSendBuf().data_ptr(),
++                                                t.getSendBuf().data_ptr(),
++                                                t.getSendBuf().numel(),
++                                                get_nccl_data_type(scalar_type),
++                                                getReductionOp(),
++                                                sp_comm_,
++                                                rs_stream_);
++            if (result != ncclSuccess) {
++                throw std::runtime_error("NCCL SP AllReduce failed");
++            }
++        }
++        ncclGroupEnd();
++    }
++
+     void flushAllReduceBuckets()
+     {
+         for (const auto& it : reduce_tasks_) { flushReduceBucket(it.first); }
+-- 
+2.43.0
+

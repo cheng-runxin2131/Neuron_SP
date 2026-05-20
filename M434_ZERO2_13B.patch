@@ -1,0 +1,59 @@
+From 2a4bc31bf462b1a6523232b28bde7ea6de3d18b2 Mon Sep 17 00:00:00 2001
+From: dylanyunlon <dylanyunlong@gmail.com>
+Date: Wed, 20 May 2026 04:10:32 +0000
+Subject: [PATCH] M434: Auto-escalate to ZeRO-2 + param offload for 13B
+
+ZeRO-1 partitions optimizer states only. Each GPU still holds full
+params (25.7GB) + full gradients (25.7GB) = 51.4GB > A6000 47.5GB.
+
+ZeRO-2 partitions gradients across ranks:
+  params:     25.7GB (full, but offloaded to CPU with stage 2)
+  gradients:  25.7/3 = 8.6GB per GPU
+  optimizer:  offloaded to CPU
+  AC activ:   ~2-4GB
+  Total:      ~12GB on GPU (fits easily)
+
+Changes:
+  - argparse: allow --zero_stage 2
+  - Auto-select stage 2 when n_params > 5B and cpu_offload
+  - Add offload_param for stage >= 2 (params to CPU too)
+
+Signed-off-by: dylanyunlon <dylanyunlong@gmail.com>
+---
+ REAL_GPU_BENCHMARK.py | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/REAL_GPU_BENCHMARK.py b/REAL_GPU_BENCHMARK.py
+index 70efcf9..65434a7 100644
+--- a/REAL_GPU_BENCHMARK.py
++++ b/REAL_GPU_BENCHMARK.py
+@@ -2043,11 +2043,16 @@ class Trainer:
+         # ZeRO optimization (supports stage 0 and 1 for all methods)
+         _zero_stage = getattr(config, 'zero_stage', 0)
+         _cpu_offload = getattr(config, 'cpu_offload', False)
+-        if _cpu_offload and _zero_stage < 1:
++        n_params = sum(p.numel() for p in self.model.parameters())
++        if _cpu_offload and n_params > 5_000_000_000 and _zero_stage < 2:
++            _zero_stage = 2
++        elif _cpu_offload and _zero_stage < 1:
+             _zero_stage = 1
+         zero_cfg = {"stage": _zero_stage}
+         if _cpu_offload:
+             zero_cfg["offload_optimizer"] = {"device": "cpu", "pin_memory": True}
++            if _zero_stage >= 2:
++                zero_cfg["offload_param"] = {"device": "cpu", "pin_memory": True}
+         ds_cfg["zero_optimization"] = zero_cfg
+ 
+         # AutoSP: add compile passes
+@@ -3026,7 +3031,7 @@ def main():
+                         help='Enable AutoSP sequence parallelism (DeepSpeed compile pass)')
+     parser.add_argument('--use_ac', action='store_true',
+                         help='Enable layer-wise activation checkpointing (torch.utils.checkpoint)')
+-    parser.add_argument('--zero_stage', type=int, default=0, choices=[0, 1],
++    parser.add_argument('--zero_stage', type=int, default=0, choices=[0, 1, 2],
+                         help='ZeRO stage (0=off, 1=optimizer state partition)')
+     parser.add_argument('--cpu_offload', action='store_true',
+                         help='Offload optimizer states to CPU (saves ~56GB for 7B)')
+-- 
+2.43.0
+

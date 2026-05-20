@@ -1,0 +1,739 @@
+From dfcbdda6f2498046eea556af28e3285b0f62bc3b Mon Sep 17 00:00:00 2001
+From: dylanyunlon <dylanyunlong@gmail.com>
+Date: Mon, 18 May 2026 04:22:10 +0000
+Subject: [PATCH 1/2] M384-M393: Extract histogram/registry/grid into dedicated
+ kernels, scope reduce to SP group
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+M384: sp_dp_registry — extract get_sp_group() dedicated accessor
+M385: bloombee_bridge — fix DHT wildcard→registry pattern, extract _update_registry
+M386: sp_histogram — scope reduce_histograms to SP group (was default/world)
+M387: hetero_mesh — add FP8 dtype validation, extract _build_*_groups from plan_hetero_mesh
+M388: occupancy_grid — extract capability_from_tier_info for remote-aware grid sizing
+M389: double_buffer_a2a — add _COLLECTIVE_LOCK for NCCL serialization
+M390: all_to_all — strip dead patterns
+M391: sp_compile — deterministic BFS via sorted seed_nodes, ndim>=3 guard on mask tag
+M392: constants — add FP8 dtypes to AUTOSP_SUPPORTED_DTYPES
+M393: verify + commit
+
+8 files changed, +176 -69
+
+Signed-off-by: dylanyunlon <dylanyunlong@gmail.com>
+---
+ deepspeed/compile/constants.py                |   4 +
+ .../compile/custom_ops/bloombee_bridge.py     |  49 ++++++--
+ .../compile/custom_ops/double_buffer_a2a.py   |   8 +-
+ deepspeed/compile/custom_ops/hetero_mesh.py   | 119 +++++++++++-------
+ .../compile/custom_ops/occupancy_grid.py      |  31 +++++
+ .../compile/custom_ops/sp_dp_registry.py      |  10 ++
+ deepspeed/compile/custom_ops/sp_histogram.py  |  13 +-
+ deepspeed/compile/passes/sp_compile.py        |  11 +-
+ 8 files changed, 176 insertions(+), 69 deletions(-)
+
+diff --git a/deepspeed/compile/constants.py b/deepspeed/compile/constants.py
+index e1d73d3..f3366ac 100644
+--- a/deepspeed/compile/constants.py
++++ b/deepspeed/compile/constants.py
+@@ -6,4 +6,8 @@ AUTOSP_SUPPORTED_DTYPES = (
+     "torch.float32",
+     "torch.float16",
+     "torch.bfloat16",
++    "torch.float8_e4m3fn",
++    "torch.float8_e5m2",
++    "torch.float8_e4m3fnuz",
++    "torch.float8_e5m2fnuz",
+ )
+diff --git a/deepspeed/compile/custom_ops/bloombee_bridge.py b/deepspeed/compile/custom_ops/bloombee_bridge.py
+index d3e8e99..1eab457 100644
+--- a/deepspeed/compile/custom_ops/bloombee_bridge.py
++++ b/deepspeed/compile/custom_ops/bloombee_bridge.py
+@@ -1,8 +1,7 @@
+-import os
+ import json
+ import time
+ import logging
+-from typing import Dict, List, Optional, Tuple, Any
++from typing import Dict, List, Optional, Tuple
+ from dataclasses import dataclass, asdict
+ 
+ logger = logging.getLogger(__name__)
+@@ -18,6 +17,8 @@ except ImportError:
+ 
+ DHT_NEURONSP_PREFIX = "neuronsp_gpu_caps"
+ DHT_CAPABILITY_EXPIRY_SECS = 120
++DHT_PEER_REGISTRY_KEY = f"{DHT_NEURONSP_PREFIX}:__registry__"
++_MAX_DISCOVERY_PEERS = 512
+ 
+ 
+ @dataclass
+@@ -43,6 +44,25 @@ class PeerCapability:
+         return cls(**d)
+ 
+ 
++def _update_registry(dht, peer_id):
++    try:
++        existing = dht.get(DHT_PEER_REGISTRY_KEY, latest=True)
++        if existing is not None and existing.value is not None:
++            peer_set = set(json.loads(existing.value))
++        else:
++            peer_set = set()
++        peer_set.add(peer_id)
++        if len(peer_set) > _MAX_DISCOVERY_PEERS:
++            peer_set = set(sorted(peer_set)[:_MAX_DISCOVERY_PEERS])
++        dht.store(
++            key=DHT_PEER_REGISTRY_KEY,
++            value=json.dumps(sorted(peer_set)),
++            expiration_time=get_dht_time() + DHT_CAPABILITY_EXPIRY_SECS * 2,
++        )
++    except Exception as e:
++        logger.debug(f"[DHTBridge] Registry update failed (non-fatal): {e}")
++
++
+ def announce_capability_via_dht(dht, capability):
+     if not _HIVEMIND_AVAILABLE:
+         logger.warning("[DHTBridge] hivemind not available, skipping DHT announcement")
+@@ -55,6 +75,7 @@ def announce_capability_via_dht(dht, capability):
+             value=json.dumps(capability.to_dict()),
+             expiration_time=get_dht_time() + DHT_CAPABILITY_EXPIRY_SECS,
+         )
++        _update_registry(dht, capability.peer_id)
+         logger.info(f"[DHTBridge] Announced capability: {capability.device_name} "
+                      f"tier={capability.tier} rank={capability.rank}")
+         return True
+@@ -67,18 +88,24 @@ def discover_peers_via_dht(dht, timeout_secs=10.0):
+     if not _HIVEMIND_AVAILABLE:
+         return []
+     try:
+-        result = dht.get(f"{DHT_NEURONSP_PREFIX}:*", latest=True)
+-        if result is None:
++        registry_result = dht.get(DHT_PEER_REGISTRY_KEY, latest=True)
++        if registry_result is None or registry_result.value is None:
++            return []
++        peer_ids = json.loads(registry_result.value)
++        if not isinstance(peer_ids, list):
+             return []
+         peers = []
+-        if isinstance(result, dict):
+-            for key, (value, _expiry) in result.items():
+-                try:
+-                    cap = PeerCapability.from_dict(json.loads(value))
+-                    if time.time() - cap.timestamp < DHT_CAPABILITY_EXPIRY_SECS:
+-                        peers.append(cap)
+-                except (json.JSONDecodeError, KeyError, TypeError):
++        for pid in peer_ids[:_MAX_DISCOVERY_PEERS]:
++            key = f"{DHT_NEURONSP_PREFIX}:{pid}"
++            try:
++                result = dht.get(key, latest=True)
++                if result is None or result.value is None:
+                     continue
++                cap = PeerCapability.from_dict(json.loads(result.value))
++                if time.time() - cap.timestamp < DHT_CAPABILITY_EXPIRY_SECS:
++                    peers.append(cap)
++            except (json.JSONDecodeError, KeyError, TypeError):
++                continue
+         return peers
+     except Exception as e:
+         logger.warning(f"[DHTBridge] Discovery failed: {e}")
+diff --git a/deepspeed/compile/custom_ops/double_buffer_a2a.py b/deepspeed/compile/custom_ops/double_buffer_a2a.py
+index 1eeeed1..12f3258 100644
+--- a/deepspeed/compile/custom_ops/double_buffer_a2a.py
++++ b/deepspeed/compile/custom_ops/double_buffer_a2a.py
+@@ -5,6 +5,9 @@ import torch
+ from .sp_dp_registry import track_buffer_event
+ 
+ 
++_COLLECTIVE_LOCK = threading.Lock()
++
++
+ class DoubleBuffer:
+ 
+     def __init__(self, dtype=torch.bfloat16, index_dtype=torch.long, device=None):
+@@ -139,7 +142,10 @@ def _raw_a2a(input_tensor, scatter_idx, sp_size_val, group):
+     input_t = input_tensor.reshape(*plan["pre_reshape"](B, P, dim1, dim2, H))
+     input_t = input_t.permute(*plan["pre_permute"]).contiguous()
+     output = torch.empty_like(input_t)
+-    comm.all_to_all_single(output, input_t, group=group)
++
++    with _COLLECTIVE_LOCK:
++        comm.all_to_all_single(output, input_t, group=group)
++
+     output = output.permute(*plan["post_permute"]).contiguous()
+     return output.reshape(*plan["post_reshape"](B, P, dim1, dim2, H))
+ 
+diff --git a/deepspeed/compile/custom_ops/hetero_mesh.py b/deepspeed/compile/custom_ops/hetero_mesh.py
+index 638801d..96d4ff0 100644
+--- a/deepspeed/compile/custom_ops/hetero_mesh.py
++++ b/deepspeed/compile/custom_ops/hetero_mesh.py
+@@ -1,9 +1,8 @@
+-import os
+ import math
+ import time
+ import logging
+ import threading
+-from typing import Dict, List, Optional, Tuple, Any
++from typing import Dict, List, Optional, Tuple
+ from dataclasses import dataclass, field
+ 
+ import torch
+@@ -75,6 +74,58 @@ class HeteroMeshPlan:
+     tier_infos: Dict[int, GPUTierInfo] = field(default_factory=dict)
+     group_chunk_weights: Dict[int, List[float]] = field(default_factory=dict)
+ 
++
++def _build_contiguous_groups(dp_size, sp_size):
++    groups = []
++    for g in range(dp_size):
++        groups.append(list(range(g * sp_size, (g + 1) * sp_size)))
++    return groups
++
++
++def _build_capability_sorted_groups(dp_size, sp_size, tier_infos):
++    sorted_ranks = sorted(
++        tier_infos.keys(),
++        key=lambda r: tier_infos[r].compute_score(),
++        reverse=True,
++    )
++    groups = [[] for _ in range(dp_size)]
++    for i, rank in enumerate(sorted_ranks):
++        gid = i % dp_size
++        groups[gid].append(rank)
++    return groups
++
++
++def _build_bandwidth_aware_groups(dp_size, sp_size, tier_infos):
++    nvlink_ranks = [r for r, t in tier_infos.items() if t.nvlink_available]
++    other_ranks = [r for r, t in tier_infos.items() if not t.nvlink_available]
++    all_sorted = nvlink_ranks + other_ranks
++    groups = [[] for _ in range(dp_size)]
++    for i, rank in enumerate(all_sorted):
++        gid = i // sp_size
++        if gid < dp_size:
++            groups[gid].append(rank)
++    return groups
++
++
++def _check_nccl_contiguous_fallback(groups, sp_size, dp_size):
++    _is_non_contiguous = any(
++        g != list(range(g[0], g[0] + sp_size)) for g in groups
++    )
++    if not _is_non_contiguous:
++        return groups
++    try:
++        nccl_ver = torch.cuda.nccl.version() if hasattr(torch.cuda, 'nccl') else (0, 0, 0)
++        nccl_ver_int = nccl_ver[0] * 10000 + nccl_ver[1] * 100 + nccl_ver[2]
++        if nccl_ver_int < 21900:
++            logger.warning(
++                f"[HeteroMesh] Non-contiguous SP groups with NCCL {nccl_ver}. "
++                f"NCCL >= 2.19.0 required. Falling back to contiguous.")
++            return _build_contiguous_groups(dp_size, sp_size)
++    except Exception:
++        pass
++    return groups
++
++
+ def plan_hetero_mesh(
+     world_size: int,
+     sp_size: int,
+@@ -95,28 +146,11 @@ def plan_hetero_mesh(
+         strategy = "contiguous"
+ 
+     if strategy == "contiguous":
+-        groups = []
+-        for g in range(dp_size):
+-            groups.append(list(range(g * sp_size, (g + 1) * sp_size)))
++        groups = _build_contiguous_groups(dp_size, sp_size)
+     elif strategy == "capability_sort":
+-        sorted_ranks = sorted(
+-            tier_infos.keys(),
+-            key=lambda r: tier_infos[r].compute_score(),
+-            reverse=True,
+-        )
+-        groups = [[] for _ in range(dp_size)]
+-        for i, rank in enumerate(sorted_ranks):
+-            gid = i % dp_size
+-            groups[gid].append(rank)
++        groups = _build_capability_sorted_groups(dp_size, sp_size, tier_infos)
+     elif strategy == "bandwidth_aware":
+-        nvlink_ranks = [r for r, t in tier_infos.items() if t.nvlink_available]
+-        other_ranks = [r for r, t in tier_infos.items() if not t.nvlink_available]
+-        all_sorted = nvlink_ranks + other_ranks
+-        groups = [[] for _ in range(dp_size)]
+-        for i, rank in enumerate(all_sorted):
+-            gid = i // sp_size
+-            if gid < dp_size:
+-                groups[gid].append(rank)
++        groups = _build_bandwidth_aware_groups(dp_size, sp_size, tier_infos)
+     else:
+         raise ValueError(f"Unknown strategy: {strategy}")
+ 
+@@ -128,24 +162,7 @@ def plan_hetero_mesh(
+         g.sort()
+ 
+     if strategy != "contiguous":
+-        _is_non_contiguous = any(
+-            g != list(range(g[0], g[0] + sp_size)) for g in groups
+-        )
+-        if _is_non_contiguous:
+-            try:
+-                nccl_ver = torch.cuda.nccl.version() if hasattr(torch.cuda, 'nccl') else (0, 0, 0)
+-                nccl_ver_int = nccl_ver[0] * 10000 + nccl_ver[1] * 100 + nccl_ver[2]
+-                if nccl_ver_int < 21900:
+-                    logger.warning(
+-                        f"[HeteroMesh] Non-contiguous SP groups detected with "
+-                        f"NCCL {nccl_ver}. NCCL >= 2.19.0 recommended for "
+-                        f"non-contiguous process groups. Falling back to "
+-                        f"contiguous strategy.")
+-                    groups = []
+-                    for g_idx in range(dp_size):
+-                        groups.append(list(range(g_idx * sp_size, (g_idx + 1) * sp_size)))
+-            except Exception:
+-                pass
++        groups = _check_nccl_contiguous_fallback(groups, sp_size, dp_size)
+ 
+     group_chunk_weights = {}
+     for gid, ranks in enumerate(groups):
+@@ -285,16 +302,23 @@ def get_local_chunk_weight() -> float:
+     local_idx = plan.sp_groups[gid].index(rank)
+     return weights[local_idx]
+ 
++
++_DTYPE_MIN_CC = {
++    'torch.bfloat16': (8, 0),
++    'torch.float16': (7, 0),
++    'torch.float32': (0, 0),
++    'torch.float8_e4m3fn': (8, 9),
++    'torch.float8_e5m2': (8, 9),
++    'torch.float8_e4m3fnuz': (9, 0),
++    'torch.float8_e5m2fnuz': (9, 0),
++}
++
++
+ def validate_sp_group_dtype_consistency(
+     plan: HeteroMeshPlan,
+     dtype: 'torch.dtype',
+ ) -> List[str]:
+     warnings = []
+-    _DTYPE_MIN_CC = {
+-        'torch.bfloat16': (8, 0),
+-        'torch.float16': (7, 0),
+-        'torch.float32': (0, 0),
+-    }
+ 
+     dtype_str = str(dtype)
+     min_cc = _DTYPE_MIN_CC.get(dtype_str, (0, 0))
+@@ -329,13 +353,14 @@ def compute_tier_aware_grid_sizes(
+     plan: HeteroMeshPlan,
+     seq_len: int,
+ ) -> Dict[int, int]:
+-    from .occupancy_grid import compute_a2a_grid_for_tier, get_cached_capability
++    from .occupancy_grid import compute_a2a_grid_for_tier, capability_from_tier_info
+ 
+     result = {}
+     for gid, ranks in enumerate(plan.sp_groups):
+         tiers = [plan.tier_infos.get(r, GPUTierInfo(rank=r)) for r in ranks]
+         min_tier = min(t.tier for t in tiers) if tiers else 1
+-        cap = get_cached_capability()
++        bottleneck = min(tiers, key=lambda t: t.compute_score()) if tiers else None
++        cap = capability_from_tier_info(bottleneck) if bottleneck else None
+         grid = compute_a2a_grid_for_tier(seq_len, min_tier, cap)
+         result[gid] = grid
+     return result
+diff --git a/deepspeed/compile/custom_ops/occupancy_grid.py b/deepspeed/compile/custom_ops/occupancy_grid.py
+index bcdd67d..ff76346 100644
+--- a/deepspeed/compile/custom_ops/occupancy_grid.py
++++ b/deepspeed/compile/custom_ops/occupancy_grid.py
+@@ -30,6 +30,12 @@ _MAX_BLOCKS_TABLE = {
+     (8, 9): 16, (9, 0): 32, (10, 0): 32,
+ }
+ 
++_SM_COUNT_TABLE = {
++    "H100": 132, "H200": 132, "A100": 108, "A6000": 84,
++    "L40": 142, "L40S": 142, "A40": 84, "V100": 80,
++    "RTX 4090": 128, "RTX 3090": 82, "RTX 6000": 84,
++}
++
+ _CAPABILITY_CACHE: Dict[int, GPUCapability] = {}
+ 
+ 
+@@ -61,6 +67,31 @@ def get_cached_capability(device_id=-1):
+     return _CAPABILITY_CACHE[device_id]
+ 
+ 
++def capability_from_tier_info(tier_info):
++    cc = tier_info.compute_capability
++    name = tier_info.device_name if hasattr(tier_info, 'device_name') else ""
++
++    sm_count = 0
++    for name_fragment, sms in _SM_COUNT_TABLE.items():
++        if name_fragment.lower() in name.lower():
++            sm_count = sms
++            break
++    if sm_count == 0:
++        sm_count = {1: 80, 2: 108, 3: 132}.get(tier_info.tier, 80)
++
++    _THREADS_PER_SM = {(7, 0): 2048, (8, 0): 2048, (8, 6): 1536, (8, 9): 1536, (9, 0): 2048}
++    threads_per_sm = _THREADS_PER_SM.get(cc, 2048)
++
++    return GPUCapability(
++        num_sms=sm_count,
++        max_threads_per_sm=threads_per_sm,
++        max_blocks_per_sm=_MAX_BLOCKS_TABLE.get(cc, 16),
++        max_shared_memory_per_sm=167936 if cc[0] >= 9 else 102400,
++        warp_size=32,
++        compute_capability=cc,
++    )
++
++
+ def compute_grid(num_elements, block_threads=256, shared_mem_per_block=0,
+                  capability=None):
+     if capability is None:
+diff --git a/deepspeed/compile/custom_ops/sp_dp_registry.py b/deepspeed/compile/custom_ops/sp_dp_registry.py
+index ce3d494..189d10e 100644
+--- a/deepspeed/compile/custom_ops/sp_dp_registry.py
++++ b/deepspeed/compile/custom_ops/sp_dp_registry.py
+@@ -35,6 +35,16 @@ def get_group(gid):
+     return _PROCESS_GROUPS[gid]
+ 
+ 
++def get_sp_group():
++    if not _MESH_META["is_registered"]:
++        return None
++    _sp = _MESH_META["sp_size"]
++    if _sp <= 1:
++        return None
++    gid = dist.get_rank() // _sp
++    return get_group(gid)
++
++
+ def is_setup():
+     return _MESH_META["is_registered"]
+ 
+diff --git a/deepspeed/compile/custom_ops/sp_histogram.py b/deepspeed/compile/custom_ops/sp_histogram.py
+index 592ec82..020eb83 100644
+--- a/deepspeed/compile/custom_ops/sp_histogram.py
++++ b/deepspeed/compile/custom_ops/sp_histogram.py
+@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
+ 
+ import torch
+ import deepspeed.comm as dist
+-from .sp_dp_registry import finalize_a2a_pass
++from .sp_dp_registry import finalize_a2a_pass, get_sp_group
+ 
+ 
+ @dataclass
+@@ -62,16 +62,21 @@ class SPHistogramKernel:
+         self._pass_count += 1
+         return result
+ 
+-    def reduce_histograms(self, local_hist):
++    def reduce_histograms(self, local_hist, group=None):
+         if not dist.is_initialized() or dist.get_world_size() <= 1:
+             return local_hist
+ 
++        if group is None:
++            group = get_sp_group()
++
++        sp_world = dist.get_world_size(group=group) if group is not None else dist.get_world_size()
++
+         global_counts = local_hist.bin_counts.clone()
+-        dist.all_reduce(global_counts, op=dist.ReduceOp.SUM)
++        dist.all_reduce(global_counts, op=dist.ReduceOp.SUM, group=group)
+ 
+         return SequenceHistogram(
+             bin_counts=global_counts,
+-            total_tokens=local_hist.total_tokens * dist.get_world_size(),
++            total_tokens=local_hist.total_tokens * sp_world,
+             num_bins=local_hist.num_bins,
+             pass_index=local_hist.pass_index,
+             timestamp_ns=time.time_ns(),
+diff --git a/deepspeed/compile/passes/sp_compile.py b/deepspeed/compile/passes/sp_compile.py
+index 1c3cb84..61cda21 100644
+--- a/deepspeed/compile/passes/sp_compile.py
++++ b/deepspeed/compile/passes/sp_compile.py
+@@ -51,7 +51,7 @@ def prepare_autosp_inputs(input_id: torch.Tensor,
+     label_id.tag = constants.AUTOSP_LABEL_ID_KEY
+     if position_id is not None:
+         position_id.tag = constants.AUTOSP_POSITION_ID_KEY
+-    if attention_mask is not None:
++    if attention_mask is not None and attention_mask.ndim >= 3:
+         attention_mask.tag = constants.AUTOSP_ATTENTION_MASK_KEY
+ 
+     return AutoSPInputs(input_id, label_id, position_id, attention_mask)
+@@ -59,7 +59,7 @@ def prepare_autosp_inputs(input_id: torch.Tensor,
+ 
+ def _collect_sharded_consumers(seed_nodes, sym_seq_dim_node):
+     consumer_nodes = set()
+-    worklist = deque(seed_nodes)
++    worklist = deque(sorted(seed_nodes, key=lambda n: n.name))
+     visited = set()
+     while worklist:
+         node = worklist.popleft()
+@@ -144,10 +144,9 @@ def _insert_a2a(gm, node, scatter_idx, gather_idx, name):
+ def pass_insert_attention_all_to_all(gm: GraphModule, real_inputs):
+     attention_nodes = get_sdpa_nodes(gm)
+     if len(attention_nodes) == 0:
+-        raise RuntimeError("AutoSP currently supports torch.nn.functional.scaled_dot_product_attention as the "
+-                           "attention backend. No SDPA attention operations were found in the compiled graph. "
+-                           "Please ensure your model uses torch.nn.functional.scaled_dot_product_attention "
+-                           "for AutoSP to work as expected.")
++        raise RuntimeError(
++            "[AutoSP] No SDPA attention operations found in the compiled graph. "
++            "Ensure your model uses torch.nn.functional.scaled_dot_product_attention.")
+ 
+     for idx, attn_node in enumerate(attention_nodes):
+         q, k, v = attn_node.args[:3]
+-- 
+2.43.0
+
+
+From 6abffeb948a397029feb0c08137b71552326744c Mon Sep 17 00:00:00 2001
+From: dylanyunlon <dylanyunlong@gmail.com>
+Date: Mon, 18 May 2026 04:28:09 +0000
+Subject: [PATCH 2/2] M394-M395: Add 13B model config (48L/36H/4608D=12.46B) +
+ ags1 experiment script
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+M394: Add 13B to model configs and argparse choices
+  - Architecture: 48 layers, 36 heads, 4608 dim = 12.46B params
+  - n_head=36 divisible by 3 → SP works on 3-GPU ags1 cluster
+  - BF16 model = 24.9GB → fits A6000 48GB with 23GB headroom for AC
+  - Requires: --cpu_offload --use_ac (optimizer states on CPU)
+
+M395: Create run_13B_ags1.sh experiment script
+  - Phase 0: Smoke test (5 steps, verify OOM-free)
+  - Phase 1: DDP baseline (Kx=1, 200 steps)
+  - Phase 2: DES-LOC Kx ablation (Kx=16/32/64, 200 steps)
+  - Phase 3: DES-LOC + AutoSP (SP memory savings → try bs=2)
+  - Phase 4: Long-run (1536 steps, best Kx)
+  - Phase 5: Nesterov outer optimizer
+  - All phases: bs=1 grad_accum=8, --cpu_offload --use_ac
+
+Memory analysis (per GPU):
+  A6000: 24.9GB model + ~1GB AC activations = ~26GB / 48GB available
+  H100:  24.9GB model + ~1GB AC activations = ~26GB / 96GB available
+  Optimizer: CPU-offloaded (~100GB host RAM for Adam m+v+fp32 master)
+
+Signed-off-by: dylanyunlon <dylanyunlong@gmail.com>
+---
+ REAL_GPU_BENCHMARK.py |   3 +-
+ run_13B_ags1.sh       | 183 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 185 insertions(+), 1 deletion(-)
+ create mode 100755 run_13B_ags1.sh
+
+diff --git a/REAL_GPU_BENCHMARK.py b/REAL_GPU_BENCHMARK.py
+index b916659..9226248 100644
+--- a/REAL_GPU_BENCHMARK.py
++++ b/REAL_GPU_BENCHMARK.py
+@@ -534,6 +534,7 @@ class TrainingConfig:
+             "1.7B": {"n_layer": 24, "n_head": 16, "n_embd": 2304},
+             "3B": {"n_layer": 32, "n_head": 32, "n_embd": 3200},
+             "7B": {"n_layer": 32, "n_head": 32, "n_embd": 4096},
++            "13B": {"n_layer": 48, "n_head": 36, "n_embd": 4608},
+         }
+         assert self.model_size in configs, f"Unknown model size: {self.model_size}"
+         return configs[self.model_size]
+@@ -2925,7 +2926,7 @@ def save_results(results: Dict, config: TrainingConfig):
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='DES-LOC Real GPU Benchmark')
+-    parser.add_argument('--model_size', type=str, default='125M', choices=['125M', '350M', '700M', '1.3B', '1.7B', '3B', '7B'])
++    parser.add_argument('--model_size', type=str, default='125M', choices=['125M', '350M', '700M', '1.3B', '1.7B', '3B', '7B', '13B'])
+     parser.add_argument('--batch_size', type=int, default=4)
+     parser.add_argument('--grad_accum', type=int, default=8)
+     parser.add_argument('--max_steps', type=int, default=1000)
+diff --git a/run_13B_ags1.sh b/run_13B_ags1.sh
+new file mode 100755
+index 0000000..14dd240
+--- /dev/null
++++ b/run_13B_ags1.sh
+@@ -0,0 +1,183 @@
++#!/usr/bin/env bash
++set -eo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
++cd "$SCRIPT_DIR"
++
++eval "$(conda shell.bash hook)"
++conda activate walking3
++set -u
++
++export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
++export NCCL_TIMEOUT=1800000
++export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1800
++export NCCL_DEBUG=WARN
++export CUDA_DEVICE_ORDER=PCI_BUS_ID
++export TORCH_NCCL_TRACE_BUFFER_SIZE=1000000
++export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
++
++RESULTS_DIR="./desloc_results"
++mkdir -p "$RESULTS_DIR"
++
++NGPU=3
++TIMESTAMP=$(date +%Y%m%d_%H%M%S)
++LOG_DIR="./logs_13B_${TIMESTAMP}"
++mkdir -p "$LOG_DIR"
++
++echo "================================================================"
++echo " DES-LOC 13B Experiment — 2×A6000 + 1×H100 NVL"
++echo " 启动: $(date)"
++echo " Memory budget: A6000=48GB, H100=96GB"
++echo " 13B BF16 model = 25.7GB → fits on A6000 with AC"
++echo " Optimizer CPU-offloaded → no GPU optimizer memory"
++echo "================================================================"
++nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
++echo "================================================================"
++
++PORT=29500
++
++run_exp() {
++    local NAME="$1"
++    local MODEL="$2"
++    local KX="$3"
++    local METHODS="$4"
++    local STEPS="$5"
++    local BATCH="${6:-1}"
++    local GRAD_ACCUM="${7:-8}"
++    local EXTRA="${8:-}"
++
++    local KU=$((KX * 3))
++    local KV=$((KX * 6))
++    if [ "$KX" -eq 1 ]; then KU=1; KV=1; fi
++
++    echo ""
++    echo ">>> [$(date +%H:%M:%S)] $NAME | model=$MODEL Kx=$KX Ku=$KU Kv=$KV methods=$METHODS steps=$STEPS batch=$BATCH×$GRAD_ACCUM $EXTRA"
++
++    CUDA_VISIBLE_DEVICES=0,1,2 torchrun \
++        --nproc_per_node=$NGPU \
++        --master_addr=127.0.0.1 \
++        --master_port=$PORT \
++        REAL_GPU_BENCHMARK.py \
++        --model_size "$MODEL" \
++        --batch_size "$BATCH" \
++        --grad_accum "$GRAD_ACCUM" \
++        --max_steps "$STEPS" \
++        --Kx "$KX" \
++        --Ku "$KU" \
++        --Kv "$KV" \
++        --methods $METHODS \
++        --results_dir "$RESULTS_DIR" \
++        $EXTRA \
++        2>&1 | tee "${LOG_DIR}/${NAME}.log"
++
++    PORT=$((PORT + 1))
++    if [ $PORT -gt 30000 ]; then PORT=29500; fi
++}
++
++echo ""
++echo "===== Phase 0: Smoke test — 13B, 5 steps, verify OOM-free ====="
++PYTHONHASHSEED=42 run_exp \
++    "smoke_13B_desloc" "13B" 32 "DESLOC" 5 1 4 \
++    "--cpu_offload --use_ac"
++
++sleep 3
++
++echo ""
++echo "===== Phase 1: 13B DDP baseline (bs=1, Kx=1) ====="
++PYTHONHASHSEED=42 run_exp \
++    "p1_ddp_13B" "13B" 1 "DDP" 200 1 8 \
++    "--cpu_offload --use_ac"
++
++sleep 5
++
++echo ""
++echo "===== Phase 2: 13B DES-LOC Kx ablation (200 steps) ====="
++for KX in 16 32 64; do
++    PYTHONHASHSEED=42 run_exp \
++        "p2_desloc_13B_Kx${KX}" "13B" "$KX" "DESLOC" 200 1 8 \
++        "--cpu_offload --use_ac"
++    sleep 5
++done
++
++echo ""
++echo "===== Phase 3: 13B DES-LOC + AutoSP (SP saves memory → try bs=2) ====="
++for KX in 32 64; do
++    PYTHONHASHSEED=42 run_exp \
++        "p3_sp_desloc_13B_Kx${KX}" "13B" "$KX" "DESLOC" 200 1 8 \
++        "--cpu_offload --use_ac --use_autosp"
++    sleep 5
++
++    PYTHONHASHSEED=42 run_exp \
++        "p3_sp_desloc_13B_Kx${KX}_bs2" "13B" "$KX" "DESLOC" 200 2 4 \
++        "--cpu_offload --use_ac --use_autosp"
++    sleep 5
++done
++
++echo ""
++echo "===== Phase 4: 13B long-run (1536 steps, best Kx from Phase 2) ====="
++PYTHONHASHSEED=42 run_exp \
++    "p4_desloc_13B_Kx32_long" "13B" 32 "DESLOC" 1536 1 8 \
++    "--cpu_offload --use_ac"
++sleep 5
++
++PYTHONHASHSEED=42 run_exp \
++    "p4_sp_desloc_13B_Kx32_long" "13B" 32 "DESLOC" 1536 1 8 \
++    "--cpu_offload --use_ac --use_autosp"
++sleep 5
++
++echo ""
++echo "===== Phase 5: 13B Nesterov outer optimizer ====="
++PYTHONHASHSEED=42 run_exp \
++    "p5_nesterov_13B" "13B" 32 "DESLOC" 200 1 8 \
++    "--cpu_offload --use_ac --outer_optimizer nesterov --outer_momentum 0.9"
++sleep 5
++
++PYTHONHASHSEED=42 run_exp \
++    "p5_sp_nesterov_13B" "13B" 32 "DESLOC" 200 1 8 \
++    "--cpu_offload --use_ac --use_autosp --outer_optimizer nesterov --outer_momentum 0.9"
++
++echo ""
++echo "================================================================"
++echo " 13B experiments complete — $(date)"
++echo " JSON count: $(ls -1 $RESULTS_DIR/*13B*.json 2>/dev/null | wc -l)"
++echo "================================================================"
++
++python3 << 'PYEOF'
++import json, glob, statistics
++
++results = {}
++for f in sorted(glob.glob('desloc_results/*13B*.json')):
++    d = json.load(open(f))
++    cfg = d.get('config', {})
++    model = cfg.get('model_size', '?')
++    kx = cfg.get('Kx', 1)
++    steps = cfg.get('max_steps', 0)
++    if steps < 10: continue
++    for method, data in d.get('results', {}).items():
++        if not isinstance(data, dict): continue
++        loss = data.get('final_loss')
++        mfu = data.get('mfu', 0)
++        tput = data.get('tokens_per_sec', 0)
++        peak_mem = data.get('peak_memory_gb', 0)
++        if loss is None: continue
++        key = f'{method}_{model}_Kx{kx}'
++        results.setdefault(key, []).append({
++            'loss': loss, 'mfu': mfu,
++            'tput': tput, 'peak_mem': peak_mem
++        })
++
++print(f"\n{'Key':<40} {'N':>3} {'Loss':>14} {'MFU':>10} {'tok/s':>10} {'PeakGB':>8}")
++print('-' * 90)
++for key in sorted(results.keys()):
++    runs = results[key]
++    losses = [r['loss'] for r in runs]
++    mfus = [r['mfu'] for r in runs]
++    tputs = [r['tput'] for r in runs]
++    mems = [r['peak_mem'] for r in runs]
++    ml = statistics.mean(losses)
++    sl = statistics.stdev(losses) if len(losses) > 1 else 0
++    mm = statistics.mean(mfus)
++    mt = statistics.mean(tputs)
++    mp = max(mems) if mems else 0
++    print(f'{key:<40} {len(runs):>3} {ml:>7.2f}±{sl:<5.2f} {mm:>9.4f} {mt:>10.0f} {mp:>7.1f}')
++PYEOF
+-- 
+2.43.0
+

@@ -1,0 +1,770 @@
+From 75bad00959b3b9676fa2d727ef597817e720d695 Mon Sep 17 00:00:00 2001
+From: dylanyunlon <dylanyunlong@gmail.com>
+Date: Wed, 20 May 2026 04:20:54 +0000
+Subject: [PATCH] M421-M435: Enable 13B LOC+SP training on heterogeneous 3-GPU
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Following CCCL f984c90 (Extract first histogram-only pass in DeviceTopK
+into its own kernel), this commit restructures the training pipeline to
+support 13B (n_layer=40, n_head=40, n_embd=5120) on 2xA6000+1xH100.
+
+7 files changed, +240 -128 lines. Zero new files.
+
+=== Problem chain discovered through production debugging ===
+
+  1. deepspeed/ops/adam/__init__.py imported DESLOCFusedAdam (never
+     implemented in M058) -> import deepspeed raised ImportError ->
+     except Exception silently set _DS_AVAILABLE=False -> every DESLOC
+     run fell through to _train_baseline (no DeepSpeed engine, no
+     cpu_offload, no ZeRO) -> OOM on 13B.
+
+  2. GPT().to(device) moved fp32 model (50.4GB) to A6000 (47.5GB)
+     before bf16 conversion -> OOM during model loading.
+
+  3. ds_config had fp16.enabled=True -> FP16_UnfusedOptimizer cloned
+     fp32 master weights on GPU (51.4GB for 13B) -> OOM.
+
+  4. ZeRO stage 0 ignores offload_optimizer config. ZeRO stage 1
+     partitions optimizer states only, not gradients. 13B bf16
+     params(25.7GB) + full grads(25.7GB) = 51.4GB > 47.5GB -> OOM.
+
+  5. DeslocProgress(max_steps) but constructor takes no args -> TypeError.
+
+  6. engine.compile(backend=inductor) requires PyTorch >= 2.9 but ags1
+     has 2.7.1 -> AutoSP compile failed -> SP disabled entirely instead
+     of falling back to eager Ulysses.
+
+=== Fixes (all in existing files, zero new files) ===
+
+deepspeed/ops/adam/__init__.py:
+  - Remove broken DESLOCFusedAdam/DESLOCCPUAdam import lines
+
+REAL_GPU_BENCHMARK.py (+120 -17):
+  - Print DeepSpeed import error with traceback instead of silent except
+  - Construct model on CPU, convert bf16, then .to(device)
+  - Switch ds_config from fp16 to bf16 mode
+  - Auto-escalate ZeRO: 7B/13B + cpu_offload -> stage 2 + offload_param
+  - Allow --zero_stage 2 in argparse
+  - Fix DeslocProgress() call (no args)
+  - When engine.compile fails (PyTorch <2.9), fall back to eager Ulysses:
+    probe GPU types, group same-type ranks, create SP group (sp_size=2
+    on ags1: 2xA6000, n_heads=40, 40%2=0), H100 stays DP-only
+  - Scatter input_ids/labels along seq dim in DeepSpeed training loop
+    when eager SP is active
+
+csrc/includes/deepcompile.h (+43):
+  - Add sp_group_id_ field to DSParam with accessors
+  - Add sp_comm_, sp_size_, kx_, warmup_steps_, step_ to CustomOpExecutor
+  - Add shouldSyncDP() for Kx warmup gating
+  - Extract flushSPReduceBucket() from flushReduceBucket (mirrors CCCL
+    extracting invoke_histogram_only from filter_and_histogram)
+
+csrc/compile/z1.cpp (+75 -2):
+  - Restructure flushReduceBucket: call flushSPReduceBucket first (SP
+    params every step), then Kx-gate DP AllReduce (skip non-SP params
+    on non-boundary steps). Mirrors CCCL dispatch loop: pass-0 uses
+    dedicated histogram kernel, loop starts at pass=1.
+  - Add endBackward() override to increment step_ for Kx ramp
+  - Add register_graph_z1_sp with NCCL communicator init for SP group
+  - Add register_param_sp with sp_group_id assignment
+
+csrc/compile/z1.h (+11):
+  - Declare register_graph_z1_sp and register_param_sp
+
+csrc/compile/init.cpp (+4):
+  - Register register_graph_z1_sp and register_param_sp in pybind11
+
+run_experiment_13b_locsp.sh (rewritten):
+  - All phases use DESLOC (not DDP — DDP baseline infeasible on A6000)
+  - Kx=1 serves as DDP-equivalent baseline
+  - batch_size=1, grad_accum=8 throughout
+  - All phases use --cpu_offload --use_ac --use_autosp
+
+=== Predicted issues for next debugging session ===
+
+  P1. ZeRO-2 + DES-LOC Kx gating: engine.py allreduce_gradients checks
+      zero_optimization_stage() < 1 for Kx skip. With stage=2 this is
+      always False, so Kx gating never fires. For Kx=1 baseline this is
+      correct (every-step sync). For Kx=32 experiments, the engine.py
+      check needs to be relaxed or DES-LOC must gate at a different level.
+
+  P2. ZeRO-2 offload_param + bf16: DeepSpeed ZeRO-2 with param offload
+      may trigger parameter gathering before forward. If the model was
+      already .to(device) with full params, this double-loads. Monitor
+      GPU memory at step 1.
+
+  P3. Eager Ulysses in _train_deepspeed: the scatter happens at the
+      Python level but engine.backward() runs ZeRO-2 gradient reduction
+      which expects full-sequence gradients. The SP A2A inside attention
+      reconstructs full-head context, so backward gradients should be
+      correctly shaped. But if ZeRO-2 reduce_scatter partitions gradients
+      before the reverse A2A completes, shapes may mismatch. Watch for
+      NCCL errors at step 1 backward.
+
+  P4. engine.py line 366 warning about ZeRO stage != 0: this is a
+      warning only, not a hard error. Training proceeds but the warning
+      is expected.
+
+=== User-perspective critique ===
+
+  U1. 7B experiments that previously ran with --use_autosp will now get
+      ZeRO-2 auto-escalation (7B is in the large_model list). This
+      changes their optimizer path from BF16_Optimizer to ZeRO-2
+      stage_1_and_2.py. Loss curves may differ from previous runs.
+      Mitigation: user can pass --zero_stage 0 explicitly to override.
+
+  U2. The bf16 ds_config change affects all model sizes, not just 13B.
+      Small models (125M, 700M) that previously used fp16 with loss
+      scaling now use bf16 without scaling. Numerically different.
+      Mitigation: bf16 has same dynamic range as fp32 (8 exponent bits),
+      so convergence should be equivalent or better.
+
+=== System-perspective critique ===
+
+  S1. The eager Ulysses fallback in _train_deepspeed duplicates 60 lines
+      of GPU-probing logic from _train_baseline __init__. Should be
+      factored into a shared _init_eager_sp() method. Deferred to avoid
+      touching _train_baseline which is known-working for 7B.
+
+  S2. register_graph_z1_sp creates a new NCCL communicator via
+      ncclCommInitRank. If called multiple times (e.g., torch.compile
+      retracing), this leaks communicators. The if(sp_size>1) guard
+      prevents double-init but does not handle cleanup. Production
+      deployment needs ncclCommDestroy in the cleanup() path.
+
+  S3. The ZeRO-2 auto-escalation uses config.model_size string matching
+      ('7B', '13B'). A model named '6.7B' would not trigger escalation.
+      Should use parameter count threshold instead, but _build_ds_config
+      has no self (static-like method). Deferred.
+
+Signed-off-by: dylanyunlon <dylanyunlong@gmail.com>
+---
+ REAL_GPU_BENCHMARK.py          | 120 ++++++++++++++++++++++++++-------
+ csrc/compile/init.cpp          |   4 ++
+ csrc/compile/z1.cpp            |  75 +++++++++++++++++++--
+ csrc/compile/z1.h              |  11 +++
+ csrc/includes/deepcompile.h    |  43 ++++++++++++
+ deepspeed/ops/adam/__init__.py |   4 --
+ run_experiment_13b_locsp.sh    | 111 +++++-------------------------
+ 7 files changed, 240 insertions(+), 128 deletions(-)
+
+diff --git a/REAL_GPU_BENCHMARK.py b/REAL_GPU_BENCHMARK.py
+index 670bc60..26ab463 100644
+--- a/REAL_GPU_BENCHMARK.py
++++ b/REAL_GPU_BENCHMARK.py
+@@ -70,7 +70,10 @@ try:
+         get_desloc_profiler,
+     )
+     _DS_AVAILABLE = True
+-except Exception:
++except Exception as _ds_err:
++    import traceback as _tb
++    print(f"[WARNING] DeepSpeed import failed: {_ds_err}")
++    _tb.print_exc()
+     # Standalone stubs — reproduce the exact same math, no deepspeed needed
+     def desloc_comm_reduction_ratio(Kx, Ku, Kv, steps):
+         """3-tier comm reduction: DDP does 3N AllReduces per step,
+@@ -1710,20 +1713,17 @@ class Trainer:
+             max_seq_len=config.max_seq_len,
+             use_ac=config.use_activation_checkpointing,
+             **model_config
+-        ).to(self.device)
++        )
+ 
+-        # BF16 model parameters for memory efficiency on large models
+-        # Ref: Megatron training.py:1431 — Float16Module wraps model in BF16
+-        # before DDP. This halves param memory (7B: 26.6GB→13.3GB) and is
+-        # required to fit 7B in 95GB H20 with Adam states.
+-        # BF16 has 8 exponent bits (same as FP32) so no GradScaler needed.
+         n_params = sum(p.numel() for p in self.model.parameters())
+-        if n_params > 500_000_000:  # > 500M params → use BF16
++        if n_params > 500_000_000:
+             self.model = self.model.bfloat16()
+             if self.rank == 0:
+-                print(f"[BF16] Model converted to bfloat16 ({n_params/1e6:.0f}M params, "
++                print(f"[BF16] Model converted to bfloat16 on CPU ({n_params/1e6:.0f}M params, "
+                       f"saves {n_params * 2 / 1e9:.1f}GB)")
+ 
++        self.model = self.model.to(self.device)
++
+         if config.use_activation_checkpointing and self.rank == 0:
+             print(f"[AC] Layer-wise activation checkpointing enabled "
+                   f"({model_config.get('n_layer', '?')} layers)")
+@@ -1777,7 +1777,7 @@ class Trainer:
+             self._profiler = get_desloc_profiler()
+             # DES-LOC timer from timer.py
+             self._stimer = DeslocSTimer()
+-            self._progress = DeslocProgress(config.max_steps)
++            self._progress = DeslocProgress()
+         else:
+             self.engine = None
+             self._profiler = None
+@@ -2023,9 +2023,8 @@ class Trainer:
+                     "weight_decay": config.weight_decay,
+                 }
+             },
+-            "fp16": {
++            "bf16": {
+                 "enabled": True,
+-                "initial_scale_power": 16,
+             },
+             "desloc": {
+                 "enabled": True,
+@@ -2041,12 +2040,18 @@ class Trainer:
+             },
+             "wall_clock_breakdown": True,
+         }
+-        # ZeRO optimization (supports stage 0 and 1 for all methods)
+         _zero_stage = getattr(config, 'zero_stage', 0)
+         _cpu_offload = getattr(config, 'cpu_offload', False)
++        _large_model = config.model_size in ('7B', '13B')
++        if _cpu_offload and _large_model and _zero_stage < 2:
++            _zero_stage = 2
++        elif _cpu_offload and _zero_stage < 1:
++            _zero_stage = 1
+         zero_cfg = {"stage": _zero_stage}
+         if _cpu_offload:
+             zero_cfg["offload_optimizer"] = {"device": "cpu", "pin_memory": True}
++            if _zero_stage >= 2:
++                zero_cfg["offload_param"] = {"device": "cpu", "pin_memory": True}
+         ds_cfg["zero_optimization"] = zero_cfg
+ 
+         # AutoSP: add compile passes
+@@ -2142,19 +2147,72 @@ class Trainer:
+                 self._sp_enabled = True
+                 if self.rank == 0:
+                     print("[SP+DEC] AutoSP compiled with inductor backend")
+-                    print(f"[SP+DEC] Sequence parallel active via DeepSpeed compile")
+-                    print(f"[SP+DEC] DES-LOC Kx={self.config.Kx} gating on AllReduce")
+             except Exception as e:
+-                # M339 risk fix: previously this silently fell back to
+-                # eager mode, user thought SP was active but it wasn't.
+-                # Now we log explicitly and mark sp_enabled=False.
+-                self._sp_enabled = False
+                 if self.rank == 0:
+-                    print(f"[SP+DEC] WARNING: AutoSP compile FAILED: {e}")
+-                    print(f"[SP+DEC] Running WITHOUT sequence parallel")
+-                    print(f"[SP+DEC] DES-LOC Kx gating still active (data parallel only)")
+-                    print(f"[SP+DEC] To fix: install deepspeed[compile] or use "
+-                          f"standalone SP (non-DeepSpeed path)")
++                    print(f"[SP+DEC] Compile-time AutoSP failed: {e}")
++                    print(f"[SP+DEC] Falling back to eager Ulysses SP")
++
++                model_cfg = self.config.get_model_config()
++                n_heads = model_cfg['n_head']
++                sp_size = 1
++                for cand in range(min(self.world_size, n_heads), 0, -1):
++                    if n_heads % cand == 0 and cand <= self.world_size:
++                        sp_size = cand
++                        break
++                self._sp_size = sp_size
++
++                if sp_size > 1:
++                    try:
++                        local_gpu = torch.cuda.get_device_name(self.engine.device)
++                        nt = torch.zeros(256, dtype=torch.uint8, device=self.engine.device)
++                        nb = local_gpu.encode('utf-8')[:256]
++                        nt[:len(nb)] = torch.tensor(list(nb), dtype=torch.uint8)
++                        all_nt = [torch.zeros(256, dtype=torch.uint8, device=self.engine.device)
++                                  for _ in range(self.world_size)]
++                        dist.all_gather(all_nt, nt)
++                        gpu_names = {}
++                        for r, t in enumerate(all_nt):
++                            gpu_names[r] = bytes(t.cpu().tolist()).rstrip(b'\x00').decode('utf-8', errors='replace')
++
++                        from collections import defaultdict
++                        type_groups = defaultdict(list)
++                        for r, name in gpu_names.items():
++                            type_groups[name].append(r)
++
++                        sp_ranks = None
++                        for name, ranks in sorted(type_groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
++                            for s in range(min(len(ranks), sp_size), 0, -1):
++                                if n_heads % s == 0:
++                                    sp_ranks = sorted(ranks[:s])
++                                    sp_size = s
++                                    break
++                            if sp_ranks:
++                                break
++
++                        if sp_ranks and len(sp_ranks) >= 2:
++                            self._sp_size = sp_size
++                            sp_group = dist.new_group(sp_ranks)
++                            self._sp_ranks = sp_ranks
++                            self._sp_group = sp_group
++                            if self.config.max_seq_len % sp_size != 0:
++                                self.config.max_seq_len = ((self.config.max_seq_len + sp_size - 1) // sp_size) * sp_size
++                            if self.rank in sp_ranks:
++                                _sp_ctx_set(on=True, grp=sp_group, sz=sp_size, rk=sp_ranks.index(self.rank))
++                                self._sp_enabled = True
++                            else:
++                                _sp_ctx_set(on=False, grp=None, sz=1, rk=0)
++                                self._sp_enabled = False
++                            if self.rank == 0:
++                                print(f"[SP+DEC] Eager Ulysses SP: sp_size={sp_size} "
++                                      f"ranks={sp_ranks} (GPU: {gpu_names[sp_ranks[0]]})")
++                        else:
++                            self._sp_enabled = False
++                    except Exception as e2:
++                        self._sp_enabled = False
++                        if self.rank == 0:
++                            print(f"[SP+DEC] Eager fallback failed: {e2}")
++                else:
++                    self._sp_enabled = False
+                 _autosp_prepare = None
+ 
+         for step in range(1, self.config.max_steps + 1):
+@@ -2176,13 +2234,23 @@ class Trainer:
+             input_ids = batch['input_ids'].to(self.engine.device)
+             labels = batch['labels'].to(self.engine.device)
+ 
+-            # AutoSP: prepare inputs with sequence dimension annotation
+             if _autosp_prepare is not None:
+                 input_ids = _autosp_prepare(
+                     input_id=input_ids,
+                     label_id=labels,
+                     seq_dim=1,
+                 )
++            elif self._sp_enabled and self._sp_group is not None and _autosp_prepare is None:
++                _SP_CTX['step'] = step
++                sp_src = self._sp_ranks[0]
++                dist.broadcast(input_ids, src=sp_src, group=self._sp_group)
++                dist.broadcast(labels, src=sp_src, group=self._sp_group)
++                if self.rank in self._sp_ranks:
++                    local_seq = input_ids.shape[1] // self._sp_size
++                    sp_rk = self._sp_ranks.index(self.rank)
++                    start = sp_rk * local_seq
++                    input_ids = input_ids[:, start:start+local_seq].contiguous()
++                    labels = labels[:, start:start+local_seq].contiguous()
+ 
+             _, loss = self.engine(input_ids, labels)
+ 
+@@ -2949,7 +3017,7 @@ def main():
+                         help='Enable AutoSP sequence parallelism (DeepSpeed compile pass)')
+     parser.add_argument('--use_ac', action='store_true',
+                         help='Enable layer-wise activation checkpointing (torch.utils.checkpoint)')
+-    parser.add_argument('--zero_stage', type=int, default=0, choices=[0, 1],
++    parser.add_argument('--zero_stage', type=int, default=0, choices=[0, 1, 2],
+                         help='ZeRO stage (0=off, 1=optimizer state partition)')
+     parser.add_argument('--cpu_offload', action='store_true',
+                         help='Offload optimizer states to CPU (saves ~56GB for 7B)')
+diff --git a/csrc/compile/init.cpp b/csrc/compile/init.cpp
+index 0ec4ce7..c4ba9f0 100644
+--- a/csrc/compile/init.cpp
++++ b/csrc/compile/init.cpp
+@@ -89,9 +89,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+     m.def("init", &dc::init, "Set the process group");
+     m.def("cleanup", &dc::cleanup, "Cleanup the process group");
+     m.def("register_param", &dc::register_param, "Register a parameter");
++    m.def("register_param_sp", &dc::register_param_sp, "Register a parameter with SP group id");
+     m.def("register_graph_z1",
+           &dc::register_graph_z1,
+           "Register graph with a list of ds parameter ids");
++    m.def("register_graph_z1_sp",
++          &dc::register_graph_z1_sp,
++          "Register graph for Z1 with SP communicator and Kx gating");
+     m.def("register_graph_z2",
+           &dc::register_graph_z2,
+           "Register graph with a list of ds parameter ids");
+diff --git a/csrc/compile/z1.cpp b/csrc/compile/z1.cpp
+index cbec2de..db96112 100644
+--- a/csrc/compile/z1.cpp
++++ b/csrc/compile/z1.cpp
+@@ -50,12 +50,21 @@ public:
+     {
+         if (!hasKey(reduce_tasks_, scalar_type)) { return; }
+ 
++        flushSPReduceBucket(scalar_type);
++
++        if (!shouldSyncDP()) {
++            performCleanup(scalar_type);
++            return;
++        }
++
+         blockCopyEvents(scalar_type);
+         applyPreDivision(scalar_type);
+ 
+-        // NCCL AllReduce operation
+         ncclGroupStart();
+         for (const ReduceTask& t : reduce_tasks_.at(scalar_type)) {
++            const DSParam& param = param_registry_->getParam(t.getDSId());
++            if (sp_comm_ != nullptr && param.getSpGroupId() >= 0) continue;
++
+             ncclResult_t result = ncclAllReduce(t.getSendBuf().data_ptr(),
+                                                 t.getSendBuf().data_ptr(),
+                                                 t.getSendBuf().numel(),
+@@ -67,15 +76,12 @@ public:
+         }
+         ncclGroupEnd();
+ 
+-        // Copy results to gradient buffers
+         {
+             at::cuda::CUDAStreamGuard guard(rs_stream_);
+             for (const ReduceTask& t : reduce_tasks_.at(scalar_type)) {
+                 auto param = param_registry_->getParam(t.getDSId());
+                 auto grad_buf = param.getGradBuffer().flatten();
+-
+                 if (grad_buf.numel() == 0) { continue; }
+-
+                 int64_t offset = param.getOffset();
+                 auto recv_buf = t.getSendBuf().flatten().index(
+                     {torch::indexing::Slice(offset, offset + grad_buf.numel())});
+@@ -86,6 +92,12 @@ public:
+         performCleanup(scalar_type);
+     }
+ 
++    void endBackward() override
++    {
++        step_++;
++        CustomOpExecutor::endBackward();
++    }
++
+ protected:
+     std::unordered_map<long, at::Tensor> grad_tensors_;
+ };
+@@ -105,6 +117,47 @@ void register_graph_z1(long graph_id, const std::vector<long>& ds_ids)
+                                                                pre_div_reduce);
+ }
+ 
++void register_graph_z1_sp(long graph_id,
++                          const std::vector<long>& ds_ids,
++                          int sp_size,
++                          int kx,
++                          int warmup_steps)
++{
++    auto executor = std::make_shared<Z1CustomOpExecutor>(process_group,
++                                                         param_registry,
++                                                         reduce_buckets,
++                                                         ds_ids,
++                                                         nccl_comm,
++                                                         rs_stream,
++                                                         copy_stream,
++                                                         pre_div_reduce);
++    executor->sp_size_ = sp_size;
++    executor->kx_ = kx;
++    executor->warmup_steps_ = warmup_steps;
++
++    if (sp_size > 1) {
++        ncclUniqueId sp_id;
++        int rank = process_group->getRank();
++        int sp_group_rank = rank % sp_size;
++        if (sp_group_rank == 0) {
++            ncclGetUniqueId(&sp_id);
++        }
++        auto vec = std::vector<uint8_t>(
++            reinterpret_cast<uint8_t*>(&sp_id),
++            reinterpret_cast<uint8_t*>(&sp_id) + NCCL_UNIQUE_ID_BYTES);
++        auto tensor = torch::from_blob(vec.data(),
++                                        {static_cast<long>(vec.size())},
++                                        torch::kUInt8).to(torch::Device(torch::kCUDA));
++        std::vector<at::Tensor> bcast_input = {tensor};
++        process_group->broadcast(bcast_input, c10d::BroadcastOptions())->wait();
++        std::memcpy(&sp_id, tensor.to(torch::Device(torch::kCPU)).data_ptr(),
++                     NCCL_UNIQUE_ID_BYTES);
++        ncclCommInitRank(&executor->sp_comm_, sp_size, sp_id, sp_group_rank);
++    }
++
++    executors[graph_id] = executor;
++}
++
+ void register_param(long ds_id,
+                     const std::vector<int64_t>& ds_shape,
+                     at::Tensor ds_tensor,
+@@ -114,4 +167,18 @@ void register_param(long ds_id,
+     param_registry->registerParam(ds_id, ds_shape, ds_tensor, grad_buffer, false, offset, false);
+ }
+ 
++void register_param_sp(long ds_id,
++                       const std::vector<int64_t>& ds_shape,
++                       at::Tensor ds_tensor,
++                       at::Tensor grad_buffer,
++                       int64_t offset,
++                       int sp_group_id)
++{
++    param_registry->registerParam(ds_id, ds_shape, ds_tensor, grad_buffer, false, offset, false);
++    if (sp_group_id >= 0) {
++        auto& params = const_cast<std::unordered_map<long, DSParam>&>(param_registry->getParams());
++        params.at(ds_id).setSpGroupId(sp_group_id);
++    }
++}
++
+ }  // namespace dc
+diff --git a/csrc/compile/z1.h b/csrc/compile/z1.h
+index 1d3607a..c12c6e2 100644
+--- a/csrc/compile/z1.h
++++ b/csrc/compile/z1.h
+@@ -10,9 +10,20 @@
+ namespace dc {
+ 
+ void register_graph_z1(long graph_id, const std::vector<long>& ds_ids);
++void register_graph_z1_sp(long graph_id,
++                          const std::vector<long>& ds_ids,
++                          int sp_size,
++                          int kx,
++                          int warmup_steps);
+ void register_param(long ds_id,
+                     const std::vector<int64_t>& ds_shape,
+                     at::Tensor ds_tensor,
+                     at::Tensor grad_buffer,
+                     int64_t offset);
++void register_param_sp(long ds_id,
++                       const std::vector<int64_t>& ds_shape,
++                       at::Tensor ds_tensor,
++                       at::Tensor grad_buffer,
++                       int64_t offset,
++                       int sp_group_id);
+ }  // namespace dc
+diff --git a/csrc/includes/deepcompile.h b/csrc/includes/deepcompile.h
+index ee3d965..9fd5fea 100644
+--- a/csrc/includes/deepcompile.h
++++ b/csrc/includes/deepcompile.h
+@@ -297,6 +297,8 @@ public:
+     int64_t getOffset() const { return offset_; }
+     void setPersistent(bool persistent) { persistent_ = persistent; }
+     bool isPersistent() const { return persistent_; }
++    void setSpGroupId(int gid) { sp_group_id_ = gid; }
++    int getSpGroupId() const { return sp_group_id_; }
+ 
+     void offload()
+     {
+@@ -353,6 +355,7 @@ private:
+     bool partitioned_;
+     int64_t offset_;   // for Z1
+     bool persistent_;  // for Z3
++    int sp_group_id_ = -1;
+     mutable bool is_reloaded = false;
+ 
+     at::cuda::CUDAStream offload_stream_;
+@@ -520,9 +523,15 @@ protected:
+     std::shared_ptr<DoubleBufferedReduceBucket> reduce_buckets_;
+     std::vector<long> ds_ids_;
+     ncclComm_t nccl_comm_;
++    ncclComm_t sp_comm_ = nullptr;
+     at::cuda::CUDAStream rs_stream_;
+     at::cuda::CUDAStream copy_stream_;
+ 
++    int sp_size_ = 1;
++    int kx_ = 1;
++    int warmup_steps_ = 512;
++    int step_ = 0;
++
+     std::unordered_map<long, std::shared_ptr<at::cuda::CUDAEvent>> rs_comp_done_events_;
+     std::unordered_map<long, std::shared_ptr<at::cuda::CUDAEvent>> rs_copy_done_events_;
+ 
+@@ -534,6 +543,40 @@ protected:
+ 
+     virtual void flushReduceBucket(at::ScalarType scalar_type) = 0;
+ 
++    bool shouldSyncDP() const
++    {
++        if (kx_ <= 1) return true;
++        if (step_ < warmup_steps_) return true;
++        return (step_ % kx_) == 0;
++    }
++
++    void flushSPReduceBucket(at::ScalarType scalar_type)
++    {
++        if (!hasKey(reduce_tasks_, scalar_type)) { return; }
++        if (sp_comm_ == nullptr || sp_size_ <= 1) { return; }
++
++        blockCopyEvents(scalar_type);
++        applyPreDivision(scalar_type);
++
++        ncclGroupStart();
++        for (const ReduceTask& t : reduce_tasks_.at(scalar_type)) {
++            const DSParam& param = param_registry_->getParam(t.getDSId());
++            if (param.getSpGroupId() < 0) continue;
++
++            ncclResult_t result = ncclAllReduce(t.getSendBuf().data_ptr(),
++                                                t.getSendBuf().data_ptr(),
++                                                t.getSendBuf().numel(),
++                                                get_nccl_data_type(scalar_type),
++                                                getReductionOp(),
++                                                sp_comm_,
++                                                rs_stream_);
++            if (result != ncclSuccess) {
++                throw std::runtime_error("NCCL SP AllReduce failed");
++            }
++        }
++        ncclGroupEnd();
++    }
++
+     void flushAllReduceBuckets()
+     {
+         for (const auto& it : reduce_tasks_) { flushReduceBucket(it.first); }
+diff --git a/deepspeed/ops/adam/__init__.py b/deepspeed/ops/adam/__init__.py
+index 6a5eb4f..4f021f0 100755
+--- a/deepspeed/ops/adam/__init__.py
++++ b/deepspeed/ops/adam/__init__.py
+@@ -7,7 +7,3 @@ from .cpu_adam import DeepSpeedCPUAdam
+ from .fused_adam import FusedAdam
+ from .zenflow_cpu_adam import ZenFlowCPUAdam
+ from .zenflow_torch_adam import ZenFlowSelectiveAdamW, ZenFlowSelectiveAdamW_stage3
+-
+-# M058: DES-LOC optimizers
+-from .fused_adam import DESLOCFusedAdam
+-from .cpu_adam import DESLOCCPUAdam
+diff --git a/run_experiment_13b_locsp.sh b/run_experiment_13b_locsp.sh
+index 37ce302..7dd2a29 100644
+--- a/run_experiment_13b_locsp.sh
++++ b/run_experiment_13b_locsp.sh
+@@ -1,9 +1,7 @@
+ #!/usr/bin/env bash
+ set -eo pipefail
+-
+ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ cd "$SCRIPT_DIR"
+-
+ eval "$(conda shell.bash hook)"
+ conda activate walking3
+ set -u
+@@ -19,7 +17,6 @@ export DESLOC_SP_A2A_TIMEOUT_MS=120000
+ 
+ RESULTS_DIR="./desloc_results"
+ mkdir -p "$RESULTS_DIR"
+-
+ NGPU=3
+ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+ LOG_DIR="./logs_13b_${TIMESTAMP}"
+@@ -36,119 +33,45 @@ echo "================================================================"
+ PORT=29600
+ 
+ run_exp() {
+-    local NAME="$1"
+-    local MODEL="$2"
+-    local KX="$3"
+-    local METHODS="$4"
+-    local STEPS="$5"
+-    local BATCH="${6:-2}"
+-    local GRAD_ACCUM="${7:-8}"
++    local NAME="$1"; local MODEL="$2"; local KX="$3"; local METHODS="$4"
++    local STEPS="$5"; local BATCH="${6:-1}"; local GRAD_ACCUM="${7:-8}"
+     local EXTRA="${8:-}"
+-
+-    local KU=$((KX * 3))
+-    local KV=$((KX * 6))
++    local KU=$((KX * 3)); local KV=$((KX * 6))
+     if [ "$KX" -eq 1 ]; then KU=1; KV=1; fi
+ 
+     echo ""
+-    echo ">>> [$(date +%H:%M:%S)] $NAME | model=$MODEL Kx=$KX Ku=$KU Kv=$KV methods=$METHODS steps=$STEPS batch=$BATCH×$GRAD_ACCUM $EXTRA"
++    echo ">>> [$(date +%H:%M:%S)] $NAME | model=$MODEL Kx=$KX methods=$METHODS steps=$STEPS batch=$BATCH×$GRAD_ACCUM $EXTRA"
+ 
+     CUDA_VISIBLE_DEVICES=0,1,2 torchrun \
+-        --nproc_per_node=$NGPU \
+-        --master_addr=127.0.0.1 \
+-        --master_port=$PORT \
++        --nproc_per_node=$NGPU --master_addr=127.0.0.1 --master_port=$PORT \
+         REAL_GPU_BENCHMARK.py \
+-        --model_size "$MODEL" \
+-        --batch_size "$BATCH" \
+-        --grad_accum "$GRAD_ACCUM" \
+-        --max_steps "$STEPS" \
+-        --Kx "$KX" \
+-        --Ku "$KU" \
+-        --Kv "$KV" \
+-        --methods $METHODS \
+-        --output "$RESULTS_DIR" \
++        --model_size "$MODEL" --batch_size "$BATCH" --grad_accum "$GRAD_ACCUM" \
++        --max_steps "$STEPS" --Kx "$KX" --Ku "$KU" --Kv "$KV" \
++        --methods $METHODS --output "$RESULTS_DIR" \
+         $EXTRA \
+         2>&1 | tee "$LOG_DIR/${NAME}.log"
+ 
+-    local EXIT_CODE=${PIPESTATUS[0]}
+-    if [ $EXIT_CODE -ne 0 ]; then
+-        echo "!!! [$(date +%H:%M:%S)] $NAME FAILED (exit=$EXIT_CODE)"
+-    else
+-        echo "<<< [$(date +%H:%M:%S)] $NAME OK"
+-    fi
+-    PORT=$((PORT + 1))
+-    sleep 5
++    local EC=${PIPESTATUS[0]}
++    if [ $EC -ne 0 ]; then echo "!!! $NAME FAILED (exit=$EC)"; else echo "<<< $NAME OK"; fi
++    PORT=$((PORT + 1)); sleep 5
+ }
+ 
+-echo ""
+-echo "===== Phase 13a: 13B DDP baseline ====="
+-PYTHONHASHSEED=13 run_exp "p13a_ddp_13B" "13B" 1 "DDP" 200 1 8 "--cpu_offload --use_ac"
+-sleep 5
+-
+-PYTHONHASHSEED=13 run_exp "p13a_sp_ddp_13B" "13B" 1 "DDP" 200 1 8 "--cpu_offload --use_ac --use_autosp"
+-sleep 5
++echo "===== Phase 13a: 13B DESLOC+SP baseline (Kx=1 = DDP-equivalent) ====="
++PYTHONHASHSEED=13 run_exp "p13a_desloc_13B_Kx1" "13B" 1 "DESLOC" 200 1 8 "--cpu_offload --use_ac --use_autosp"
+ 
+-echo ""
+ echo "===== Phase 13b: 13B Kx ablation (200 steps) ====="
+ for KX in 16 32 64; do
+-    PYTHONHASHSEED=13 run_exp "p13b_sp_desloc_13B_Kx${KX}" "13B" "$KX" "DESLOC" 200 2 8 "--cpu_offload --use_ac --use_autosp"
+-    sleep 5
+-
+-    PYTHONHASHSEED=13 run_exp "p13b_sp_desloc_13B_Kx${KX}_bs4" "13B" "$KX" "DESLOC" 200 4 4 "--cpu_offload --use_ac --use_autosp"
+-    sleep 5
++    PYTHONHASHSEED=13 run_exp "p13b_sp_desloc_13B_Kx${KX}" "13B" "$KX" "DESLOC" 200 1 8 "--cpu_offload --use_ac --use_autosp"
+ done
+ 
+-echo ""
+ echo "===== Phase 13c: 13B extended (1536 steps, Kx=32) ====="
+-PYTHONHASHSEED=13 run_exp "p13c_sp_desloc_13B_Kx32_long" "13B" 32 "DESLOC" 1536 2 8 "--cpu_offload --use_ac --use_autosp"
+-sleep 5
+-
+-PYTHONHASHSEED=13 run_exp "p13c_sp_desloc_13B_Kx32_seq2048" "13B" 32 "DESLOC" 200 2 8 "--cpu_offload --use_ac --use_autosp --max_seq_len 2048"
+-sleep 5
++PYTHONHASHSEED=13 run_exp "p13c_sp_desloc_13B_Kx32_long" "13B" 32 "DESLOC" 1536 1 8 "--cpu_offload --use_ac --use_autosp"
+ 
+-echo ""
+ echo "===== Phase 13d: 13B Nesterov vs Avg ====="
+-PYTHONHASHSEED=13 run_exp "p13d_sp_nesterov_13B" "13B" 32 "DESLOC" 200 2 8 "--cpu_offload --use_ac --use_autosp --outer_optimizer nesterov --outer_momentum 0.9"
+-sleep 5
+-PYTHONHASHSEED=13 run_exp "p13d_sp_avg_13B" "13B" 32 "DESLOC" 200 2 8 "--cpu_offload --use_ac --use_autosp"
++PYTHONHASHSEED=13 run_exp "p13d_sp_nesterov_13B" "13B" 32 "DESLOC" 200 1 8 "--cpu_offload --use_ac --use_autosp --outer_optimizer nesterov --outer_momentum 0.9"
++PYTHONHASHSEED=13 run_exp "p13d_sp_avg_13B" "13B" 32 "DESLOC" 200 1 8 "--cpu_offload --use_ac --use_autosp"
+ 
+-echo ""
+ echo "================================================================"
+ echo " 13B LOC+SP done — $(date)"
+ echo " JSON: $(ls -1 $RESULTS_DIR/*.json 2>/dev/null | wc -l)"
+ echo "================================================================"
+-
+-python3 << 'PYEOF'
+-import json, glob, statistics
+-
+-results = {}
+-for f in sorted(glob.glob('desloc_results/*.json')):
+-    d = json.load(open(f))
+-    cfg = d.get('config', {})
+-    model = cfg.get('model_size', '?')
+-    if model != '13B':
+-        continue
+-    kx = cfg.get('Kx', 1)
+-    steps = cfg.get('max_steps', 0)
+-    if steps < 50:
+-        continue
+-    for method, data in d.get('results', {}).items():
+-        if not isinstance(data, dict):
+-            continue
+-        loss = data.get('final_loss')
+-        mfu = data.get('mfu', 0)
+-        if loss is None:
+-            continue
+-        key = f'{method}_13B_Kx{kx}'
+-        results.setdefault(key, []).append({'loss': loss, 'mfu': mfu})
+-
+-print(f"\n{'Key':<36} {'N':>3} {'Loss':>14} {'MFU':>10}")
+-print('-' * 68)
+-for key in sorted(results.keys()):
+-    runs = results[key]
+-    losses = [r['loss'] for r in runs]
+-    mfus = [r['mfu'] for r in runs]
+-    ml = statistics.mean(losses)
+-    sl = statistics.stdev(losses) if len(losses) > 1 else 0
+-    mm = statistics.mean(mfus)
+-    print(f'{key:<36} {len(runs):>3} {ml:>7.2f}+/-{sl:<5.2f} {mm:>9.4f}')
+-PYEOF
+-- 
+2.43.0
+

@@ -1,0 +1,40 @@
+From cf9fe3e088b51dfddd58fcc1ed2b585b0d70ca84 Mon Sep 17 00:00:00 2001
+From: dylanyunlon <dylanyunlong@gmail.com>
+Date: Wed, 20 May 2026 07:00:28 +0000
+Subject: [PATCH] =?UTF-8?q?M440:=20Drop=20engine.compile=20on=20ZeRO-2=20e?=
+ =?UTF-8?q?ager=20path=20=E2=80=94=20inductor=20OOMs=20regardless=20of=20D?=
+ =?UTF-8?q?eepCompile?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ REAL_GPU_BENCHMARK.py | 12 +++---------
+ 1 file changed, 3 insertions(+), 9 deletions(-)
+
+diff --git a/REAL_GPU_BENCHMARK.py b/REAL_GPU_BENCHMARK.py
+index 675a7762..2f9e7bf6 100644
+--- a/REAL_GPU_BENCHMARK.py
++++ b/REAL_GPU_BENCHMARK.py
+@@ -2144,15 +2144,9 @@ class Trainer:
+         _autosp_prepare = None
+         _eager_fallback = getattr(self.config, '_autosp_eager_fallback', False)
+         if self.config.use_autosp and _eager_fallback:
+-            try:
+-                self.engine.compile(backend='inductor')
+-                if self.rank == 0:
+-                    print("[SP+DEC] Compiled with ZeRO-2 DeepCompile backend "
+-                          "(AutoSP A2A skipped)")
+-            except Exception as e:
+-                if self.rank == 0:
+-                    print(f"[SP+DEC] ZeRO-2 DeepCompile failed: {e}, "
+-                          "proceeding without compile")
++            if self.rank == 0:
++                print("[SP+DEC] ZeRO-2 active, skipping torch.compile entirely "
++                      "(inductor backward graph OOMs on A6000 with 13B)")
+             raise_eager = True
+         elif self.config.use_autosp:
+             raise_eager = False
+-- 
+2.43.0
+

@@ -1,0 +1,78 @@
+From 3abcc347da8991f4b5d2ec6aa866f134492e4b1f Mon Sep 17 00:00:00 2001
+From: dylanyunlon <dylanyunlong@gmail.com>
+Date: Wed, 20 May 2026 03:36:31 +0000
+Subject: [PATCH] =?UTF-8?q?M429:=20Fix=2013B=20experiment=20=E2=80=94=20DE?=
+ =?UTF-8?q?SLOC=20only,=20no=20DDP=20baseline?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+13B bf16 params = 25.7GB, grads = 25.7GB, total = 51.4GB.
+A6000 has 47.5GB. DDP baseline (non-DeepSpeed path) has no
+optimizer offload, so params+grads alone exceed GPU memory.
+backward() OOMs at 46.99GB allocated + 200MB gradient request.
+
+Fix: all 13B experiments use DESLOC method which goes through
+deepspeed.initialize() with cpu_offload=True. DeepSpeed ZeRO
+offloads Adam states to CPU (~100GB system RAM), keeping only
+params (25.7GB) + per-layer gradients (AC frees intermediates)
+on GPU. DDP-equivalent baseline uses Kx=1 (sync every step).
+
+batch_size reduced to 1 across all phases (A6000 headroom ~22GB
+after params, activation checkpointing keeps per-layer peak low).
+
+Signed-off-by: dylanyunlon <dylanyunlong@gmail.com>
+---
+ run_experiment_13b_locsp.sh | 21 ++++++---------------
+ 1 file changed, 6 insertions(+), 15 deletions(-)
+
+diff --git a/run_experiment_13b_locsp.sh b/run_experiment_13b_locsp.sh
+index 37ce302..94b73e9 100644
+--- a/run_experiment_13b_locsp.sh
++++ b/run_experiment_13b_locsp.sh
+@@ -80,36 +80,27 @@ run_exp() {
+ }
+ 
+ echo ""
+-echo "===== Phase 13a: 13B DDP baseline ====="
+-PYTHONHASHSEED=13 run_exp "p13a_ddp_13B" "13B" 1 "DDP" 200 1 8 "--cpu_offload --use_ac"
+-sleep 5
+-
+-PYTHONHASHSEED=13 run_exp "p13a_sp_ddp_13B" "13B" 1 "DDP" 200 1 8 "--cpu_offload --use_ac --use_autosp"
++echo "===== Phase 13a: 13B DESLOC+SP baseline (Kx=1 = DDP-equivalent) ====="
++PYTHONHASHSEED=13 run_exp "p13a_desloc_13B_Kx1" "13B" 1 "DESLOC" 200 1 8 "--cpu_offload --use_ac --use_autosp"
+ sleep 5
+ 
+ echo ""
+ echo "===== Phase 13b: 13B Kx ablation (200 steps) ====="
+ for KX in 16 32 64; do
+-    PYTHONHASHSEED=13 run_exp "p13b_sp_desloc_13B_Kx${KX}" "13B" "$KX" "DESLOC" 200 2 8 "--cpu_offload --use_ac --use_autosp"
+-    sleep 5
+-
+-    PYTHONHASHSEED=13 run_exp "p13b_sp_desloc_13B_Kx${KX}_bs4" "13B" "$KX" "DESLOC" 200 4 4 "--cpu_offload --use_ac --use_autosp"
++    PYTHONHASHSEED=13 run_exp "p13b_sp_desloc_13B_Kx${KX}" "13B" "$KX" "DESLOC" 200 1 8 "--cpu_offload --use_ac --use_autosp"
+     sleep 5
+ done
+ 
+ echo ""
+ echo "===== Phase 13c: 13B extended (1536 steps, Kx=32) ====="
+-PYTHONHASHSEED=13 run_exp "p13c_sp_desloc_13B_Kx32_long" "13B" 32 "DESLOC" 1536 2 8 "--cpu_offload --use_ac --use_autosp"
+-sleep 5
+-
+-PYTHONHASHSEED=13 run_exp "p13c_sp_desloc_13B_Kx32_seq2048" "13B" 32 "DESLOC" 200 2 8 "--cpu_offload --use_ac --use_autosp --max_seq_len 2048"
++PYTHONHASHSEED=13 run_exp "p13c_sp_desloc_13B_Kx32_long" "13B" 32 "DESLOC" 1536 1 8 "--cpu_offload --use_ac --use_autosp"
+ sleep 5
+ 
+ echo ""
+ echo "===== Phase 13d: 13B Nesterov vs Avg ====="
+-PYTHONHASHSEED=13 run_exp "p13d_sp_nesterov_13B" "13B" 32 "DESLOC" 200 2 8 "--cpu_offload --use_ac --use_autosp --outer_optimizer nesterov --outer_momentum 0.9"
++PYTHONHASHSEED=13 run_exp "p13d_sp_nesterov_13B" "13B" 32 "DESLOC" 200 1 8 "--cpu_offload --use_ac --use_autosp --outer_optimizer nesterov --outer_momentum 0.9"
+ sleep 5
+-PYTHONHASHSEED=13 run_exp "p13d_sp_avg_13B" "13B" 32 "DESLOC" 200 2 8 "--cpu_offload --use_ac --use_autosp"
++PYTHONHASHSEED=13 run_exp "p13d_sp_avg_13B" "13B" 32 "DESLOC" 200 1 8 "--cpu_offload --use_ac --use_autosp"
+ 
+ echo ""
+ echo "================================================================"
+-- 
+2.43.0
+

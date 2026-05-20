@@ -1,0 +1,59 @@
+From 9c573c7aa58cea7f6750e3fe3630967a155024d5 Mon Sep 17 00:00:00 2001
+From: dylanyunlon <dylanyunlong@gmail.com>
+Date: Wed, 20 May 2026 02:32:28 +0000
+Subject: [PATCH] =?UTF-8?q?M421:=20Fix=2013B=20OOM=20=E2=80=94=20bf16=20co?=
+ =?UTF-8?q?nversion=20on=20CPU=20before=20device=20placement?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+13B model (12846M params) in fp32 = 50.4GB, exceeds A6000 47.5GB.
+The original code did .to(device) first (fp32 on GPU), then .bfloat16()
+(too late — already OOM).
+
+Fix: construct on CPU, convert to bf16 (25.2GB), then .to(device).
+This matches Megatron-LM Float16Module pattern where dtype conversion
+precedes device placement.
+
+Memory flow on A6000 after fix:
+  bf16 params on GPU:  25.2GB
+  Remaining for AC+grad: 22.3GB  (sufficient with activation checkpointing)
+
+Signed-off-by: dylanyunlon <dylanyunlong@gmail.com>
+---
+ REAL_GPU_BENCHMARK.py | 13 +++++--------
+ 1 file changed, 5 insertions(+), 8 deletions(-)
+
+diff --git a/REAL_GPU_BENCHMARK.py b/REAL_GPU_BENCHMARK.py
+index 670bc60..e105724 100644
+--- a/REAL_GPU_BENCHMARK.py
++++ b/REAL_GPU_BENCHMARK.py
+@@ -1710,20 +1710,17 @@ class Trainer:
+             max_seq_len=config.max_seq_len,
+             use_ac=config.use_activation_checkpointing,
+             **model_config
+-        ).to(self.device)
++        )
+ 
+-        # BF16 model parameters for memory efficiency on large models
+-        # Ref: Megatron training.py:1431 — Float16Module wraps model in BF16
+-        # before DDP. This halves param memory (7B: 26.6GB→13.3GB) and is
+-        # required to fit 7B in 95GB H20 with Adam states.
+-        # BF16 has 8 exponent bits (same as FP32) so no GradScaler needed.
+         n_params = sum(p.numel() for p in self.model.parameters())
+-        if n_params > 500_000_000:  # > 500M params → use BF16
++        if n_params > 500_000_000:
+             self.model = self.model.bfloat16()
+             if self.rank == 0:
+-                print(f"[BF16] Model converted to bfloat16 ({n_params/1e6:.0f}M params, "
++                print(f"[BF16] Model converted to bfloat16 on CPU ({n_params/1e6:.0f}M params, "
+                       f"saves {n_params * 2 / 1e9:.1f}GB)")
+ 
++        self.model = self.model.to(self.device)
++
+         if config.use_activation_checkpointing and self.rank == 0:
+             print(f"[AC] Layer-wise activation checkpointing enabled "
+                   f"({model_config.get('n_layer', '?')} layers)")
+-- 
+2.43.0
+

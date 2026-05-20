@@ -1,0 +1,1244 @@
+From 5c8840558c1c34879e53a29c83a17839c14c18a3 Mon Sep 17 00:00:00 2001
+From: dylanyunlon <dylanyunlong@gmail.com>
+Date: Tue, 19 May 2026 00:26:43 +0000
+Subject: [PATCH] M408-M409: Extract histogram-only first pass, factor
+ finalize_pass, LOC+SP 13B bridge, restructure dispatch loop
+
+Following CCCL f984c90 (Extract first histogram-only pass in DeviceTopK
+into its own kernel), this commit applies the same kernel extraction
+and dispatch restructuring discipline to Neuron_SP AutoSP:
+
+=== M408: Kernel extraction + LOC bridge ===
+
+sp_histogram.py:
+  - Extract invoke_histogram_only() as standalone pass-0 kernel
+    (mirrors AgentTopK::invoke_histogram_only)
+  - Add invoke_filter_and_histogram() for pass>=1 with candidate masking
+  - Factor finalize_pass() as reusable method taking counter_update_fn
+    callable (mirrors AgentTopK::finalize_pass<CounterUpdateFn>)
+  - Add PassCounter dataclass for cross-pass state tracking
+  - Add run_filter_and_histogram_pass() top-level dispatch
+
+double_buffer_a2a.py:
+  - Align DoubleBuffer.swap() with CCCL key_bufs.selector ^= 1 pattern
+  - Add _swap_count tracking and swap_count() accessor
+
+sp_dp_registry.py:
+  - Add LOC state: loc_enabled, loc_sp_group_ids in _MESH_META
+  - Add is_loc_enabled(), enable_loc(), get_loc_sp_group_ids()
+  - Add populate_registry_with_loc() for decentralized peer groups
+
+all_to_all.py:
+  - Extract _resolve_group() helper
+
+init_sp.py:
+  - Add _parse_loc_config() for loc.enabled/peer_ranks/model_size
+  - init_autosp() branches: LOC -> populate_registry_with_loc
+
+loc_sp_bridge.py (NEW):
+  - LOCSPShardingAdapter: scatter/gather for SP region
+    (mirrors Megatron scatter_to_sequence_parallel_region)
+  - LOCRemoteSequentialSPWrapper: wraps BloomBee RemoteSequential
+  - LOCSPGradientBridge: DES-LOC Kx-gated gradient sync
+
+sp_compile.py:
+  - Consolidate pass_shard_input_ids/label_ids/position_ids into
+    unified pass_shard_tagged_inputs with _SHARD_TARGETS table
+
+=== M409: Dispatch loop restructuring ===
+
+autosp_fusion.py:
+  - Extract duplicated gather->splice->pad->shard from three VLM
+    adapters into reusable _fused_sp_forward() free function
+  - Each adapter now only implements _splice_visual_into_text
+
+bloombee_bridge.py:
+  - TensorCodec uses _COMPRESS_DISPATCH/_DECOMPRESS_DISPATCH tables
+    instead of if/elif chains
+  - HeteroSyncGate.should_sync() takes is_last_pass parameter
+  - RemoteA2ADoubleBuffer: public selector, alternate_send/recv,
+    swap_count tracking
+
+occupancy_grid.py:
+  - Extract _compute_blocks_per_sm() helper
+  - compute_histogram_grid/filter_grid return full OccupancyResult
+  - New compute_dispatch_plan() returns both grids
+
+long_context_checkpointing.py:
+  - Convert _CUSTOM_SHOULD_BAN from triple-quoted string to
+    parenthesized string concatenation
+
+All files: zero docstrings, zero hash comments.
+---
+ deepspeed/compile/custom_ops/all_to_all.py    |  11 +-
+ .../compile/custom_ops/bloombee_bridge.py     | 161 ++++++++++++------
+ .../compile/custom_ops/double_buffer_a2a.py   |  14 +-
+ deepspeed/compile/custom_ops/loc_sp_bridge.py | 134 +++++++++++++++
+ .../compile/custom_ops/occupancy_grid.py      |  48 +++++-
+ .../compile/custom_ops/sp_dp_registry.py      |  30 ++++
+ deepspeed/compile/custom_ops/sp_histogram.py  | 124 +++++++++++++-
+ deepspeed/compile/init_sp.py                  |  23 ++-
+ .../passes/long_context_checkpointing.py      | 118 ++++++-------
+ deepspeed/compile/passes/sp_compile.py        |  19 ++-
+ deepspeed/sequence/autosp_fusion.py           |  86 ++++------
+ 11 files changed, 576 insertions(+), 192 deletions(-)
+ create mode 100644 deepspeed/compile/custom_ops/loc_sp_bridge.py
+
+diff --git a/deepspeed/compile/custom_ops/all_to_all.py b/deepspeed/compile/custom_ops/all_to_all.py
+index 4d3be745..975b71a0 100644
+--- a/deepspeed/compile/custom_ops/all_to_all.py
++++ b/deepspeed/compile/custom_ops/all_to_all.py
+@@ -1,7 +1,7 @@
+ import torch
+ import deepspeed.comm as dist
+ from torch.utils._sympy.functions import FloorDiv
+-from .sp_dp_registry import get_group, is_setup, sp_size, track_a2a_handle, finalize_a2a_pass
++from .sp_dp_registry import get_group, is_setup, sp_size, track_a2a_handle, finalize_a2a_pass, is_loc_enabled
+ 
+ _FP32_SP_GRAD = False
+ 
+@@ -37,6 +37,12 @@ def _execute_a2a(input, B, dim1, dim2, H, group, plan):
+     return output.reshape(*plan["post_reshape"](B, P, dim1, dim2, H))
+ 
+ 
++def _resolve_group():
++    _sp = sp_size()
++    gid = dist.get_rank() // _sp
++    return get_group(gid)
++
++
+ @torch.library.custom_op("autosp::all_to_all", mutates_args=())
+ def all_to_all(
+     input: torch.Tensor,
+@@ -59,9 +65,8 @@ def all_to_all(
+         assert dim2 % _sp == 0, (
+             f"[AutoSP] all_to_all forward: S={dim2} not divisible by sp_size={_sp}. "
+             f"Sequence length must be divisible by sequence_parallel_size.")
+-    gid = dist.get_rank() // _sp
+-    group = get_group(gid)
+ 
++    group = _resolve_group()
+     plan = _SCATTER_HEADS if scatter_idx == 1 else _SCATTER_SEQ
+     return _execute_a2a(input, B, dim1, dim2, H, group, plan)
+ 
+diff --git a/deepspeed/compile/custom_ops/bloombee_bridge.py b/deepspeed/compile/custom_ops/bloombee_bridge.py
+index d3e8e991..0d6d962c 100644
+--- a/deepspeed/compile/custom_ops/bloombee_bridge.py
++++ b/deepspeed/compile/custom_ops/bloombee_bridge.py
+@@ -94,69 +94,106 @@ class RemoteA2AConfig:
+     retry_count: int = 3
+ 
+ 
++def _compress_fp16(tensor, meta):
++    import numpy as np
++    compressed = tensor.half().cpu().numpy().tobytes()
++    return compressed, meta
++
++
++def _compress_int8(tensor, meta):
++    import torch
++    import numpy as np
++    orig_shape = tensor.shape
++    flat = tensor.reshape(-1, orig_shape[-1])
++    absmax = flat.abs().amax(dim=0)
++    scales = absmax / 127.0
++    scales = scales.clamp(min=1e-8)
++    quantized = (flat / scales.unsqueeze(0)).clamp(-127, 127).to(torch.int8)
++    compressed = quantized.cpu().numpy().tobytes()
++    meta["scales"] = scales.cpu().tolist()
++    meta["orig_shape"] = list(orig_shape)
++    meta["flat_shape"] = list(flat.shape)
++    return compressed, meta
++
++
++def _compress_none(tensor, meta):
++    import numpy as np
++    meta["codec"] = "none"
++    return tensor.cpu().numpy().tobytes(), meta
++
++
++def _decompress_fp16(data, meta, device):
++    import torch
++    import numpy as np
++    shape = meta["shape"]
++    original_dtype = getattr(torch, meta["dtype"].replace("torch.", ""))
++    arr = np.frombuffer(data, dtype=np.float16).reshape(shape)
++    return torch.from_numpy(arr.copy()).to(dtype=original_dtype, device=device)
++
++
++def _decompress_int8(data, meta, device):
++    import torch
++    import numpy as np
++    orig_shape = meta.get("orig_shape", meta["shape"])
++    hidden_dim = orig_shape[-1]
++    flat_shape = tuple(meta["flat_shape"]) if "flat_shape" in meta else (-1, hidden_dim)
++    arr = np.frombuffer(data, dtype=np.int8).reshape(flat_shape)
++    tensor = torch.from_numpy(arr.copy()).to(dtype=torch.float32, device=device)
++    scales = torch.tensor(meta["scales"], dtype=torch.float32, device=device)
++    tensor = tensor * scales.unsqueeze(0)
++    original_dtype = getattr(torch, meta["dtype"].replace("torch.", ""))
++    return tensor.reshape(orig_shape).to(original_dtype)
++
++
++def _decompress_none(data, meta, device):
++    import torch
++    import numpy as np
++    shape = meta["shape"]
++    original_dtype = getattr(torch, meta["dtype"].replace("torch.", ""))
++    arr = np.frombuffer(data, dtype=np.float32).reshape(shape)
++    return torch.from_numpy(arr.copy()).to(dtype=original_dtype, device=device)
++
++
++_COMPRESS_DISPATCH = {
++    "fp16": _compress_fp16,
++    "int8": _compress_int8,
++}
++
++_DECOMPRESS_DISPATCH = {
++    "fp16": _decompress_fp16,
++    "int8": _decompress_int8,
++    "none": _decompress_none,
++}
++
++
+ class TensorCodec:
+ 
+     def __init__(self, codec="fp16"):
+         self._codec = codec
+ 
+-    def compress(self, tensor) -> Tuple[bytes, dict]:
++    def compress(self, tensor):
+         import torch
+-        import numpy as np
+         meta = {
+             "shape": list(tensor.shape),
+             "dtype": str(tensor.dtype),
+             "codec": self._codec,
+         }
++        compress_fn = _COMPRESS_DISPATCH.get(self._codec)
++        if compress_fn is None:
++            return _compress_none(tensor, meta)
++        if self._codec == "fp16" and tensor.dtype != torch.float32:
++            return _compress_none(tensor, meta)
++        return compress_fn(tensor, meta)
+ 
+-        if self._codec == "fp16" and tensor.dtype == torch.float32:
+-            compressed = tensor.half().cpu().numpy().tobytes()
+-            return compressed, meta
+-
+-        if self._codec == "int8":
+-            orig_shape = tensor.shape
+-            flat = tensor.reshape(-1, orig_shape[-1])
+-            absmax = flat.abs().amax(dim=0)
+-            scales = absmax / 127.0
+-            scales = scales.clamp(min=1e-8)
+-            quantized = (flat / scales.unsqueeze(0)).clamp(-127, 127).to(torch.int8)
+-            compressed = quantized.cpu().numpy().tobytes()
+-            meta["scales"] = scales.cpu().tolist()
+-            meta["orig_shape"] = list(orig_shape)
+-            meta["flat_shape"] = list(flat.shape)
+-            return compressed, meta
+-
+-        compressed = tensor.cpu().numpy().tobytes()
+-        meta["codec"] = "none"
+-        return compressed, meta
+-
+-    def decompress(self, data, meta, device) -> 'torch.Tensor':
+-        import torch
+-        import numpy as np
+-        shape = meta["shape"]
+-        original_dtype = getattr(torch, meta["dtype"].replace("torch.", ""))
+-        codec = meta["codec"]
+-
+-        if codec == "fp16":
+-            arr = np.frombuffer(data, dtype=np.float16).reshape(shape)
+-            return torch.from_numpy(arr.copy()).to(dtype=original_dtype, device=device)
+-
+-        if codec == "int8":
+-            orig_shape = meta.get("orig_shape", shape)
+-            hidden_dim = orig_shape[-1]
+-            flat_shape = tuple(meta["flat_shape"]) if "flat_shape" in meta else (-1, hidden_dim)
+-            arr = np.frombuffer(data, dtype=np.int8).reshape(flat_shape)
+-            tensor = torch.from_numpy(arr.copy()).to(dtype=torch.float32, device=device)
+-            scales = torch.tensor(meta["scales"], dtype=torch.float32, device=device)
+-            tensor = tensor * scales.unsqueeze(0)
+-            return tensor.reshape(orig_shape).to(original_dtype)
+-
+-        arr = np.frombuffer(data, dtype=np.float32).reshape(shape)
+-        return torch.from_numpy(arr.copy()).to(dtype=original_dtype, device=device)
++    def decompress(self, data, meta, device):
++        codec = meta.get("codec", "none")
++        decompress_fn = _DECOMPRESS_DISPATCH.get(codec, _decompress_none)
++        return decompress_fn(data, meta, device)
+ 
+ 
+ class RemoteA2AProxy:
+ 
+-    def __init__(self, config: Optional[RemoteA2AConfig] = None):
++    def __init__(self, config=None):
+         self.config = config or RemoteA2AConfig()
+         self._codec = TensorCodec(self.config.compression_codec)
+         self._stats = {"sends": 0, "recvs": 0, "bytes_sent": 0, "bytes_recv": 0}
+@@ -184,15 +221,17 @@ class HeteroSyncConfig:
+ 
+ class HeteroSyncGate:
+ 
+-    def __init__(self, config: Optional[HeteroSyncConfig] = None):
++    def __init__(self, config=None):
+         self.config = config or HeteroSyncConfig()
+         self._effective_Kx = self.config.base_Kx
+         self._step = 0
+         self._peer_last_seen: Dict[int, float] = {}
+         self._grad_norms: List[float] = []
+ 
+-    def should_sync(self, step):
++    def should_sync(self, step, is_last_pass=False):
+         self._step = step
++        if is_last_pass:
++            return True
+         if self._effective_Kx <= 1:
+             return True
+         return (step % self._effective_Kx) == 0
+@@ -253,12 +292,13 @@ class HeteroSyncGate:
+ 
+ class RemoteA2ADoubleBuffer:
+ 
+-    def __init__(self, config: Optional[RemoteA2AConfig] = None):
++    def __init__(self, config=None):
+         self._config = config or RemoteA2AConfig()
+         self._proxy = RemoteA2AProxy(self._config)
+-        self._selector = 0
++        self.selector = 0
+         self._send_buffers = [None, None]
+         self._recv_buffers = [None, None]
++        self._swap_count = 0
+ 
+     def allocate(self, shape, dtype):
+         import torch as _t
+@@ -267,13 +307,23 @@ class RemoteA2ADoubleBuffer:
+             self._recv_buffers[i] = _t.empty(shape, dtype=dtype, device='cpu')
+ 
+     def current_send(self):
+-        return self._send_buffers[self._selector]
++        return self._send_buffers[self.selector]
++
++    def alternate_send(self):
++        return self._send_buffers[self.selector ^ 1]
+ 
+     def current_recv(self):
+-        return self._recv_buffers[self._selector]
++        return self._recv_buffers[self.selector]
++
++    def alternate_recv(self):
++        return self._recv_buffers[self.selector ^ 1]
+ 
+     def swap(self):
+-        self._selector ^= 1
++        self.selector ^= 1
++        self._swap_count += 1
++
++    def swap_count(self):
++        return self._swap_count
+ 
+     def compress_and_stage(self, tensor):
+         return self._proxy.compress_tensor(tensor)
+@@ -284,4 +334,5 @@ class RemoteA2ADoubleBuffer:
+     def free(self):
+         self._send_buffers = [None, None]
+         self._recv_buffers = [None, None]
+-        self._selector = 0
++        self.selector = 0
++        self._swap_count = 0
+diff --git a/deepspeed/compile/custom_ops/double_buffer_a2a.py b/deepspeed/compile/custom_ops/double_buffer_a2a.py
+index 1eeeed11..4a7b2daf 100644
+--- a/deepspeed/compile/custom_ops/double_buffer_a2a.py
++++ b/deepspeed/compile/custom_ops/double_buffer_a2a.py
+@@ -18,6 +18,7 @@ class DoubleBuffer:
+         self._valid = [False, False]
+         self._allocated = False
+         self._lock = threading.Lock()
++        self._swap_count = 0
+ 
+     def allocate(self, shape, dtype=None):
+         with self._lock:
+@@ -50,8 +51,12 @@ class DoubleBuffer:
+     def swap(self):
+         with self._lock:
+             self.selector ^= 1
++            self._swap_count += 1
+             track_buffer_event("swapped")
+ 
++    def swap_count(self):
++        return self._swap_count
++
+     def mark_valid(self, slot=-1):
+         if slot < 0:
+             slot = self.selector
+@@ -74,6 +79,7 @@ class DoubleBuffer:
+             self._valid[i] = False
+         self._allocated = False
+         self.selector = 0
++        self._swap_count = 0
+         track_buffer_event("freed")
+ 
+     def free(self):
+@@ -149,7 +155,8 @@ def execute_double_buffered_a2a(input_tensor, scatter_idx, gather_idx,
+                                  is_last_pass, pool=None):
+     pool = pool or get_buffer_pool()
+ 
+-    buf = pool.get_or_create(f"a2a_pass_{pass_index % 2}", dtype=input_tensor.dtype)
++    buf_key = f"a2a_pass_{pass_index % 2}"
++    buf = pool.get_or_create(buf_key, dtype=input_tensor.dtype)
+ 
+     if not buf.allocated or buf.current().shape != input_tensor.shape:
+         buf.free()
+@@ -163,4 +170,9 @@ def execute_double_buffered_a2a(input_tensor, scatter_idx, gather_idx,
+     buf.mark_valid(buf.selector ^ 1)
+     buf.swap()
+ 
++    if is_last_pass:
++        idx_buf = pool.get_or_create(f"idx_{buf_key}", dtype=torch.long)
++        if idx_buf.allocated:
++            idx_buf.swap()
++
+     return result
+diff --git a/deepspeed/compile/custom_ops/loc_sp_bridge.py b/deepspeed/compile/custom_ops/loc_sp_bridge.py
+new file mode 100644
+index 00000000..a22e1ab7
+--- /dev/null
++++ b/deepspeed/compile/custom_ops/loc_sp_bridge.py
+@@ -0,0 +1,134 @@
++import logging
++from typing import Optional, List, Tuple
++
++import torch
++import torch.nn as nn
++import deepspeed.comm as dist
++
++from .sp_dp_registry import (
++    is_setup, sp_size, dp_size, get_group,
++    is_loc_enabled, get_loc_sp_group_ids,
++    fence_all_sp_handles, track_a2a_handle,
++)
++
++logger = logging.getLogger(__name__)
++
++
++class LOCSPShardingAdapter(nn.Module):
++
++    def __init__(self, sp_world_size, loc_group=None):
++        super().__init__()
++        self._sp_world_size = sp_world_size
++        self._loc_group = loc_group
++        self._scatter_cache = {}
++
++    def scatter_to_sp_region(self, hidden_states, seq_dim=1):
++        total_seq = hidden_states.shape[seq_dim]
++        assert total_seq % self._sp_world_size == 0, (
++            f"seq_len={total_seq} not divisible by sp_size={self._sp_world_size}")
++
++        local_seq = total_seq // self._sp_world_size
++        rank = dist.get_rank()
++        sp_rank = rank % self._sp_world_size
++        start = sp_rank * local_seq
++        end = start + local_seq
++
++        return hidden_states.narrow(seq_dim, start, local_seq).contiguous()
++
++    def gather_from_sp_region(self, hidden_states, seq_dim=1):
++        local_seq = hidden_states.shape[seq_dim]
++        gathered = [torch.empty_like(hidden_states) for _ in range(self._sp_world_size)]
++
++        rank = dist.get_rank()
++        gid = rank // self._sp_world_size
++        group = get_group(gid) if is_setup() else None
++
++        dist.all_gather(gathered, hidden_states.contiguous(), group=group)
++
++        return torch.cat(gathered, dim=seq_dim)
++
++    def forward(self, hidden_states, mode="scatter", seq_dim=1):
++        if mode == "scatter":
++            return self.scatter_to_sp_region(hidden_states, seq_dim)
++        return self.gather_from_sp_region(hidden_states, seq_dim)
++
++
++class LOCRemoteSequentialSPWrapper(nn.Module):
++
++    def __init__(self, remote_sequential, sp_world_size, loc_group=None):
++        super().__init__()
++        self.remote_sequential = remote_sequential
++        self.adapter = LOCSPShardingAdapter(sp_world_size, loc_group)
++        self._sp_world_size = sp_world_size
++
++    def forward(self, inputs, prompts=None, **kwargs):
++        assert inputs.ndim == 3, (
++            f"inputs must be [batch_size, seq_length, hidden_size], got {inputs.shape}")
++
++        sharded = self.adapter.scatter_to_sp_region(inputs, seq_dim=1)
++
++        output = self.remote_sequential(sharded, prompts=prompts, **kwargs)
++
++        gathered = self.adapter.gather_from_sp_region(output, seq_dim=1)
++
++        return gathered
++
++
++class LOCSPGradientBridge:
++
++    def __init__(self, sp_world_size, kx=1):
++        self._sp_world_size = sp_world_size
++        self._kx = kx
++        self._step = 0
++        self._pending_grads = []
++
++    def should_sync(self):
++        if self._step < 512:
++            return True
++        return (self._step % self._kx) == 0
++
++    def pre_backward_fence(self):
++        if is_setup():
++            fence_all_sp_handles()
++
++    def post_backward_reduce(self, model):
++        self._step += 1
++        if not self.should_sync():
++            return False
++
++        for p in model.parameters():
++            if p.grad is not None:
++                dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
++
++        return True
++
++    def state_dict(self):
++        return {'step': self._step, 'kx': self._kx}
++
++    def load_state_dict(self, sd):
++        self._step = sd.get('step', 0)
++        self._kx = sd.get('kx', self._kx)
++
++
++def create_loc_sp_wrapper(remote_sequential, config_param_dict):
++    sp = config_param_dict.get('sequence_parallel_size', 1)
++    loc_cfg = config_param_dict.get('loc', {})
++    kx = config_param_dict.get('desloc', {}).get('Kx', 1)
++
++    loc_group = None
++    if is_loc_enabled():
++        gids = get_loc_sp_group_ids()
++        if gids:
++            loc_group = get_group(gids[0])
++
++    wrapper = LOCRemoteSequentialSPWrapper(
++        remote_sequential, sp, loc_group)
++
++    grad_bridge = LOCSPGradientBridge(sp, kx=kx)
++
++    logger.info(
++        f"[LOC+SP] Created wrapper sp={sp} kx={kx} "
++        f"loc_enabled={is_loc_enabled()} "
++        f"model_size={loc_cfg.get('model_size', '7B')}")
++
++    return wrapper, grad_bridge
+diff --git a/deepspeed/compile/custom_ops/occupancy_grid.py b/deepspeed/compile/custom_ops/occupancy_grid.py
+index bcdd67d5..f3e04405 100644
+--- a/deepspeed/compile/custom_ops/occupancy_grid.py
++++ b/deepspeed/compile/custom_ops/occupancy_grid.py
+@@ -25,6 +25,14 @@ class OccupancyResult:
+     shared_mem_per_block: int = 0
+ 
+ 
++@dataclass
++class DispatchPlan:
++    histogram_grid: OccupancyResult = None
++    filter_grid: OccupancyResult = None
++    num_passes: int = 1
++    num_sms: int = 0
++
++
+ _MAX_BLOCKS_TABLE = {
+     (7, 0): 32, (7, 5): 16, (8, 0): 32, (8, 6): 16,
+     (8, 9): 16, (9, 0): 32, (10, 0): 32,
+@@ -61,13 +69,9 @@ def get_cached_capability(device_id=-1):
+     return _CAPABILITY_CACHE[device_id]
+ 
+ 
+-def compute_grid(num_elements, block_threads=256, shared_mem_per_block=0,
+-                 capability=None):
+-    if capability is None:
+-        capability = get_cached_capability()
+-
++def _compute_blocks_per_sm(block_threads, shared_mem_per_block, capability):
+     if capability.num_sms == 0:
+-        return OccupancyResult(grid_size=1, block_threads=block_threads)
++        return 1
+ 
+     warps_per_block = math.ceil(block_threads / capability.warp_size)
+     max_warps_per_sm = capability.max_threads_per_sm // capability.warp_size
+@@ -79,7 +83,18 @@ def compute_grid(num_elements, block_threads=256, shared_mem_per_block=0,
+     if shared_mem_per_block > 0 and capability.max_shared_memory_per_sm > 0:
+         blocks_by_smem = capability.max_shared_memory_per_sm // shared_mem_per_block
+ 
+-    blocks_per_sm = max(min(blocks_by_warps, blocks_by_limit, blocks_by_smem), 1)
++    return max(min(blocks_by_warps, blocks_by_limit, blocks_by_smem), 1)
++
++
++def compute_grid(num_elements, block_threads=256, shared_mem_per_block=0,
++                 capability=None):
++    if capability is None:
++        capability = get_cached_capability()
++
++    if capability.num_sms == 0:
++        return OccupancyResult(grid_size=1, block_threads=block_threads)
++
++    blocks_per_sm = _compute_blocks_per_sm(block_threads, shared_mem_per_block, capability)
+     max_occupancy = blocks_per_sm * capability.num_sms
+     num_tiles = math.ceil(num_elements / block_threads)
+     grid_size = min(max_occupancy, num_tiles)
+@@ -96,12 +111,27 @@ def compute_grid(num_elements, block_threads=256, shared_mem_per_block=0,
+ 
+ def compute_histogram_grid(num_elements, capability=None):
+     return compute_grid(num_elements, block_threads=256,
+-                        shared_mem_per_block=256 * 8, capability=capability).grid_size
++                        shared_mem_per_block=256 * 8, capability=capability)
+ 
+ 
+ def compute_filter_grid(num_elements, capability=None):
+     return compute_grid(num_elements, block_threads=256,
+-                        shared_mem_per_block=256 * 4, capability=capability).grid_size
++                        shared_mem_per_block=256 * 4, capability=capability)
++
++
++def compute_dispatch_plan(num_elements, num_passes=1, capability=None):
++    if capability is None:
++        capability = get_cached_capability()
++
++    hist_occ = compute_histogram_grid(num_elements, capability)
++    filt_occ = compute_filter_grid(num_elements, capability)
++
++    return DispatchPlan(
++        histogram_grid=hist_occ,
++        filter_grid=filt_occ,
++        num_passes=num_passes,
++        num_sms=capability.num_sms,
++    )
+ 
+ 
+ def compute_a2a_grid_for_tier(num_elements, tier, capability=None):
+diff --git a/deepspeed/compile/custom_ops/sp_dp_registry.py b/deepspeed/compile/custom_ops/sp_dp_registry.py
+index ce3d494d..b0ac4370 100644
+--- a/deepspeed/compile/custom_ops/sp_dp_registry.py
++++ b/deepspeed/compile/custom_ops/sp_dp_registry.py
+@@ -12,6 +12,8 @@ _MESH_META = {
+     "dp_size": 0,
+     "is_registered": False,
+     "is_heterogeneous": False,
++    "loc_enabled": False,
++    "loc_sp_group_ids": [],
+ }
+ 
+ _PENDING_A2A_HANDLES = []
+@@ -47,6 +49,20 @@ def mark_heterogeneous(flag=True):
+     _MESH_META["is_heterogeneous"] = flag
+ 
+ 
++def is_loc_enabled():
++    return _MESH_META.get("loc_enabled", False)
++
++
++def enable_loc(sp_group_ids=None):
++    _MESH_META["loc_enabled"] = True
++    if sp_group_ids is not None:
++        _MESH_META["loc_sp_group_ids"] = list(sp_group_ids)
++
++
++def get_loc_sp_group_ids():
++    return _MESH_META.get("loc_sp_group_ids", [])
++
++
+ def extract_mesh_size(param_dict):
+     sp = param_dict.get('sequence_parallel_size', 1)
+     assert dist.get_world_size() % sp == 0, 'World mesh-size should be divisible by SP_SIZE'
+@@ -90,6 +106,18 @@ def populate_registry(SP_SIZE, DP_SIZE):
+         f"groups={[list(range(i*SP_SIZE,(i+1)*SP_SIZE)) for i in range(DP_SIZE)]}")
+ 
+ 
++def populate_registry_with_loc(SP_SIZE, DP_SIZE, loc_peer_ranks=None):
++    populate_registry(SP_SIZE, DP_SIZE)
++
++    if loc_peer_ranks is not None and len(loc_peer_ranks) > 0:
++        loc_gid = max(_PROCESS_GROUPS.keys(), default=-1) + 1
++        _PROCESS_GROUPS[loc_gid] = dist.new_group(loc_peer_ranks)
++        enable_loc(sp_group_ids=[loc_gid])
++        logger.info(
++            f"[SP-REG-LOC] rank={dist.get_rank()} LOC peer group "
++            f"gid={loc_gid} ranks={loc_peer_ranks}")
++
++
+ def _drain_threshold():
+     if _MESH_META.get("is_heterogeneous", False):
+         return _A2A_HANDLE_HIGH_WATER // 4
+@@ -200,6 +228,8 @@ def cleanup_sp_groups():
+     _MESH_META["dp_size"] = 0
+     _MESH_META["is_registered"] = False
+     _MESH_META["is_heterogeneous"] = False
++    _MESH_META["loc_enabled"] = False
++    _MESH_META["loc_sp_group_ids"] = []
+ 
+ 
+ _BUFFER_LIFECYCLE = {
+diff --git a/deepspeed/compile/custom_ops/sp_histogram.py b/deepspeed/compile/custom_ops/sp_histogram.py
+index 592ec82a..07c3ebf5 100644
+--- a/deepspeed/compile/custom_ops/sp_histogram.py
++++ b/deepspeed/compile/custom_ops/sp_histogram.py
+@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
+ 
+ import torch
+ import deepspeed.comm as dist
+-from .sp_dp_registry import finalize_a2a_pass
++from .sp_dp_registry import finalize_a2a_pass, fence_all_sp_handles
+ 
+ 
+ @dataclass
+@@ -27,6 +27,15 @@ class HistogramAccumulator:
+     filter_count: int = 0
+ 
+ 
++@dataclass
++class PassCounter:
++    previous_len: int = 0
++    current_len: int = 0
++    filter_cnt: int = 0
++    k: int = 0
++    finished_block_cnt: int = 0
++
++
+ class SPHistogramKernel:
+ 
+     def __init__(self, num_bins=256, device=None):
+@@ -35,6 +44,7 @@ class SPHistogramKernel:
+                                   if torch.cuda.is_available() else torch.device("cpu"))
+         self._accumulator = HistogramAccumulator()
+         self._pass_count = 0
++        self._counter = PassCounter()
+ 
+     def invoke_histogram_only(self, input_ids, seq_dim=1):
+         seq_len = input_ids.shape[seq_dim]
+@@ -62,6 +72,64 @@ class SPHistogramKernel:
+         self._pass_count += 1
+         return result
+ 
++    def invoke_filter_and_histogram(self, input_ids, candidate_mask, seq_dim=1):
++        seq_len = input_ids.shape[seq_dim]
++        bin_edges = torch.linspace(0, seq_len, self._num_bins + 1,
++                                   device=self._device, dtype=torch.float32)
++
++        if input_ids.dtype in (torch.long, torch.int):
++            values = input_ids.float()
++        else:
++            values = input_ids
++
++        flat = values.reshape(-1)
++        if candidate_mask is not None:
++            mask_flat = candidate_mask.reshape(-1)
++            flat = flat[mask_flat]
++
++        bin_indices = torch.bucketize(flat, bin_edges[1:-1])
++        counts = torch.zeros(self._num_bins, device=self._device, dtype=torch.long)
++        counts.scatter_add_(0, bin_indices.long(), torch.ones_like(bin_indices, dtype=torch.long))
++
++        self._counter.filter_cnt = int(flat.numel())
++
++        result = SequenceHistogram(
++            bin_counts=counts,
++            total_tokens=flat.numel(),
++            num_bins=self._num_bins,
++            pass_index=self._pass_count,
++            timestamp_ns=time.time_ns(),
++            rank=dist.get_rank() if dist.is_initialized() else 0,
++        )
++        self._pass_count += 1
++        return result
++
++    def finalize_pass(self, histogram, current_k, pass_idx, is_last_pass, counter_update_fn):
++        global_hist = self.reduce_histograms(histogram)
++
++        counter_update_fn(global_hist)
++
++        bin_offsets = self._compute_bin_offsets(global_hist)
++
++        bucket_idx = self._choose_bucket(bin_offsets, current_k)
++
++        if not is_last_pass:
++            self._counter.finished_block_cnt = 0
++
++        return global_hist, bucket_idx, bin_offsets
++
++    def _compute_bin_offsets(self, histogram):
++        if histogram.bin_counts is None:
++            return torch.zeros(self._num_bins, device=self._device, dtype=torch.long)
++        return torch.cumsum(histogram.bin_counts, dim=0)
++
++    def _choose_bucket(self, bin_offsets, current_k):
++        if bin_offsets is None or current_k <= 0:
++            return 0
++        idx = torch.searchsorted(bin_offsets, torch.tensor(
++            [current_k], device=self._device, dtype=bin_offsets.dtype))
++        return int(idx.item())
++
+     def reduce_histograms(self, local_hist):
+         if not dist.is_initialized() or dist.get_world_size() <= 1:
+             return local_hist
+@@ -134,8 +202,12 @@ class SPHistogramKernel:
+     def get_accumulator(self):
+         return self._accumulator
+ 
++    def get_counter(self):
++        return self._counter
++
+     def reset(self):
+         self._accumulator = HistogramAccumulator()
++        self._counter = PassCounter()
+         self._pass_count = 0
+ 
+ 
+@@ -152,14 +224,58 @@ def get_histogram_kernel(num_bins=256):
+ def run_first_pass_histogram(input_ids, sp_size, seq_dim=1, is_last_pass=False):
+     kernel = get_histogram_kernel()
+     local_hist = kernel.invoke_histogram_only(input_ids, seq_dim=seq_dim)
+-    global_hist = kernel.reduce_histograms(local_hist)
+ 
+-    def _counter_update():
++    num_items = input_ids.numel()
++
++    def _first_pass_counter_update(global_hist):
+         kernel.accumulate(global_hist)
++        kernel._counter.previous_len = num_items
++        kernel._counter.filter_cnt = 0
+ 
+-    finalize_a2a_pass(is_last_pass, _counter_update)
++    global_hist, bucket_idx, bin_offsets = kernel.finalize_pass(
++        local_hist, sp_size, 0, is_last_pass, _first_pass_counter_update)
+ 
+     early_stop = kernel.early_stop_check(global_hist, sp_size)
++    if early_stop:
++        kernel._counter.previous_len = 0
++        kernel._counter.current_len = 0
++        return [1.0 / sp_size] * sp_size, True
++
++    ratios = kernel.compute_optimal_chunk_ratios(global_hist, sp_size)
++    return ratios, False
++
++
++def run_filter_and_histogram_pass(
++    input_ids, candidate_mask, sp_size, pass_idx,
++    is_last_pass=False, seq_dim=1,
++):
++    kernel = get_histogram_kernel()
++    counter = kernel.get_counter()
++
++    current_k = counter.k if counter.k > 0 else sp_size
++    current_len = counter.current_len
++    previous_len = counter.previous_len
++
++    if current_len == 0:
++        return [1.0 / sp_size] * sp_size, True
++
++    early_stop = (current_len == current_k)
++
++    local_hist = kernel.invoke_filter_and_histogram(
++        input_ids, candidate_mask, seq_dim=seq_dim)
++
++    def _filter_counter_update(global_hist):
++        kernel.accumulate(global_hist)
++        if early_stop:
++            kernel._counter.previous_len = 0
++            kernel._counter.current_len = 0
++        else:
++            kernel._counter.previous_len = current_len
++            kernel._counter.filter_cnt = 0
++
++    global_hist, bucket_idx, bin_offsets = kernel.finalize_pass(
++        local_hist, current_k, pass_idx, is_last_pass, _filter_counter_update)
++
+     if early_stop:
+         return [1.0 / sp_size] * sp_size, True
+ 
+diff --git a/deepspeed/compile/init_sp.py b/deepspeed/compile/init_sp.py
+index 432e943f..f380a360 100644
+--- a/deepspeed/compile/init_sp.py
++++ b/deepspeed/compile/init_sp.py
+@@ -49,6 +49,16 @@ def _parse_histogram_config(param_dict):
+     }
+ 
+ 
++def _parse_loc_config(param_dict):
++    cfg = param_dict.get('loc', {})
++    return {
++        'enabled': cfg.get('enabled', False),
++        'peer_ranks': cfg.get('peer_ranks', []),
++        'model_size': cfg.get('model_size', '7B'),
++        'dht_prefix': cfg.get('dht_prefix', 'neuron_sp'),
++    }
++
++
+ def _ensure_clean_state():
+     from .custom_ops.sp_dp_registry import cleanup_sp_groups, is_setup, pending_handle_count
+     if not is_setup():
+@@ -96,8 +106,14 @@ def init_autosp(config):
+     desloc_cfg = _parse_desloc_config(config._param_dict)
+     hetero_cfg = _parse_hetero_config(config._param_dict)
+     histogram_cfg = _parse_histogram_config(config._param_dict)
+-
+-    if hetero_cfg['strategy'] != 'contiguous':
++    loc_cfg = _parse_loc_config(config._param_dict)
++
++    if loc_cfg['enabled']:
++        from .custom_ops.sp_dp_registry import populate_registry_with_loc
++        populate_registry_with_loc(
++            sp_size, dp_size,
++            loc_peer_ranks=loc_cfg['peer_ranks'] or None)
++    elif hetero_cfg['strategy'] != 'contiguous':
+         from .custom_ops.hetero_mesh import populate_hetero_registry
+         populate_hetero_registry(sp_size, dp_size, strategy=hetero_cfg['strategy'])
+         from .custom_ops.sp_dp_registry import mark_heterogeneous
+@@ -110,7 +126,8 @@ def init_autosp(config):
+     logger.info(
+         f"[AutoSP] sp={sp_size} dp={dp_size} desloc={desloc_cfg['enabled']} "
+         f"Kx={desloc_cfg['Kx']} mesh_strategy={hetero_cfg['strategy']} "
+-        f"histogram={histogram_cfg['enabled']}")
++        f"histogram={histogram_cfg['enabled']} "
++        f"loc={loc_cfg['enabled']} loc_model={loc_cfg['model_size']}")
+ 
+     def backend_fn(gm: GraphModule, real_inputs):
+         apply_autosp(gm, real_inputs, debug=False, sp_size=sp_size, dp_size=dp_size)
+diff --git a/deepspeed/compile/passes/long_context_checkpointing.py b/deepspeed/compile/passes/long_context_checkpointing.py
+index 59efcd70..2df4cc7e 100644
+--- a/deepspeed/compile/passes/long_context_checkpointing.py
++++ b/deepspeed/compile/passes/long_context_checkpointing.py
+@@ -6,65 +6,65 @@ import torch._functorch.partitioners as _partitioners
+ 
+ logger = logging.getLogger(__name__)
+ 
+-_CUSTOM_SHOULD_BAN = """\
+-def should_ban_recomputation(node):
+-    if node.op != "call_function":
+-        return None
+-    if node.target == operator.getitem:
+-        return None
+-    if node.meta.get("recompute", None) == CheckpointPolicy.MUST_SAVE:
+-        return "autosp: MUST_SAVE policy"
+-    if config.recompute_views and op_types.is_view(node):
+-        return None
+-    if node.target in [aten.lift_fresh_copy.default, aten.lift_fresh.default]:
+-        return None
+-
+-    must_save_set = [
+-        aten.convolution,
+-        aten.convolution_backward,
+-        aten._scaled_dot_product_flash_attention,
+-        aten._scaled_dot_product_efficient_attention,
+-        aten._flash_attention_forward,
+-        aten._efficient_attention_forward,
+-        aten.upsample_bilinear2d,
+-        aten.native_dropout,
+-        aten.rand_like,
+-        aten.randn_like,
+-    ]
+-
+-    if get_aten_target(node) in must_save_set:
+-        return "autosp: attention/stochastic op"
+-
+-    if hasattr(node.target, '__module__') and 'autosp' in str(node.target):
+-        return "autosp: collective op"
+-
+-    def heuristic(node):
+-        if "val" in node.meta:
+-            if isinstance(node.meta["val"], torch.Tensor) and node.meta["val"].dim() >= 2:
+-                return node.meta["val"].shape[1] >= 4096
+-        return False
+-
+-    if min_cut_options.ban_if_not_in_allowlist:
+-        if not op_types.is_recomputable(node):
+-            return None
+-
+-    if min_cut_options.ban_if_materialized_backward and is_materialized_backwards(node):
+-        if heuristic(node):
+-            return None
+-        return "autosp: materialized backward (small tensor)"
+-
+-    if node.dist_from_bw < 1000 and node.dist_from_bw > config.max_dist_from_bw:
+-        return None
+-
+-    if min_cut_options.ban_if_reduction:
+-        input_tensors_size = sum(
+-            _size_of(i) for i in node.args if isinstance(i, fx.Node)
+-        )
+-        output_size = _size_of(node)
+-        if output_size * 4 < input_tensors_size:
+-            return "autosp: reduction op"
+-    return None
+-"""
++_CUSTOM_SHOULD_BAN = (
++    'def should_ban_recomputation(node):\n'
++    '    if node.op != "call_function":\n'
++    '        return None\n'
++    '    if node.target == operator.getitem:\n'
++    '        return None\n'
++    '    if node.meta.get("recompute", None) == CheckpointPolicy.MUST_SAVE:\n'
++    '        return "autosp: MUST_SAVE policy"\n'
++    '    if config.recompute_views and op_types.is_view(node):\n'
++    '        return None\n'
++    '    if node.target in [aten.lift_fresh_copy.default, aten.lift_fresh.default]:\n'
++    '        return None\n'
++    '\n'
++    '    must_save_set = [\n'
++    '        aten.convolution,\n'
++    '        aten.convolution_backward,\n'
++    '        aten._scaled_dot_product_flash_attention,\n'
++    '        aten._scaled_dot_product_efficient_attention,\n'
++    '        aten._flash_attention_forward,\n'
++    '        aten._efficient_attention_forward,\n'
++    '        aten.upsample_bilinear2d,\n'
++    '        aten.native_dropout,\n'
++    '        aten.rand_like,\n'
++    '        aten.randn_like,\n'
++    '    ]\n'
++    '\n'
++    '    if get_aten_target(node) in must_save_set:\n'
++    '        return "autosp: attention/stochastic op"\n'
++    '\n'
++    '    if hasattr(node.target, \'__module__\') and \'autosp\' in str(node.target):\n'
++    '        return "autosp: collective op"\n'
++    '\n'
++    '    def heuristic(node):\n'
++    '        if "val" in node.meta:\n'
++    '            if isinstance(node.meta["val"], torch.Tensor) and node.meta["val"].dim() >= 2:\n'
++    '                return node.meta["val"].shape[1] >= 4096\n'
++    '        return False\n'
++    '\n'
++    '    if min_cut_options.ban_if_not_in_allowlist:\n'
++    '        if not op_types.is_recomputable(node):\n'
++    '            return None\n'
++    '\n'
++    '    if min_cut_options.ban_if_materialized_backward and is_materialized_backwards(node):\n'
++    '        if heuristic(node):\n'
++    '            return None\n'
++    '        return "autosp: materialized backward (small tensor)"\n'
++    '\n'
++    '    if node.dist_from_bw < 1000 and node.dist_from_bw > config.max_dist_from_bw:\n'
++    '        return None\n'
++    '\n'
++    '    if min_cut_options.ban_if_reduction:\n'
++    '        input_tensors_size = sum(\n'
++    '            _size_of(i) for i in node.args if isinstance(i, fx.Node)\n'
++    '        )\n'
++    '        output_size = _size_of(node)\n'
++    '        if output_size * 4 < input_tensors_size:\n'
++    '            return "autosp: reduction op"\n'
++    '    return None\n'
++)
+ 
+ _NEEDLE = '    def should_ban_recomputation('
+ 
+diff --git a/deepspeed/compile/passes/sp_compile.py b/deepspeed/compile/passes/sp_compile.py
+index 1c3cb84f..0b07b22f 100644
+--- a/deepspeed/compile/passes/sp_compile.py
++++ b/deepspeed/compile/passes/sp_compile.py
+@@ -78,7 +78,7 @@ def _collect_sharded_consumers(seed_nodes, sym_seq_dim_node):
+ 
+ 
+ def pass_shard_seq_dim(gm: GraphModule, example_inputs):
+-    sp_size = sp_dp_registry.sp_size()
++    sp_sz = sp_dp_registry.sp_size()
+     input_ids_node = get_input_id_node(gm)
+     val = get_node_shape_meta(input_ids_node)
+     seq_symint = val.shape[1]
+@@ -92,7 +92,7 @@ def pass_shard_seq_dim(gm: GraphModule, example_inputs):
+         return
+ 
+     with gm.graph.inserting_after(sym_seq_dim_node):
+-        sharded_node = gm.graph.call_function(operator.floordiv, args=(sym_seq_dim_node, sp_size))
++        sharded_node = gm.graph.call_function(operator.floordiv, args=(sym_seq_dim_node, sp_sz))
+ 
+     seed_nodes = set()
+     for getter in (get_input_id_node, get_label_id_node, get_position_id_node):
+@@ -144,10 +144,11 @@ def _insert_a2a(gm, node, scatter_idx, gather_idx, name):
+ def pass_insert_attention_all_to_all(gm: GraphModule, real_inputs):
+     attention_nodes = get_sdpa_nodes(gm)
+     if len(attention_nodes) == 0:
+-        raise RuntimeError("AutoSP currently supports torch.nn.functional.scaled_dot_product_attention as the "
+-                           "attention backend. No SDPA attention operations were found in the compiled graph. "
+-                           "Please ensure your model uses torch.nn.functional.scaled_dot_product_attention "
+-                           "for AutoSP to work as expected.")
++        raise RuntimeError(
++            "AutoSP currently supports torch.nn.functional.scaled_dot_product_attention as the "
++            "attention backend. No SDPA attention operations were found in the compiled graph. "
++            "Please ensure your model uses torch.nn.functional.scaled_dot_product_attention "
++            "for AutoSP to work as expected.")
+ 
+     for idx, attn_node in enumerate(attention_nodes):
+         q, k, v = attn_node.args[:3]
+@@ -245,7 +246,7 @@ def pass_propagate_shapes(gm: torch.fx.GraphModule, real_inputs):
+         _restore_sdpa_masks(saved_masks)
+ 
+ 
+-def _validate_sdpa_nodes(gm, sp_size, rank):
++def _validate_sdpa_nodes(gm, sp_sz, rank):
+     sdpa_nodes = get_sdpa_nodes(gm)
+     n_sdpa = len(sdpa_nodes)
+     if n_sdpa == 0:
+@@ -260,10 +261,10 @@ def _validate_sdpa_nodes(gm, sp_size, rank):
+                 meta = node.meta.get("val") or node.meta.get("example_value")
+                 if meta is not None and hasattr(meta, 'shape') and len(meta.shape) >= 2:
+                     n_heads = meta.shape[1]
+-                    if isinstance(n_heads, int) and n_heads % sp_size != 0:
++                    if isinstance(n_heads, int) and n_heads % sp_sz != 0:
+                         raise RuntimeError(
+                             f"[AutoSP] {arg_name} n_heads={n_heads} not divisible "
+-                            f"by sp_size={sp_size}. For GQA models, "
++                            f"by sp_size={sp_sz}. For GQA models, "
+                             f"set sp_size to a divisor of num_kv_heads={n_heads}.")
+     return n_sdpa
+ 
+diff --git a/deepspeed/sequence/autosp_fusion.py b/deepspeed/sequence/autosp_fusion.py
+index 1797f8f8..7b83aa0f 100644
+--- a/deepspeed/sequence/autosp_fusion.py
++++ b/deepspeed/sequence/autosp_fusion.py
+@@ -6,44 +6,48 @@ import deepspeed.comm as dist
+ 
+ _DEFAULT_IMAGE_TOKEN_ID = -200
+ 
++
++def _fused_sp_forward(adapter, visual_features, text_embeds, input_ids):
++    visual_embeds = adapter.projection(visual_features)
++
++    parts = [torch.zeros_like(visual_embeds) for _ in range(adapter.world_size)]
++    dist.all_gather(parts, visual_embeds.contiguous(), group=adapter.process_group)
++    full_visual = torch.cat(parts, dim=1)
++
++    fused = adapter._splice_visual_into_text(text_embeds, full_visual, input_ids)
++
++    total_len = fused.shape[1]
++    pad = (adapter.world_size - total_len % adapter.world_size) % adapter.world_size
++    if pad > 0:
++        fused = F.pad(fused, (0, 0, 0, pad))
++
++    rank = dist.get_rank(adapter.process_group)
++    local_len = fused.shape[1] // adapter.world_size
++    return fused[:, rank * local_len:(rank + 1) * local_len, :].contiguous()
++
++
+ class ModalityFusionSPAdapter(nn.Module):
+ 
+-    def __init__(self, projection: nn.Module, process_group, image_token_id: int = _DEFAULT_IMAGE_TOKEN_ID) -> None:
++    def __init__(self, projection, process_group, image_token_id=_DEFAULT_IMAGE_TOKEN_ID):
+         super().__init__()
+         self.projection = projection
+         self.process_group = process_group
+         self.world_size = dist.get_world_size(process_group)
+         self.image_token_id = image_token_id
+ 
+-    def forward(self, visual_features: torch.Tensor, text_embeds: torch.Tensor,
+-                input_ids: torch.Tensor) -> torch.Tensor:
+-        visual_embeds = self.projection(visual_features)
+-
+-        parts = [torch.zeros_like(visual_embeds) for _ in range(self.world_size)]
+-        dist.all_gather(parts, visual_embeds.contiguous(), group=self.process_group)
+-        full_visual = torch.cat(parts, dim=1)
++    def forward(self, visual_features, text_embeds, input_ids):
++        return _fused_sp_forward(self, visual_features, text_embeds, input_ids)
+ 
+-        fused = self._splice_visual_into_text(text_embeds, full_visual, input_ids)
++    def _splice_visual_into_text(self, text_embeds, visual_embeds, input_ids):
++        raise NotImplementedError(
++            f"{type(self).__name__}._splice_visual_into_text is not implemented. "
++            f"Subclass ModalityFusionSPAdapter and override this method to match "
++            f"your model's prepare_inputs_embeds logic.")
+ 
+-        total_len = fused.shape[1]
+-        pad = (self.world_size - total_len % self.world_size) % self.world_size
+-        if pad > 0:
+-            fused = F.pad(fused, (0, 0, 0, pad))
+-
+-        rank = dist.get_rank(self.process_group)
+-        local_len = fused.shape[1] // self.world_size
+-        return fused[:, rank * local_len:(rank + 1) * local_len, :].contiguous()
+-
+-    def _splice_visual_into_text(self, text_embeds: torch.Tensor, visual_embeds: torch.Tensor,
+-                                 input_ids: torch.Tensor) -> torch.Tensor:
+-        raise NotImplementedError(f"{type(self).__name__}._splice_visual_into_text is not implemented. "
+-                                  "Subclass ModalityFusionSPAdapter and override this method to match "
+-                                  "your model's prepare_inputs_embeds logic.")
+ 
+ class LlavaFusionAdapter(ModalityFusionSPAdapter):
+ 
+-    def _splice_visual_into_text(self, text_embeds: torch.Tensor, visual_embeds: torch.Tensor,
+-                                 input_ids: torch.Tensor) -> torch.Tensor:
++    def _splice_visual_into_text(self, text_embeds, visual_embeds, input_ids):
+         bs, text_len, hidden = text_embeds.shape
+         device = text_embeds.device
+ 
+@@ -77,10 +81,10 @@ class LlavaFusionAdapter(ModalityFusionSPAdapter):
+             out[i, :s.shape[0]] = s
+         return out
+ 
++
+ class InternVLFusionAdapter(ModalityFusionSPAdapter):
+ 
+-    def _splice_visual_into_text(self, text_embeds: torch.Tensor, visual_embeds: torch.Tensor,
+-                                 input_ids: torch.Tensor) -> torch.Tensor:
++    def _splice_visual_into_text(self, text_embeds, visual_embeds, input_ids):
+         out = text_embeds.clone()
+         bs = text_embeds.shape[0]
+ 
+@@ -92,10 +96,11 @@ class InternVLFusionAdapter(ModalityFusionSPAdapter):
+ 
+         return out
+ 
++
+ class Qwen2VLFusionAdapter(nn.Module):
+ 
+-    def __init__(self, projection: nn.Module, process_group, vision_start_token_id: int,
+-                 vision_end_token_id: int) -> None:
++    def __init__(self, projection, process_group, vision_start_token_id,
++                 vision_end_token_id):
+         super().__init__()
+         self.projection = projection
+         self.process_group = process_group
+@@ -103,27 +108,10 @@ class Qwen2VLFusionAdapter(nn.Module):
+         self.vision_start_token_id = vision_start_token_id
+         self.vision_end_token_id = vision_end_token_id
+ 
+-    def forward(self, visual_features: torch.Tensor, text_embeds: torch.Tensor,
+-                input_ids: torch.Tensor) -> torch.Tensor:
+-        visual_embeds = self.projection(visual_features)
+-
+-        parts = [torch.zeros_like(visual_embeds) for _ in range(self.world_size)]
+-        dist.all_gather(parts, visual_embeds.contiguous(), group=self.process_group)
+-        full_visual = torch.cat(parts, dim=1)
+-
+-        fused = self._splice_visual_into_text(text_embeds, full_visual, input_ids)
+-
+-        total_len = fused.shape[1]
+-        pad = (self.world_size - total_len % self.world_size) % self.world_size
+-        if pad > 0:
+-            fused = F.pad(fused, (0, 0, 0, pad))
+-
+-        rank = dist.get_rank(self.process_group)
+-        local_len = fused.shape[1] // self.world_size
+-        return fused[:, rank * local_len:(rank + 1) * local_len, :].contiguous()
++    def forward(self, visual_features, text_embeds, input_ids):
++        return _fused_sp_forward(self, visual_features, text_embeds, input_ids)
+ 
+-    def _splice_visual_into_text(self, text_embeds: torch.Tensor, visual_embeds: torch.Tensor,
+-                                 input_ids: torch.Tensor) -> torch.Tensor:
++    def _splice_visual_into_text(self, text_embeds, visual_embeds, input_ids):
+         out = text_embeds.clone()
+         bs = text_embeds.shape[0]
+ 
+-- 
+2.43.0
+

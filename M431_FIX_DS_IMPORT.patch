@@ -1,0 +1,35 @@
+From 0e6c11da8053cf5763afdfba014e10c55eff0b44 Mon Sep 17 00:00:00 2001
+From: dylanyunlon <dylanyunlong@gmail.com>
+Date: Wed, 20 May 2026 03:49:40 +0000
+Subject: [PATCH] M431: Remove broken DESLOCFusedAdam/DESLOCCPUAdam imports
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+M058 added import lines for DESLOCFusedAdam and DESLOCCPUAdam in
+deepspeed/ops/adam/__init__.py but never implemented the classes
+in fused_adam.py/cpu_adam.py. This caused import deepspeed to fail
+with ImportError, setting _DS_AVAILABLE=False, which made every
+DESLOC run silently fall back to _train_baseline (no cpu_offload,
+no ZeRO, no DeepSpeed engine) — the root cause of all 13B OOMs.
+
+Signed-off-by: dylanyunlon <dylanyunlong@gmail.com>
+---
+ deepspeed/ops/adam/__init__.py | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/deepspeed/ops/adam/__init__.py b/deepspeed/ops/adam/__init__.py
+index 6a5eb4f..4f021f0 100755
+--- a/deepspeed/ops/adam/__init__.py
++++ b/deepspeed/ops/adam/__init__.py
+@@ -7,7 +7,3 @@ from .cpu_adam import DeepSpeedCPUAdam
+ from .fused_adam import FusedAdam
+ from .zenflow_cpu_adam import ZenFlowCPUAdam
+ from .zenflow_torch_adam import ZenFlowSelectiveAdamW, ZenFlowSelectiveAdamW_stage3
+-
+-# M058: DES-LOC optimizers
+-from .fused_adam import DESLOCFusedAdam
+-from .cpu_adam import DESLOCCPUAdam
+-- 
+2.43.0
+
