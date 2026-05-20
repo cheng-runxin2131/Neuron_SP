@@ -2043,11 +2043,16 @@ class Trainer:
         # ZeRO optimization (supports stage 0 and 1 for all methods)
         _zero_stage = getattr(config, 'zero_stage', 0)
         _cpu_offload = getattr(config, 'cpu_offload', False)
-        if _cpu_offload and _zero_stage < 1:
+        n_params = sum(p.numel() for p in self.model.parameters())
+        if _cpu_offload and n_params > 5_000_000_000 and _zero_stage < 2:
+            _zero_stage = 2
+        elif _cpu_offload and _zero_stage < 1:
             _zero_stage = 1
         zero_cfg = {"stage": _zero_stage}
         if _cpu_offload:
             zero_cfg["offload_optimizer"] = {"device": "cpu", "pin_memory": True}
+            if _zero_stage >= 2:
+                zero_cfg["offload_param"] = {"device": "cpu", "pin_memory": True}
         ds_cfg["zero_optimization"] = zero_cfg
 
         # AutoSP: add compile passes
@@ -3026,7 +3031,7 @@ def main():
                         help='Enable AutoSP sequence parallelism (DeepSpeed compile pass)')
     parser.add_argument('--use_ac', action='store_true',
                         help='Enable layer-wise activation checkpointing (torch.utils.checkpoint)')
-    parser.add_argument('--zero_stage', type=int, default=0, choices=[0, 1],
+    parser.add_argument('--zero_stage', type=int, default=0, choices=[0, 1, 2],
                         help='ZeRO stage (0=off, 1=optimizer state partition)')
     parser.add_argument('--cpu_offload', action='store_true',
                         help='Offload optimizer states to CPU (saves ~56GB for 7B)')
