@@ -70,9 +70,9 @@ try:
         get_desloc_profiler,
     )
     _DS_AVAILABLE = True
-except Exception as _ds_import_err:
+except Exception as _ds_err:
     import traceback as _tb
-    print(f"[WARNING] DeepSpeed import failed: {_ds_import_err}")
+    print(f"[WARNING] DeepSpeed import failed: {_ds_err}")
     _tb.print_exc()
     # Standalone stubs — reproduce the exact same math, no deepspeed needed
     def desloc_comm_reduction_ratio(Kx, Ku, Kv, steps):
@@ -2040,11 +2040,10 @@ class Trainer:
             },
             "wall_clock_breakdown": True,
         }
-        # ZeRO optimization (supports stage 0 and 1 for all methods)
         _zero_stage = getattr(config, 'zero_stage', 0)
         _cpu_offload = getattr(config, 'cpu_offload', False)
-        n_params = sum(p.numel() for p in self.model.parameters())
-        if _cpu_offload and n_params > 5_000_000_000 and _zero_stage < 2:
+        _large_model = config.model_size in ('7B', '13B')
+        if _cpu_offload and _large_model and _zero_stage < 2:
             _zero_stage = 2
         elif _cpu_offload and _zero_stage < 1:
             _zero_stage = 1
@@ -2148,8 +2147,6 @@ class Trainer:
                 self._sp_enabled = True
                 if self.rank == 0:
                     print("[SP+DEC] AutoSP compiled with inductor backend")
-                    print(f"[SP+DEC] Sequence parallel active via DeepSpeed compile")
-                    print(f"[SP+DEC] DES-LOC Kx={self.config.Kx} gating on AllReduce")
             except Exception as e:
                 if self.rank == 0:
                     print(f"[SP+DEC] Compile-time AutoSP failed: {e}")
@@ -2158,25 +2155,24 @@ class Trainer:
                 model_cfg = self.config.get_model_config()
                 n_heads = model_cfg['n_head']
                 sp_size = 1
-                for candidate in range(min(self.world_size, n_heads), 0, -1):
-                    if n_heads % candidate == 0 and candidate <= self.world_size:
-                        sp_size = candidate
+                for cand in range(min(self.world_size, n_heads), 0, -1):
+                    if n_heads % cand == 0 and cand <= self.world_size:
+                        sp_size = cand
                         break
                 self._sp_size = sp_size
 
                 if sp_size > 1:
                     try:
-                        local_gpu_name = torch.cuda.get_device_name(self.engine.device)
-                        name_tensor = torch.zeros(256, dtype=torch.uint8, device=self.engine.device)
-                        name_bytes = local_gpu_name.encode('utf-8')[:256]
-                        name_tensor[:len(name_bytes)] = torch.tensor(list(name_bytes), dtype=torch.uint8)
-                        all_names = [torch.zeros(256, dtype=torch.uint8, device=self.engine.device)
-                                     for _ in range(self.world_size)]
-                        dist.all_gather(all_names, name_tensor)
+                        local_gpu = torch.cuda.get_device_name(self.engine.device)
+                        nt = torch.zeros(256, dtype=torch.uint8, device=self.engine.device)
+                        nb = local_gpu.encode('utf-8')[:256]
+                        nt[:len(nb)] = torch.tensor(list(nb), dtype=torch.uint8)
+                        all_nt = [torch.zeros(256, dtype=torch.uint8, device=self.engine.device)
+                                  for _ in range(self.world_size)]
+                        dist.all_gather(all_nt, nt)
                         gpu_names = {}
-                        for r, nt in enumerate(all_names):
-                            raw = bytes(nt.cpu().tolist()).rstrip(b'\x00').decode('utf-8', errors='replace')
-                            gpu_names[r] = raw
+                        for r, t in enumerate(all_nt):
+                            gpu_names[r] = bytes(t.cpu().tolist()).rstrip(b'\x00').decode('utf-8', errors='replace')
 
                         from collections import defaultdict
                         type_groups = defaultdict(list)
@@ -2184,10 +2180,8 @@ class Trainer:
                             type_groups[name].append(r)
 
                         sp_ranks = None
-                        for name, ranks in sorted(type_groups.items(),
-                                                  key=lambda kv: (-len(kv[1]), kv[0])):
-                            usable = min(len(ranks), sp_size)
-                            for s in range(usable, 0, -1):
+                        for name, ranks in sorted(type_groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+                            for s in range(min(len(ranks), sp_size), 0, -1):
                                 if n_heads % s == 0:
                                     sp_ranks = sorted(ranks[:s])
                                     sp_size = s
@@ -2200,33 +2194,25 @@ class Trainer:
                             sp_group = dist.new_group(sp_ranks)
                             self._sp_ranks = sp_ranks
                             self._sp_group = sp_group
-
                             if self.config.max_seq_len % sp_size != 0:
                                 self.config.max_seq_len = ((self.config.max_seq_len + sp_size - 1) // sp_size) * sp_size
-
                             if self.rank in sp_ranks:
                                 _sp_ctx_set(on=True, grp=sp_group, sz=sp_size, rk=sp_ranks.index(self.rank))
                                 self._sp_enabled = True
                             else:
                                 _sp_ctx_set(on=False, grp=None, sz=1, rk=0)
                                 self._sp_enabled = False
-
                             if self.rank == 0:
                                 print(f"[SP+DEC] Eager Ulysses SP: sp_size={sp_size} "
                                       f"ranks={sp_ranks} (GPU: {gpu_names[sp_ranks[0]]})")
-                                print(f"[SP+DEC] DES-LOC Kx={self.config.Kx} gating still active")
                         else:
                             self._sp_enabled = False
-                            if self.rank == 0:
-                                print(f"[SP+DEC] No valid SP group found (n_heads={n_heads} ws={self.world_size})")
                     except Exception as e2:
                         self._sp_enabled = False
                         if self.rank == 0:
-                            print(f"[SP+DEC] Eager fallback also failed: {e2}")
+                            print(f"[SP+DEC] Eager fallback failed: {e2}")
                 else:
                     self._sp_enabled = False
-                    if self.rank == 0:
-                        print(f"[SP+DEC] sp_size=1, no SP possible")
                 _autosp_prepare = None
 
         for step in range(1, self.config.max_steps + 1):

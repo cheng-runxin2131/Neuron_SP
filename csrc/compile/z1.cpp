@@ -81,9 +81,7 @@ public:
             for (const ReduceTask& t : reduce_tasks_.at(scalar_type)) {
                 auto param = param_registry_->getParam(t.getDSId());
                 auto grad_buf = param.getGradBuffer().flatten();
-
                 if (grad_buf.numel() == 0) { continue; }
-
                 int64_t offset = param.getOffset();
                 auto recv_buf = t.getSendBuf().flatten().index(
                     {torch::indexing::Slice(offset, offset + grad_buf.numel())});
@@ -141,11 +139,9 @@ void register_graph_z1_sp(long graph_id,
         ncclUniqueId sp_id;
         int rank = process_group->getRank();
         int sp_group_rank = rank % sp_size;
-
         if (sp_group_rank == 0) {
             ncclGetUniqueId(&sp_id);
         }
-
         auto vec = std::vector<uint8_t>(
             reinterpret_cast<uint8_t*>(&sp_id),
             reinterpret_cast<uint8_t*>(&sp_id) + NCCL_UNIQUE_ID_BYTES);
@@ -156,7 +152,6 @@ void register_graph_z1_sp(long graph_id,
         process_group->broadcast(bcast_input, c10d::BroadcastOptions())->wait();
         std::memcpy(&sp_id, tensor.to(torch::Device(torch::kCPU)).data_ptr(),
                      NCCL_UNIQUE_ID_BYTES);
-
         ncclCommInitRank(&executor->sp_comm_, sp_size, sp_id, sp_group_rank);
     }
 
