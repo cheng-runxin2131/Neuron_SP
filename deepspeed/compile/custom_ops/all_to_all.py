@@ -45,8 +45,11 @@ def _resolve_group():
     if is_loc_enabled():
         from .sp_dp_registry import get_loc_sp_group_ids
         loc_gids = get_loc_sp_group_ids()
-        if loc_gids and gid in loc_gids:
-            grp = get_group(loc_gids[0])
+        if loc_gids:
+            try:
+                grp = get_group(loc_gids[0])
+            except KeyError:
+                pass
     return grp
 
 
