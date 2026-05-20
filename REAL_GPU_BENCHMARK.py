@@ -1722,7 +1722,13 @@ class Trainer:
                 print(f"[BF16] Model converted to bfloat16 on CPU ({n_params/1e6:.0f}M params, "
                       f"saves {n_params * 2 / 1e9:.1f}GB)")
 
-        self.model = self.model.to(self.device)
+        _defer_device = (getattr(config, 'cpu_offload', False)
+                         and config.model_size in ('7B', '13B')
+                         and self.use_deepspeed)
+        if not _defer_device:
+            self.model = self.model.to(self.device)
+        elif self.rank == 0:
+            print(f"[M438] Deferring .to(device) for DeepSpeed placement")
 
         if config.use_activation_checkpointing and self.rank == 0:
             print(f"[AC] Layer-wise activation checkpointing enabled "
@@ -1731,7 +1737,8 @@ class Trainer:
         # RQ5 (Section 5.5): Initialize from DDP checkpoint
         # Charles et al. (2025) protocol: warm-start from 2048-step DDP training
         if config.init_from_ckpt and os.path.isfile(config.init_from_ckpt):
-            ckpt = torch.load(config.init_from_ckpt, map_location=self.device)
+            _map_loc = 'cpu' if _defer_device else self.device
+            ckpt = torch.load(config.init_from_ckpt, map_location=_map_loc)
             if 'model_state_dict' in ckpt:
                 self.model.load_state_dict(ckpt['model_state_dict'])
             else:
@@ -2052,14 +2059,19 @@ class Trainer:
             zero_cfg["offload_optimizer"] = {"device": "cpu", "pin_memory": True}
             if _zero_stage >= 2:
                 zero_cfg["offload_param"] = {"device": "cpu", "pin_memory": True}
+        if _large_model and _zero_stage >= 2:
+            zero_cfg["reduce_bucket_size"] = 50_000_000
+            zero_cfg["allgather_bucket_size"] = 50_000_000
+            zero_cfg["contiguous_gradients"] = True
         ds_cfg["zero_optimization"] = zero_cfg
 
-        # AutoSP: add compile passes
-        if config.use_autosp:
+        if config.use_autosp and _zero_stage < 2:
             ds_cfg["compile"] = {
                 "deepcompile": True,
                 "passes": ["autosp"],
             }
+        elif config.use_autosp and _zero_stage >= 2:
+            config._autosp_eager_fallback = True
         return ds_cfg
 
     def _create_optimizer(self, method: str):
@@ -2124,22 +2136,26 @@ class Trainer:
             return self._train_baseline()
 
     def _train_deepspeed(self) -> Dict:
-        """DeepSpeed training loop — exercises all Claude M257-M332 code.
-
-        AutoSP (M332): When config.use_autosp=True, the engine is compiled with
-        torch.compile(backend='inductor') and inputs are prepared with
-        prepare_autosp_inputs() to mark the sequence dimension for automatic
-        sharding across GPUs. This enables sequence parallelism without manual
-        tensor splitting — the compiler figures out the sharding plan.
-        """
         self.engine.train()
         data_iter = iter(self.dataloader)
         total_tokens = 0
         start_time = time.time()
 
-        # AutoSP: compile engine before training loop (one-time cost)
         _autosp_prepare = None
-        if self.config.use_autosp:
+        _eager_fallback = getattr(self.config, '_autosp_eager_fallback', False)
+        if self.config.use_autosp and _eager_fallback:
+            try:
+                self.engine.compile(backend='inductor')
+                if self.rank == 0:
+                    print("[SP+DEC] Compiled with ZeRO-2 DeepCompile backend "
+                          "(AutoSP A2A skipped)")
+            except Exception as e:
+                if self.rank == 0:
+                    print(f"[SP+DEC] ZeRO-2 DeepCompile failed: {e}, "
+                          "proceeding without compile")
+            raise_eager = True
+        elif self.config.use_autosp:
+            raise_eager = False
             try:
                 from deepspeed.compile.passes.sp_compile import prepare_autosp_inputs
                 self.engine.compile(backend='inductor')
@@ -2151,69 +2167,73 @@ class Trainer:
                 if self.rank == 0:
                     print(f"[SP+DEC] Compile-time AutoSP failed: {e}")
                     print(f"[SP+DEC] Falling back to eager Ulysses SP")
+                raise_eager = True
+        else:
+            raise_eager = False
 
-                model_cfg = self.config.get_model_config()
-                n_heads = model_cfg['n_head']
-                sp_size = 1
-                for cand in range(min(self.world_size, n_heads), 0, -1):
-                    if n_heads % cand == 0 and cand <= self.world_size:
-                        sp_size = cand
-                        break
-                self._sp_size = sp_size
+        if raise_eager and self.config.use_autosp:
+            model_cfg = self.config.get_model_config()
+            n_heads = model_cfg['n_head']
+            sp_size = 1
+            for cand in range(min(self.world_size, n_heads), 0, -1):
+                if n_heads % cand == 0 and cand <= self.world_size:
+                    sp_size = cand
+                    break
+            self._sp_size = sp_size
 
-                if sp_size > 1:
-                    try:
-                        local_gpu = torch.cuda.get_device_name(self.engine.device)
-                        nt = torch.zeros(256, dtype=torch.uint8, device=self.engine.device)
-                        nb = local_gpu.encode('utf-8')[:256]
-                        nt[:len(nb)] = torch.tensor(list(nb), dtype=torch.uint8)
-                        all_nt = [torch.zeros(256, dtype=torch.uint8, device=self.engine.device)
-                                  for _ in range(self.world_size)]
-                        dist.all_gather(all_nt, nt)
-                        gpu_names = {}
-                        for r, t in enumerate(all_nt):
-                            gpu_names[r] = bytes(t.cpu().tolist()).rstrip(b'\x00').decode('utf-8', errors='replace')
+            if sp_size > 1:
+                try:
+                    local_gpu = torch.cuda.get_device_name(self.engine.device)
+                    nt = torch.zeros(256, dtype=torch.uint8, device=self.engine.device)
+                    nb = local_gpu.encode('utf-8')[:256]
+                    nt[:len(nb)] = torch.tensor(list(nb), dtype=torch.uint8)
+                    all_nt = [torch.zeros(256, dtype=torch.uint8, device=self.engine.device)
+                              for _ in range(self.world_size)]
+                    dist.all_gather(all_nt, nt)
+                    gpu_names = {}
+                    for r, t in enumerate(all_nt):
+                        gpu_names[r] = bytes(t.cpu().tolist()).rstrip(b'\x00').decode('utf-8', errors='replace')
 
-                        from collections import defaultdict
-                        type_groups = defaultdict(list)
-                        for r, name in gpu_names.items():
-                            type_groups[name].append(r)
+                    from collections import defaultdict
+                    type_groups = defaultdict(list)
+                    for r, name in gpu_names.items():
+                        type_groups[name].append(r)
 
-                        sp_ranks = None
-                        for name, ranks in sorted(type_groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
-                            for s in range(min(len(ranks), sp_size), 0, -1):
-                                if n_heads % s == 0:
-                                    sp_ranks = sorted(ranks[:s])
-                                    sp_size = s
-                                    break
-                            if sp_ranks:
+                    sp_ranks = None
+                    for name, ranks in sorted(type_groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+                        for s in range(min(len(ranks), sp_size), 0, -1):
+                            if n_heads % s == 0:
+                                sp_ranks = sorted(ranks[:s])
+                                sp_size = s
                                 break
+                        if sp_ranks:
+                            break
 
-                        if sp_ranks and len(sp_ranks) >= 2:
-                            self._sp_size = sp_size
-                            sp_group = dist.new_group(sp_ranks)
-                            self._sp_ranks = sp_ranks
-                            self._sp_group = sp_group
-                            if self.config.max_seq_len % sp_size != 0:
-                                self.config.max_seq_len = ((self.config.max_seq_len + sp_size - 1) // sp_size) * sp_size
-                            if self.rank in sp_ranks:
-                                _sp_ctx_set(on=True, grp=sp_group, sz=sp_size, rk=sp_ranks.index(self.rank))
-                                self._sp_enabled = True
-                            else:
-                                _sp_ctx_set(on=False, grp=None, sz=1, rk=0)
-                                self._sp_enabled = False
-                            if self.rank == 0:
-                                print(f"[SP+DEC] Eager Ulysses SP: sp_size={sp_size} "
-                                      f"ranks={sp_ranks} (GPU: {gpu_names[sp_ranks[0]]})")
+                    if sp_ranks and len(sp_ranks) >= 2:
+                        self._sp_size = sp_size
+                        sp_group = dist.new_group(sp_ranks)
+                        self._sp_ranks = sp_ranks
+                        self._sp_group = sp_group
+                        if self.config.max_seq_len % sp_size != 0:
+                            self.config.max_seq_len = ((self.config.max_seq_len + sp_size - 1) // sp_size) * sp_size
+                        if self.rank in sp_ranks:
+                            _sp_ctx_set(on=True, grp=sp_group, sz=sp_size, rk=sp_ranks.index(self.rank))
+                            self._sp_enabled = True
                         else:
+                            _sp_ctx_set(on=False, grp=None, sz=1, rk=0)
                             self._sp_enabled = False
-                    except Exception as e2:
-                        self._sp_enabled = False
                         if self.rank == 0:
-                            print(f"[SP+DEC] Eager fallback failed: {e2}")
-                else:
+                            print(f"[SP+DEC] Eager Ulysses SP: sp_size={sp_size} "
+                                  f"ranks={sp_ranks} (GPU: {gpu_names[sp_ranks[0]]})")
+                    else:
+                        self._sp_enabled = False
+                except Exception as e2:
                     self._sp_enabled = False
-                _autosp_prepare = None
+                    if self.rank == 0:
+                        print(f"[SP+DEC] Eager fallback failed: {e2}")
+            else:
+                self._sp_enabled = False
+            _autosp_prepare = None
 
         for step in range(1, self.config.max_steps + 1):
             step_start = time.time()

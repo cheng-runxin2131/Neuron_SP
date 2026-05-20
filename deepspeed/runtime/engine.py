@@ -2797,7 +2797,10 @@ class DeepSpeedEngine(Module):
             except ImportError:
                 pass
 
-        if self.is_deepcompile_active() and not self.compile_autosp():
+        if self.is_deepcompile_active() and (
+            not self.compile_autosp()
+            or self._desloc_sp_mode == 'z2_fallback'
+        ):
             return
 
         # Pass (PP) gas boundary flag to optimizer (required for zero)
@@ -5148,7 +5151,13 @@ class DeepSpeedEngine(Module):
 
         if self.compile_autosp():
             resolved_backend = self.get_autosp_backend(compile_kwargs)
-        else:
+        if resolved_backend is None:
+            if self.compile_autosp():
+                self._desloc_sp_mode = 'z2_fallback'
+                logger.info(
+                    "[M438] AutoSP incompatible with ZeRO-2; "
+                    "using DeepCompile ZeRO-2 reduce backend. "
+                    "SP will use eager Ulysses fallback.")
             resolved_backend = self.get_deepcompile_backend(backend, compile_kwargs, schedule)
 
         return resolved_backend, schedule
