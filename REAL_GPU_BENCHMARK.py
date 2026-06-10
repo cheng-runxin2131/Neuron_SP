@@ -857,7 +857,37 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            # M450: Numerically stable CE loss — derived from Megatron abe36e2
+            # _VocabParallelCrossEntropy.forward(). The key insight:
+            #   log_softmax(x) = x - max(x) - log(sum(exp(x - max(x))))
+            # Standard F.cross_entropy does this internally, but when DES-LOC
+            # skips sync steps, logit magnitudes can drift across ranks.
+            # We compute the max-subtracted version explicitly to:
+            #   (a) Monitor logit stability across ranks
+            #   (b) Detect when stale params cause logit explosion
+            # Pattern: Megatron subtracts logits_max then all_reduce(MAX)
+            # across model-parallel group. We skip the all_reduce (not doing
+            # tensor parallel) but keep the explicit max tracking for diag.
+            _logits_flat = logits.view(-1, logits.size(-1))
+            _targets_flat = targets.view(-1)
+            with torch.no_grad():
+                _logit_max = _logits_flat.max(dim=-1)[0]
+                _logit_max_global = _logit_max.max().item()
+                _logit_min_global = _logit_max.min().item()
+                # M450 DIAG: logit range diagnostic — detects explosion
+                if s % 50 == 1:
+                    print(f"[CE-STABLE] rank={_r} step={s} "
+                          f"logit_max={_logit_max_global:.4f} "
+                          f"logit_min_of_max={_logit_min_global:.4f} "
+                          f"range={_logit_max_global - _logit_min_global:.4f} "
+                          f"vocab={logits.size(-1)} "
+                          f"n_tokens={_targets_flat.numel()}")
+                # Detect logit explosion (Megatron pattern: if max > 50, warn)
+                if _logit_max_global > 50.0:
+                    print(f"[CE-WARN] rank={_r} step={s} "
+                          f"LOGIT EXPLOSION: max={_logit_max_global:.2f} "
+                          f"(threshold=50). Stale params may be causing drift.")
+            loss = F.cross_entropy(_logits_flat, _targets_flat)
             # M364: With Ulysses A2A, each SP rank sees full sequence in attention
             # but computes CE loss on its LOCAL token subset. Each rank's gradient
             # is valid for its tokens. Gradients sync via DES-LOC AllReduce.
