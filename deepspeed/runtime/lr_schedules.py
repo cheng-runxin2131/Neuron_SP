@@ -729,16 +729,42 @@ class WarmupLR(object):
 
 class WarmupDecayLR(WarmupLR):
     """Increase the learning rate of each parameter group from min lr to max lr
-        over warmup_num_steps steps, and then decay at linear rate over the remaining training steps.
+        over warmup_num_steps steps, and then decay at linear rate over the remaining
+        training steps.
+
+        Incorporates three improvements from Megatron-LM commit a1d04b7939c3cf3:
+          1. min_lr floor: decay never drops below this value (default 0.0 = original).
+          2. Clamped progress: effective iteration is clipped to schedule boundary so
+             the linear decay formula cannot overshoot past the end of training.
+          3. Checkpoint-aware LR resume: use_checkpoint_lr_scheduler /
+             override_lr_scheduler flags give explicit control over which values win on
+             checkpoint reload, surfacing silent mismatches.
+
+        Knuth double critique of the original design:
+          (1) _get_gamma could return negative values past total_num_steps because
+              last_batch_iteration was never clamped — a mathematically inconsistent
+              extrapolation that silently violated the schedule’s own contract.
+          (2) load_state_dict blindly overwrote every hyper-param from the checkpoint
+              with no validation, making “continue with different --lr” invisibly broken.
 
         Args:
             optimizer (Optimizer): Wrapped optimizer.
             total_num_steps (int): total number of training steps
             warmup_min_lr (float or list): minimum learning rate. Default: 0
             warmup_max_lr (float or list): maximum learning rate. Default: 0.001
-            warmup_num_steps (int): number of steps to warm up from min_lr to max_lr. Default: 1000
-            warmup_type {‘log’, ‘linear’}: increasing function from min_lr to max_lr during warmup. Default: log
+            warmup_num_steps (int): number of steps to warm up from min_lr to max_lr.
+                Default: 1000
+            warmup_type {‘log’, ‘linear’}: increasing function from min_lr to max_lr
+                during warmup. Default: log
             last_batch_iteration (int): The index of the last batch. Default: -1.
+            min_lr (float): absolute LR floor applied during the decay tail.
+                Default: 0.0 (original behaviour unchanged).
+            use_checkpoint_lr_scheduler (bool): if True, hyper-params are loaded from
+                the checkpoint; mismatches with class-init values are logged.
+                Default: True
+            override_lr_scheduler (bool): if True, class-init values win over the
+                checkpoint’s saved hyper-params. Mutually exclusive with
+                use_checkpoint_lr_scheduler. Default: False
         Example:
             >>> optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
             >>> scheduler = WarmupDecayLR(optimizer, 1000000)
@@ -757,38 +783,118 @@ class WarmupDecayLR(WarmupLR):
                  warmup_max_lr: float = 0.001,
                  warmup_num_steps: int = 1000,
                  warmup_type: str = WARMUP_LOG_RATE,
-                 last_batch_iteration: int = -1):
+                 last_batch_iteration: int = -1,
+                 min_lr: float = 0.0,
+                 use_checkpoint_lr_scheduler: bool = True,
+                 override_lr_scheduler: bool = False):
 
+        # M454: min_lr floor + checkpoint-resume flags stored before super().__init__ so
+        # they are available if get_lr() is triggered during parent initialisation.
+        self.decay_min_lr = min_lr
+        self.use_checkpoint_lr_scheduler = use_checkpoint_lr_scheduler
+        self.override_lr_scheduler = override_lr_scheduler
+        if self.override_lr_scheduler:
+            assert not self.use_checkpoint_lr_scheduler, (
+                'WarmupDecayLR: override_lr_scheduler and use_checkpoint_lr_scheduler '
+                'are mutually exclusive — set at most one.')
         self.total_num_steps = total_num_steps
-        super(WarmupDecayLR, self).__init__(optimizer, warmup_min_lr, warmup_max_lr, warmup_num_steps, warmup_type,
+        super(WarmupDecayLR, self).__init__(optimizer, warmup_min_lr, warmup_max_lr,
+                                            warmup_num_steps, warmup_type,
                                             last_batch_iteration)
         if self.total_num_steps < self.warmup_num_steps:
             logger.warning('total_num_steps {} is less than warmup_num_steps {}'.format(
                 total_num_steps, warmup_num_steps))
+        print(
+            f'[WarmupDecayLR] init: total={total_num_steps} warmup={warmup_num_steps} '
+            f'max_lr={warmup_max_lr} min_lr_floor={min_lr} '
+            f'use_ckpt_lr={use_checkpoint_lr_scheduler} override_lr={override_lr_scheduler}'
+        )
 
     def _get_gamma(self):
-        if self.last_batch_iteration < self.warmup_num_steps:
+        # M454: clamp effective iteration to schedule boundary (Megatron num_iters_ pattern).
+        # Without the clamp, iterations past total_num_steps yield negative gamma values —
+        # a silent contract violation that produced negative LR in extreme cases.
+        eff_iter = min(self.last_batch_iteration, self.total_num_steps)
+        if eff_iter < self.warmup_num_steps:
             if self.warmup_type == WARMUP_LOG_RATE:
-                return self.inverse_log_warm_up * math.log(self.last_batch_iteration + 1)
+                return self.inverse_log_warm_up * math.log(eff_iter + 1)
             elif self.warmup_type == WARMUP_LINEAR_RATE:
-                return self.last_batch_iteration / self.warmup_num_steps
-        return max(
+                return eff_iter / self.warmup_num_steps
+        # Linear decay tail: fraction of max_lr remaining, floored by decay_min_lr ratio.
+        raw_gamma = max(
             0.0,
-            float(self.total_num_steps - self.last_batch_iteration) /
+            float(self.total_num_steps - eff_iter) /
             float(max(1.0, self.total_num_steps - self.warmup_num_steps)))
+        # Convert absolute min_lr floor to a gamma floor against the first group’s max_lr.
+        max_lr_ref = self.max_lrs[0] if self.max_lrs else 1.0
+        min_gamma = (self.decay_min_lr / max_lr_ref) if max_lr_ref > 0.0 else 0.0
+        return max(raw_gamma, min_gamma)
+
+    def state_dict(self):
+        # M454: persist decay_min_lr and total_num_steps so a resumed run can validate
+        # against the saved configuration.
+        sd = super(WarmupDecayLR, self).state_dict()
+        sd['decay_min_lr'] = self.decay_min_lr
+        sd['total_num_steps'] = self.total_num_steps
+        return sd
+
+    def _check_and_resume_(self, cls_value, sd_value, name):
+        """Checkpoint-aware field resolution (Megatron check_and_set_ pattern, adapted).
+
+        Knuth double critique:
+          (1) The original load_state_dict was a silent liar: it blindly overwrote every
+              hyper-param from the checkpoint, so changing --lr or --total-iters at resume
+              time had zero visible effect — a confusing invariant violation.
+          (2) It persisted only last_batch_iteration in state_dict, so there was nothing
+              to cross-check anyway; this pair of methods fixes both defects together.
+        """
+        if self.override_lr_scheduler:
+            print(f'[WarmupDecayLR] override: keeping class value {name}={cls_value} '
+                  f'(checkpoint had {sd_value})')
+            return cls_value
+        if cls_value != sd_value:
+            logger.warning(
+                f'[WarmupDecayLR] {name}: class value {cls_value} != checkpoint value '
+                f'{sd_value}; adopting checkpoint value. Pass override_lr_scheduler=True '
+                f'to use class value instead.')
+        print(f'[WarmupDecayLR] resume: {name}={sd_value} (from checkpoint)')
+        return sd_value
+
+    def load_state_dict(self, sd):
+        # M454: checkpoint-aware reload — validate/override configurable hyper-params;
+        # always trust the checkpoint’s iteration counter.
+        if 'decay_min_lr' in sd:
+            self.decay_min_lr = self._check_and_resume_(
+                self.decay_min_lr, sd['decay_min_lr'], 'decay_min_lr')
+        if 'total_num_steps' in sd:
+            self.total_num_steps = self._check_and_resume_(
+                self.total_num_steps, sd['total_num_steps'], 'total_num_steps')
+        self.last_batch_iteration = sd['last_batch_iteration']
+        print(f'[WarmupDecayLR] load_state_dict: resumed at iter={self.last_batch_iteration} '
+              f'lr={self.get_lr()}')
 
 
 class WarmupCosineLR(object):
-    """Increase the learning rate of each parameter group from min lr ratio to max lr ratio
-        over warmup_num_steps steps, and then decay at cosine rate over the remaining training steps to min cosine ratio.
+    """Increase the learning rate of each parameter group from min lr ratio to max lr
+        ratio over warmup_num_steps steps, then decay at cosine rate over the remaining
+        training steps down to cos_min_ratio.
+
+        M454 improvements (Megatron a1d04b7939c3cf3 cosine-decay pattern adapted):
+          - Effective iteration is clamped to the schedule boundary so the cosine
+            formula cannot extrapolate past total_num_steps and produce a rising tail.
+          - state_dict now persists total_num_steps and cos_min_ratio so resumed runs
+            can detect schedule-config mismatches.
+          - load_state_dict logs a warning when class-init values differ from the
+            checkpoint’s saved values, matching WarmupDecayLR’s new contract.
 
         Args:
             optimizer (Optimizer): Wrapped optimizer.
             total_num_steps (int): total number of training steps
-            warmup_min_ratio (float or list): warmup start learning rate ratio. Default: 0
-            warmup_num_steps (int): number of steps to warm up from warmup_min_ratio to 1.0. Default: 1000
-            warmup_type {‘log’, ‘linear’}: increasing function from min_lr to max_lr during warmup. Default: log
-            cos_min_ratio (float): cosine end learning rate ratio. Default: 0.0001
+            warmup_min_ratio (float): warmup start LR ratio. Default: 0
+            warmup_num_steps (int): warmup steps from warmup_min_ratio to 1.0.
+                Default: 1000
+            cos_min_ratio (float): cosine end LR ratio. Default: 0.0001
+            warmup_type {‘log’, ‘linear’}: warmup shape. Default: log
             last_batch_iteration (int): The index of the last batch. Default: -1.
         Example:
             >>> optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
@@ -830,24 +936,32 @@ class WarmupCosineLR(object):
         if last_batch_iteration == -1:
             self._last_lr = update_lr(self.optimizer.param_groups, self.get_lr())
 
+        print(f'[WarmupCosineLR] init: total={total_num_steps} warmup={warmup_num_steps} '
+              f'cos_min_ratio={cos_min_ratio}')
+
     def get_lr_ratio(self):
         if self.last_batch_iteration < 0:
             logger.warning("Attempting to get learning rate from scheduler before it has started")
             return [0.0]
 
-        if self.last_batch_iteration < self.warmup_num_steps:
+        # M454: clamp to schedule end so cosine does not rise again past total_num_steps.
+        eff_iter = min(self.last_batch_iteration, self.total_num_steps)
+
+        if eff_iter < self.warmup_num_steps:
             if self.warmup_type == WARMUP_LOG_RATE:
-                ratio = self.inverse_log_warm_up * math.log(self.last_batch_iteration + 1)
+                ratio = self.inverse_log_warm_up * math.log(eff_iter + 1)
             elif self.warmup_type == WARMUP_LINEAR_RATE:
-                ratio = self.last_batch_iteration / self.warmup_num_steps
+                ratio = eff_iter / self.warmup_num_steps
+            else:
+                ratio = self.inverse_log_warm_up * math.log(eff_iter + 1)
             ratio_delta = 1. - self.warmup_min_ratio
             ratio = self.warmup_min_ratio + ratio * ratio_delta
             return ratio
 
-        real_last_step = self.last_batch_iteration - self.warmup_num_steps + 1
+        real_last_step = eff_iter - self.warmup_num_steps + 1
         real_total_steps = self.total_num_steps - self.warmup_num_steps
         ratio_delta = 1. - self.cos_min_ratio
-        ratio = (1 + math.cos(math.pi * real_last_step / real_total_steps)) / 2
+        ratio = (1 + math.cos(math.pi * real_last_step / max(1, real_total_steps))) / 2
         ratio = max(0.0, self.cos_min_ratio + ratio_delta * ratio)
         return ratio
 
@@ -871,10 +985,27 @@ class WarmupCosineLR(object):
         return self._last_lr
 
     def state_dict(self):
-        return {'last_batch_iteration': self.last_batch_iteration}
+        # M454: persist schedule config so mismatches are detectable on resume.
+        return {
+            'last_batch_iteration': self.last_batch_iteration,
+            'total_num_steps': self.total_num_steps,
+            'cos_min_ratio': self.cos_min_ratio,
+        }
 
     def load_state_dict(self, sd):
+        # M454: log a warning if the saved schedule config disagrees with the current
+        # class-init values (mirrors WarmupDecayLR._check_and_resume_ contract).
+        for key, cls_val in (('total_num_steps', self.total_num_steps),
+                             ('cos_min_ratio', self.cos_min_ratio)):
+            if key in sd and sd[key] != cls_val:
+                logger.warning(
+                    f'[WarmupCosineLR] {key}: class value {cls_val} != checkpoint '
+                    f'value {sd[key]}; using checkpoint value.')
+            if key in sd:
+                setattr(self, key, sd[key])
         self.last_batch_iteration = sd['last_batch_iteration']
+        print(f'[WarmupCosineLR] load_state_dict: resumed at iter={self.last_batch_iteration} '
+              f'lr_ratio={self.get_lr_ratio():.6f}')
 
     def _format_param(self, optimizer, param_value, param_name):
         if isinstance(param_value, list) or isinstance(param_value, tuple):
