@@ -1183,12 +1183,16 @@ class DeslocTieredAllReduce:
     DEFAULT_BUCKET_BYTES = 40_000_000
 
     def __init__(self, scheduler, group=None, bucket_bytes=None,
-                 overlap_comm=True, fp32_reduce=False):
+                 overlap_comm=True, fp32_reduce=False, reduce_scatter=False):
         self.scheduler = scheduler
         self.group = group
         self._bucket_cap = bucket_bytes or self.DEFAULT_BUCKET_BYTES
         self._overlap = overlap_comm
         self._fp32_reduce = fp32_reduce
+        # M476: reduce_scatter mode — instead of AllReduce, perform
+        # ReduceScatter so each rank receives its own gradient shard,
+        # matching Megatron distrib_optimizer's per-rank ownership model.
+        self._reduce_scatter = reduce_scatter
         self._bytes_sent = 0
         self._bytes_skipped = 0
         self._op_count = 0
@@ -1214,6 +1218,13 @@ class DeslocTieredAllReduce:
         self._tier_streams = {'x': None, 'u': None, 'v': None}
         self._diag_enabled = int(os.environ.get('DESLOC_DIAG', '0')) > 0
         self._reduce_call_count = 0
+        # Backward-hook state for async RS + bucket coalescing overlap.
+        # Populated by attach_model_hooks(); cleared each step in
+        # finish_reduces().  Pattern: Megatron DistributedDataParallel
+        # 0203a13f — hooks fire per param, coalesce into buckets, then
+        # dispatch reduce_scatter when the bucket fills.
+        self._hook_handles = []  # retain refs so GC doesn't drop them
+        self._hook_grad_ready = {}  # param → bool
 
     def _get_stream(self):
         """Lazy-init comm stream. Ref: Megatron param_and_grad_buffer.py:577."""
@@ -1234,6 +1245,164 @@ class DeslocTieredAllReduce:
             except Exception:
                 pass
         return self._tier_streams[tier]
+
+    def _get_local_view(self, buf):
+        """Slice the contiguous grad buffer to this rank's owned shard.
+
+        Knuth critique 1 (correctness): buf.numel() must be divisible by
+        dp_world_size.  DeslocGradBucket pads to bucket_cap which is a
+        multiple of world_size; assert guards any future bucket-cap change
+        that forgets to re-pad.
+        Knuth critique 2 (efficiency): integer floor division avoids
+        floating-point round-off on very large buffers (>2^24 elements).
+        20% paraphrase of Megatron Bucket._get_local_view (0203a13f).
+        """
+        import torch.distributed as tdist
+        if not tdist.is_initialized():
+            return buf
+        dp_size = tdist.get_world_size(group=self.group)
+        dp_rank = tdist.get_rank(group=self.group)
+        assert buf.numel() % dp_size == 0, (
+            f"[DeslocTieredAllReduce._get_local_view] buf.numel()={buf.numel()} "
+            f"not divisible by dp_size={dp_size}; bucket padding is required"
+        )
+        shard = buf.numel() // dp_size
+        return buf[dp_rank * shard : (dp_rank + 1) * shard]
+
+    def attach_model_hooks(self, model, tier='x'):
+        """Register per-parameter backward hooks for async RS + coalescing.
+
+        Each hook fires when its parameter's gradient is ready, copies it into
+        the owning DeslocGradBucket, and dispatches RS when the bucket fills.
+        Pattern: Megatron DistributedDataParallel._make_param_hook (0203a13f)
+        — hook fires → mark_grad_ready → start_grad_sync on bucket full.
+
+        Knuth critique 1 (correctness): we retain hook handles in
+        self._hook_handles so autograd doesn't drop them between steps.
+        Knuth critique 2 (efficiency): bucket dispatch is gated on
+        all_ready() to avoid N separate RS calls per bucket.
+        """
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if param not in self._param_map:
+                self.register_param(param, tier=tier)
+            self._hook_grad_ready[param] = False
+
+            def _make_hook(p, _tier):
+                def _hook(grad):
+                    entry = self._param_map.get(p)
+                    if entry is None:
+                        return
+                    bkt, idx = entry
+                    bkt.copy_grad_in(idx)
+                    self._hook_grad_ready[p] = True
+                    if bkt.all_ready() and self._reduce_scatter:
+                        # Bucket full: dispatch async RS now, overlap with
+                        # remaining backward passes. Pattern: Megatron
+                        # 0203a13f Bucket.all_reduce async path.
+                        self._dispatch_rs_bucket(bkt, _tier)
+                    elif bkt.all_ready():
+                        # Fallback: standard async AllReduce coalescing.
+                        self._dispatch_ar_bucket(bkt, _tier)
+                    if self._diag_enabled:
+                        import torch.distributed as tdist
+                        _rank = tdist.get_rank() if tdist.is_initialized() else 0
+                        print(
+                            f"[HOOK-RS] rank={_rank} tier={_tier} param_numel={p.numel()} "
+                            f"bkt_ready={bkt.all_ready()} rs_mode={self._reduce_scatter}",
+                            flush=True,
+                        )
+                return _hook
+
+            h = param.register_hook(_make_hook(param, tier))
+            self._hook_handles.append(h)
+
+        if self._diag_enabled:
+            import torch.distributed as tdist
+            _rank = tdist.get_rank() if tdist.is_initialized() else 0
+            print(
+                f"[HOOK-ATTACH] rank={_rank} tier={tier} "
+                f"params={len(self._hook_handles)} model={type(model).__name__}",
+                flush=True,
+            )
+
+    def _dispatch_rs_bucket(self, bkt, tier):
+        """Async ReduceScatter for a filled bucket.
+
+        Knuth critique 1 (correctness): pre-divide by dp_size before RS so
+        the scattered shard already holds the mean; matches Megatron
+        Bucket.all_reduce which does data /= dp_size before the collective.
+        Knuth critique 2 (efficiency): async_op=True when self._overlap is
+        set; caller must call finish_reduces() before optimizer step.
+        20% paraphrase of Megatron Bucket.all_reduce RS branch (0203a13f).
+        """
+        import torch.distributed as tdist
+        if not tdist.is_initialized():
+            return
+        buf = bkt.data[:bkt._fill]
+        dp_size = tdist.get_world_size(group=self.group)
+        buf.div_(dp_size)
+        local_view = self._get_local_view(buf)
+        tier_stream = self._get_tier_stream(tier) if self._overlap else None
+        nb = buf.numel() * buf.element_size()
+
+        if tier_stream is not None:
+            tier_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(tier_stream):
+                h = tdist._reduce_scatter_base(
+                    local_view, buf, group=self.group, async_op=True
+                )
+        else:
+            h = tdist._reduce_scatter_base(
+                local_view, buf, group=self.group, async_op=self._overlap
+            )
+
+        self._pending.append((h, None, None))
+        self._bytes_sent += nb
+        self._op_count += 1
+        self.scheduler.record_sync(tier)
+        bkt.reset()
+
+        if self._diag_enabled:
+            _rank = tdist.get_rank()
+            print(
+                f"[DISPATCH-RS] rank={_rank} tier={tier} bytes={nb} "
+                f"async={self._overlap} pending={len(self._pending)}",
+                flush=True,
+            )
+
+    def _dispatch_ar_bucket(self, bkt, tier):
+        """Async AllReduce for a filled bucket (non-RS fallback).
+
+        Used when reduce_scatter=False but overlap_comm=True; keeps the hook
+        path consistent regardless of collective type.
+        Knuth critique: same pre-divide / async pattern as _dispatch_rs_bucket
+        so the two code paths stay structurally parallel and easy to audit.
+        """
+        import torch.distributed as tdist
+        if not tdist.is_initialized():
+            return
+        buf = bkt.data[:bkt._fill]
+        tier_stream = self._get_tier_stream(tier) if self._overlap else None
+        nb = buf.numel() * buf.element_size()
+
+        if tier_stream is not None:
+            tier_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(tier_stream):
+                h = tdist.all_reduce(
+                    buf, op=tdist.ReduceOp.AVG, group=self.group, async_op=True
+                )
+        else:
+            h = tdist.all_reduce(
+                buf, op=tdist.ReduceOp.AVG, group=self.group, async_op=self._overlap
+            )
+
+        self._pending.append((h, None, None))
+        self._bytes_sent += nb
+        self._op_count += 1
+        self.scheduler.record_sync(tier)
+        bkt.reset()
 
     def _adapt_bucket_cap(self, tier):
         """Dynamically scale bucket size based on gradient norm trend.
@@ -1336,7 +1505,33 @@ class DeslocTieredAllReduce:
                     self._tier_grad_history[tier] = self._tier_grad_history[tier][-self._adaptive_window:]
 
                 if sync:
-                    if self._fp32_reduce and buf.dtype != torch.float32:
+                    # M476: RS mode — pre-divide then ReduceScatter so each rank
+                    # holds only its owned shard.  Pattern: Megatron Bucket.all_reduce
+                    # RS branch (0203a13f): data /= dp_size then _reduce_scatter_base.
+                    # Knuth critique 1 (correctness): local_view aliasing — _get_local_view
+                    # returns a slice of buf; the RS writes directly into that slice,
+                    # so downstream optimizer reads the right shard without an extra copy.
+                    # Knuth critique 2 (efficiency): fp32_reduce + RS not combined here
+                    # (fp32 upcast + RS would require a separate output buffer); fall back
+                    # to AllReduce for fp32 path to keep the common RS path branchless.
+                    if self._reduce_scatter and not self._fp32_reduce:
+                        dp_size = tdist.get_world_size(group=self.group)
+                        buf.div_(dp_size)
+                        local_view = self._get_local_view(buf)
+                        if tier_stream is not None:
+                            tier_stream.wait_stream(torch.cuda.current_stream())
+                            with torch.cuda.stream(tier_stream):
+                                h = tdist._reduce_scatter_base(
+                                    local_view, buf,
+                                    group=self.group, async_op=True
+                                )
+                        else:
+                            h = tdist._reduce_scatter_base(
+                                local_view, buf,
+                                group=self.group, async_op=self._overlap
+                            )
+                        self._pending.append((h, None, None))
+                    elif self._fp32_reduce and buf.dtype != torch.float32:
                         fp32 = buf.float()
                         if tier_stream is not None:
                             tier_stream.wait_stream(torch.cuda.current_stream())
@@ -1389,7 +1584,11 @@ class DeslocTieredAllReduce:
 
     def finish_reduces(self):
         """Wait for async handles. Ref: Megatron finish_grad_sync pattern.
-        Enhanced: waits per-tier streams before handle completion."""
+        Enhanced: waits per-tier streams before handle completion.
+        M476: also resets hook_grad_ready map for the next step so stale
+        ready-flags don't cause double-dispatch of hook-triggered RS buckets.
+        Knuth critique: clearing _hook_grad_ready here (not in the hook) avoids
+        a TOCTOU race where the hook sees the flag from the previous step."""
         import time as _time
         _t0 = _time.monotonic_ns()
         # Synchronize all per-tier streams first
@@ -1404,12 +1603,19 @@ class DeslocTieredAllReduce:
                 dst.copy_(fp32)
         n_pending = len(self._pending)
         self._pending.clear()
+        # Reset per-param ready flags for next backward pass.
+        for p in self._hook_grad_ready:
+            self._hook_grad_ready[p] = False
         _dt_us = (_time.monotonic_ns() - _t0) / 1000
         if self._diag_enabled and n_pending > 0:
             import torch.distributed as tdist
             _rank = tdist.get_rank() if tdist.is_initialized() else 0
-            print(f"[BUCKET-FINISH] rank={_rank} n_handles={n_pending} "
-                  f"wait_us={_dt_us:.0f}")
+            print(
+                f"[BUCKET-FINISH] rank={_rank} n_handles={n_pending} "
+                f"wait_us={_dt_us:.0f} rs_mode={self._reduce_scatter} "
+                f"hook_params={len(self._hook_grad_ready)}",
+                flush=True,
+            )
 
     def write_grads_back(self):
         for tier in ('x', 'u', 'v'):
@@ -1530,12 +1736,19 @@ class DeslocProfiler:
         self._comm_data = sd.get('comms', [])
 
 
-def init_desloc_scheduler(Kx=1, Ku=3, Kv=6, warmup_steps=512, group=None):
-    """Initialize global DES-LOC scheduler. Called from engine.desloc_init_scheduler()."""
+def init_desloc_scheduler(Kx=1, Ku=3, Kv=6, warmup_steps=512, group=None,
+                          reduce_scatter=False):
+    """Initialize global DES-LOC scheduler. Called from engine.desloc_init_scheduler().
+    M476: reduce_scatter flag wired through to DeslocTieredAllReduce so the
+    distrib-optimizer path (use_distributed_optimizer=True) can enable RS-overlap
+    without monkey-patching the tiered-AR instance after construction.
+    """
     global _desloc_scheduler_instance, _desloc_tiered_ar_instance, _desloc_profiler_instance
     _desloc_scheduler_instance = DeslocScheduler(Kx=Kx, Ku=Ku, Kv=Kv,
                                                   warmup_steps=warmup_steps, group=group)
-    _desloc_tiered_ar_instance = DeslocTieredAllReduce(_desloc_scheduler_instance, group=group)
+    _desloc_tiered_ar_instance = DeslocTieredAllReduce(
+        _desloc_scheduler_instance, group=group, reduce_scatter=reduce_scatter
+    )
     _desloc_profiler_instance = DeslocProfiler()
 
 
