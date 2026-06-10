@@ -27,9 +27,143 @@ SOFTWARE.
 
 """
 
+import logging
+from typing import Optional
+
 import torch
 import deepspeed.comm as dist  # replace torch's distributed package with deepspeed.comm to resolve deepspeed check
 from deepspeed.runtime import compiler
+
+logger = logging.getLogger(__name__)
+
+# ───────────────────────────────────────────────────────────────
+# M473: QKV split helpers ported from Megatron 947d6ae1
+# (Fix Muon QKV split for gated attention #4728)
+# ───────────────────────────────────────────────────────────────
+
+
+def _get_qkv_split_shapes(model_cfg) -> list[int]:
+    """Compute QKV projection split dimensions from model config.
+
+    For standard GQA: [Q, K, V] where Q = heads/groups * kv_channels.
+    For gated attention (attention_output_gate=True): [Q, Q_gate, K, V]
+    — the gate projection mirrors Q in width, so both halves receive a
+    separate Muon orthogonalisation pass rather than being lumped together.
+
+    Knuth critique #1: the original flat [Q,K,V] tuple silently produced
+    wrong gradient slabs when gate projections doubled row-count; this
+    explicit branch makes the contract observable at construction time.
+    """
+    query_projection_size = (
+        model_cfg.num_attention_heads // model_cfg.num_query_groups * model_cfg.kv_channels
+    )
+    if getattr(model_cfg, 'attention_output_gate', False):
+        # gated attention: Q and its gate share the same column count
+        print(
+            f"[M473 _get_qkv_split_shapes] gated attention detected: "
+            f"split=[Q={query_projection_size}, gate={query_projection_size}, "
+            f"K={model_cfg.kv_channels}, V={model_cfg.kv_channels}]"
+        )
+        return [
+            query_projection_size,
+            query_projection_size,
+            model_cfg.kv_channels,
+            model_cfg.kv_channels,
+        ]
+    print(
+        f"[M473 _get_qkv_split_shapes] standard GQA split: "
+        f"[Q={query_projection_size}, K={model_cfg.kv_channels}, V={model_cfg.kv_channels}]"
+    )
+    return [query_projection_size, model_cfg.kv_channels, model_cfg.kv_channels]
+
+
+def _tag_param_qkv(param: torch.nn.Parameter,
+                   name: str,
+                   model_cfg,
+                   _cache: dict) -> None:
+    """Attach is_qkv + qkv_split_shapes to a QKV weight parameter.
+
+    Called once per named_parameters() traversal. Uses a one-element
+    dict cache so _get_qkv_split_shapes() is computed at most once per
+    model chunk (Megatron's pattern; avoids redundant config reads).
+
+    Knuth critique #2: tagging inside the loop with no memoisation meant
+    _get_qkv_split_shapes() ran O(n_layers) times — cheap but misleading;
+    caching makes the once-per-chunk intent explicit.
+    """
+    if 'is_qkv' not in _cache:
+        _cache['is_qkv'] = None  # will be populated below
+
+    # Only 2-D weight tensors are candidates
+    if len(param.shape) != 2:
+        return
+
+    if _cache['is_qkv'] is None:
+        _cache['is_qkv'] = _get_qkv_split_shapes(model_cfg)
+    qkv_split_shapes: list[int] = _cache['is_qkv']
+
+    qkv_split_dim = sum(qkv_split_shapes)
+    if param.shape[0] % qkv_split_dim == 0:
+        param.is_qkv = True
+        param.qkv_split_shapes = qkv_split_shapes
+        print(
+            f"[M473 _tag_param_qkv] tagged {name}: "
+            f"shape={tuple(param.shape)}, split_shapes={qkv_split_shapes}"
+        )
+    else:
+        logger.debug(
+            "[M473 _tag_param_qkv] QKV split skipped for %s: "
+            "shape=%s, split_shapes=%s — row count not divisible by split dim %d",
+            name, tuple(param.shape), qkv_split_shapes, qkv_split_dim,
+        )
+
+
+def _apply_qkv_split_grad(
+    grad: torch.Tensor,
+    param: torch.nn.Parameter,
+    optimizer_qkv_split_shapes: Optional[list[int]],
+) -> list[torch.Tensor]:
+    """Split a QKV gradient tensor into per-projection slabs.
+
+    Resolution order for split config:
+      1. Per-param attribute  (set by _tag_param_qkv / Megatron tagger)
+      2. Optimizer-level default (qkv_split_shapes constructor arg)
+      3. RuntimeError — split was requested but shapes are nowhere to be found
+
+    Returns a list of 2-D tensors, one per projection head group,
+    each shaped (group_rows, hidden_dim).
+    """
+    qkv_split_shapes: Optional[list[int]] = getattr(param, 'qkv_split_shapes', None)
+    if qkv_split_shapes is None:
+        qkv_split_shapes = optimizer_qkv_split_shapes
+    if qkv_split_shapes is None:
+        raise RuntimeError(
+            "Muon QKV split requested but qkv_split_shapes is not set "
+            "(neither on param nor on optimizer). "
+            "Pass qkv_split_shapes to the optimizer constructor or tag "
+            "parameters with _tag_param_qkv()."
+        )
+
+    grad_shape = grad.shape
+    qkv_split_dim = sum(qkv_split_shapes)
+    if grad_shape[0] % qkv_split_dim != 0:
+        raise RuntimeError(
+            f"[M473] Muon QKV split shape mismatch: "
+            f"grad_shape={tuple(grad_shape)}, split_shapes={qkv_split_shapes}, "
+            f"split_dim={qkv_split_dim} — first dim not divisible"
+        )
+
+    num_query_groups = grad_shape[0] // qkv_split_dim
+    print(
+        f"[M473 _apply_qkv_split_grad] grad_shape={tuple(grad_shape)}, "
+        f"split_shapes={qkv_split_shapes}, num_query_groups={num_query_groups}"
+    )
+    qkv_grads = torch.split(
+        grad.view(num_query_groups, qkv_split_dim, -1),
+        qkv_split_shapes,
+        dim=1,
+    )
+    return [g.reshape(-1, grad_shape[-1]) for g in qkv_grads]
 
 
 @compiler.compile()
@@ -73,6 +207,73 @@ def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
     return update
 
 
+def muon_update_with_qkv_split(
+    grad: torch.Tensor,
+    momentum: torch.Tensor,
+    param: torch.nn.Parameter,
+    optimizer_qkv_split_shapes: Optional[list[int]],
+    beta: float = 0.95,
+    ns_steps: int = 5,
+    nesterov: bool = True,
+) -> torch.Tensor:
+    """Muon update that orthogonalises each QKV projection slab independently.
+
+    M473: When a parameter carries is_qkv=True, naive orthogonalisation of
+    the full [Q||K||V] matrix (or [Q||Q_gate||K||V] for gated attention)
+    treats projections from different semantic roles as a single entity.
+    Splitting first and merging after ensures each head group gradient is
+    orthogonalised in isolation.
+
+    For non-QKV params this is identical to muon_update().
+
+    Knuth critique #1: silent wrong-split was the original bug — we make the
+    shape contract observable at the call site via RuntimeError.
+    Knuth critique #2: memoised qkv_split_shapes avoids recomputing across
+    steps; resolution order: per-param attr > optimizer default > error.
+    """
+    is_qkv = getattr(param, "is_qkv", False)
+
+    if not is_qkv:
+        return muon_update(grad, momentum, beta=beta, ns_steps=ns_steps, nesterov=nesterov)
+
+    # ── QKV path ────────────────────────────────────────────────
+    grad_shape = grad.shape
+    qkv_grads = _apply_qkv_split_grad(grad, param, optimizer_qkv_split_shapes)
+
+    qkv_split_shapes: list[int] = (
+        getattr(param, "qkv_split_shapes", None) or optimizer_qkv_split_shapes
+    )
+    num_query_groups = grad_shape[0] // sum(qkv_split_shapes)
+    mom_slabs = _apply_qkv_split_grad(momentum.data.clone(), param, optimizer_qkv_split_shapes)
+
+    updated_slabs: list[torch.Tensor] = []
+    updated_mom_slabs: list[torch.Tensor] = []
+    for g_slab, m_slab in zip(qkv_grads, mom_slabs):
+        m_slab.lerp_(g_slab, 1 - beta)
+        u = g_slab.lerp_(m_slab, beta) if nesterov else m_slab.clone()
+        u = zeropower_via_newtonschulz5(u, steps=ns_steps)
+        u = u * max(1, g_slab.size(-2) / g_slab.size(-1)) ** 0.5
+        updated_slabs.append(u)
+        updated_mom_slabs.append(m_slab)
+
+    # Reconstruct full-row update
+    update = torch.cat(updated_slabs, dim=0)
+
+    # Write updated momentum back into the flat buffer in-place
+    mom_chunks = [
+        s.reshape(num_query_groups, sz, -1)
+        for s, sz in zip(updated_mom_slabs, qkv_split_shapes)
+    ]
+    momentum.data.copy_(torch.cat(mom_chunks, dim=1).reshape(grad_shape))
+
+    print(
+        f"[M473 muon_update_with_qkv_split] "
+        f"grad_shape={tuple(grad_shape)}, update_shape={tuple(update.shape)}, "
+        f"n_slabs={len(updated_slabs)}, split_shapes={qkv_split_shapes}"
+    )
+    return update
+
+
 class Muon(torch.optim.Optimizer):
     """
     Muon - MomentUm Orthogonalized by Newton-schulz
@@ -95,11 +296,23 @@ class Muon(torch.optim.Optimizer):
         momentum: The momentum. A value of 0.95 here is usually fine.
     """
 
-    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95):
+    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95,
+                 split_qkv: bool = False,
+                 qkv_split_shapes: Optional[list[int]] = None):
+        """M473: split_qkv enables per-projection orthogonalisation for QKV
+        weight matrices. qkv_split_shapes is the optimizer-level fallback;
+        per-param qkv_split_shapes (set by _tag_param_qkv) takes precedence."""
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
         params = sorted(params, key=lambda x: x.size(), reverse=True)
         super().__init__(params, defaults)
+        self.split_qkv = split_qkv
+        self.qkv_split_shapes = qkv_split_shapes
+        if split_qkv:
+            print(
+                f"[M473 Muon.__init__] split_qkv=True, "
+                f"optimizer-level qkv_split_shapes={qkv_split_shapes}"
+            )
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -122,7 +335,14 @@ class Muon(torch.optim.Optimizer):
                     state = self.state[p]
                     if len(state) == 0:
                         state["momentum_buffer"] = torch.zeros_like(p)
-                    update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
+                    # M473: use QKV-aware update when split_qkv requested
+                    if self.split_qkv and getattr(p, "is_qkv", False):
+                        update = muon_update_with_qkv_split(
+                            p.grad, state["momentum_buffer"], p,
+                            self.qkv_split_shapes, beta=group["momentum"],
+                        )
+                    else:
+                        update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update.reshape(p.shape), alpha=-group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + dist.get_world_size()],
@@ -136,9 +356,14 @@ class SingleDeviceMuon(torch.optim.Optimizer):
     Muon variant for usage in non-distributed settings.
     """
 
-    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95):
+    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95,
+                 split_qkv: bool = False,
+                 qkv_split_shapes: Optional[list[int]] = None):
+        """M473: single-device Muon with optional QKV split support."""
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
         super().__init__(params, defaults)
+        self.split_qkv = split_qkv
+        self.qkv_split_shapes = qkv_split_shapes
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -156,7 +381,14 @@ class SingleDeviceMuon(torch.optim.Optimizer):
                 state = self.state[p]
                 if len(state) == 0:
                     state["momentum_buffer"] = torch.zeros_like(p)
-                update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
+                # M473: QKV-aware update path
+                if self.split_qkv and getattr(p, "is_qkv", False):
+                    update = muon_update_with_qkv_split(
+                        p.grad, state["momentum_buffer"], p,
+                        self.qkv_split_shapes, beta=group["momentum"],
+                    )
+                else:
+                    update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
                 p.mul_(1 - group["lr"] * group["weight_decay"])
                 p.add_(update.reshape(p.shape), alpha=-group["lr"])
 
@@ -217,6 +449,24 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
                 group["weight_decay"] = group.get("weight_decay", 0)
                 assert set(group.keys()) == set(["params", "lr", "betas", "eps", "weight_decay", "use_muon"])
         super().__init__(param_groups, dict())
+        # M473: optimizer-level fallback for QKV split shapes
+        self.split_qkv: bool = False
+        self.qkv_split_shapes: Optional[list[int]] = None
+
+    def configure_qkv_split(self, split_qkv: bool,
+                             qkv_split_shapes: Optional[list[int]] = None) -> None:
+        """M473: opt-in to per-projection QKV orthogonalisation.
+
+        Call after construction with split_qkv=True and the appropriate
+        split_shapes (or rely on per-param is_qkv / qkv_split_shapes attrs
+        set by _tag_param_qkv).
+        """
+        self.split_qkv = split_qkv
+        self.qkv_split_shapes = qkv_split_shapes
+        print(
+            f"[M473 MuonWithAuxAdam.configure_qkv_split] "
+            f"split_qkv={split_qkv}, qkv_split_shapes={qkv_split_shapes}"
+        )
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -240,7 +490,14 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
                         state = self.state[p]
                         if len(state) == 0:
                             state["momentum_buffer"] = torch.zeros_like(p)
-                        update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
+                        # M473: QKV-aware update path
+                        if self.split_qkv and getattr(p, "is_qkv", False):
+                            update = muon_update_with_qkv_split(
+                                p.grad, state["momentum_buffer"], p,
+                                self.qkv_split_shapes, beta=group["momentum"],
+                            )
+                        else:
+                            update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
                         p.mul_(1 - group["lr"] * group["weight_decay"])
                         p.add_(update.reshape(p.shape), alpha=-group["lr"])
                     dist.all_gather(params_pad[base_i:base_i + dist.get_world_size()],
@@ -304,7 +561,16 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                     state = self.state[p]
                     if len(state) == 0:
                         state["momentum_buffer"] = torch.zeros_like(p)
-                    update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
+                    # M473: QKV-aware update for single-device aux-adam variant
+                    split_qkv = getattr(self, "split_qkv", False)
+                    qkv_split_shapes = getattr(self, "qkv_split_shapes", None)
+                    if split_qkv and getattr(p, "is_qkv", False):
+                        update = muon_update_with_qkv_split(
+                            p.grad, state["momentum_buffer"], p,
+                            qkv_split_shapes, beta=group["momentum"],
+                        )
+                    else:
+                        update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update.reshape(p.shape), alpha=-group["lr"])
             else:
@@ -345,8 +611,12 @@ class DESLOCMuon(Muon):
     """
 
     def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95,
-                 desloc_Kx=1, desloc_Ku=1, desloc_clip_radius=1.0):
-        super().__init__(params, lr=lr, weight_decay=weight_decay, momentum=momentum)
+                 desloc_Kx=1, desloc_Ku=1, desloc_clip_radius=1.0,
+                 split_qkv: bool = False,
+                 qkv_split_shapes=None):
+        # M473: forward QKV split config to base Muon
+        super().__init__(params, lr=lr, weight_decay=weight_decay, momentum=momentum,
+                         split_qkv=split_qkv, qkv_split_shapes=qkv_split_shapes)
         self._desloc_Kx = desloc_Kx
         self._desloc_Ku = desloc_Ku
         self._desloc_clip_radius = desloc_clip_radius
@@ -390,8 +660,15 @@ class DESLOCMuon(Muon):
                     state = self.state[p]
                     if len(state) == 0:
                         state["momentum_buffer"] = torch.zeros_like(p)
-                    update = muon_update(p.grad, state["momentum_buffer"],
-                                         beta=group["momentum"])
+                    # M473: use QKV-aware update when split_qkv is active
+                    if self.split_qkv and getattr(p, "is_qkv", False):
+                        update = muon_update_with_qkv_split(
+                            p.grad, state["momentum_buffer"], p,
+                            self.qkv_split_shapes, beta=group["momentum"],
+                        )
+                    else:
+                        update = muon_update(p.grad, state["momentum_buffer"],
+                                             beta=group["momentum"])
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update.reshape(p.shape), alpha=-group["lr"])
 
@@ -476,8 +753,15 @@ class DESLOCMuonWithAuxAdam(MuonWithAuxAdam):
                         state = self.state[p]
                         if len(state) == 0:
                             state["momentum_buffer"] = torch.zeros_like(p)
-                        update = muon_update(p.grad, state["momentum_buffer"],
-                                             beta=group["momentum"])
+                        # M473: QKV-aware update path for DESLOC+AuxAdam
+                        if self.split_qkv and getattr(p, "is_qkv", False):
+                            update = muon_update_with_qkv_split(
+                                p.grad, state["momentum_buffer"], p,
+                                self.qkv_split_shapes, beta=group["momentum"],
+                            )
+                        else:
+                            update = muon_update(p.grad, state["momentum_buffer"],
+                                                 beta=group["momentum"])
                         p.mul_(1 - group["lr"] * group["weight_decay"])
                         p.add_(update.reshape(p.shape), alpha=-group["lr"])
 
