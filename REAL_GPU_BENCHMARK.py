@@ -1115,10 +1115,12 @@ class DESLOCAdamW(torch.optim.Optimizer):
         self._prev_avg = {}  # {param_id: previous averaged params for Nesterov}
         # Activation norm monitoring (Section 5.5: prevent exploding norms)
         self._activation_norms = []
-        # M448: Overflow-Aware Scaling (OAS) — derived from Megatron fb4cbdc
+        # M448/M451: Overflow-Aware Scaling (OAS) — derived from Megatron fb4cbdc
         # DynamicLossScaler. Instead of a separate LossScaler class, we inline
         # the three core mechanisms directly into the optimizer:
-        #   1. Overflow detection: scan param grads for inf/nan each step
+        #   1. Pre-step grad scan: _scan_grads_for_overflow() — M451 addition.
+        #      Aborts the entire step on any inf/nan in gradients (Megatron
+        #      DynamicLossScaler.has_overflow pattern, commit fb4cbdc277a0).
         #   2. Hysteresis downscale: require N consecutive overflows before halving
         #   3. Window upscale: after W clean steps, double the scale
         # This avoids the Megatron pattern of wrapping the optimizer in another
@@ -1139,7 +1141,70 @@ class DESLOCAdamW(torch.optim.Optimizer):
         """Current loss scale for training loop. Megatron exposes this via
         FP16_Optimizer.loss_scale; we expose it as a read-only property."""
         return self._oas_scale if self._oas_enabled else 1.0
-    
+
+    @staticmethod
+    def _grad_has_inf_or_nan(tensor: torch.Tensor) -> bool:
+        """M451: Gradient overflow probe — derived from Megatron fb4cbdc
+        DynamicLossScaler._has_inf_or_nan (commit fb4cbdc277a0).
+
+        Megatron's original used float(x.float().sum()) and caught RuntimeError
+        for overflow-converted values — a scalar-path that can silently miss
+        sparse inf patterns when cancellation occurs.  We use torch.isfinite()
+        instead: it performs an element-wise boolean mask and reduces with .all(),
+        catching every inf/nan regardless of sum cancellation.  The float() cast
+        is retained to handle fp16 tensors without mixed-precision overflow.
+
+        Knuth critique (TAOCP Vol.2 §4.2.2 — floating-point error accumulation):
+          USER BUG:  Callers who skip this check and apply the raw gradient to
+                     Adam's m/v states corrupt the EMA statistics permanently.
+                     A single inf in exp_avg_sq sets every future denom to inf,
+                     silencing all parameter updates for the lifetime of training
+                     — a subtle, silent catastrophe that no loss curve will reveal
+                     until the model has diverged beyond recovery.
+          SYSTEM IMPACT: Without a pre-step guard the scale doubling window
+                         (scale_window=200) will keep escalating loss_scale while
+                         corrupt states accumulate, burning GPU cycles on updates
+                         that produce NaN outputs, then requiring a full
+                         checkpoint rollback — wasting hours of cluster time.
+        """
+        try:
+            return not torch.isfinite(tensor.float()).all().item()
+        except RuntimeError as exc:
+            # Megatron pattern: RuntimeError may signal overflow in tensor
+            # conversion itself (e.g. fp16 -> float saturating at ±65504).
+            # Re-raise non-overflow errors; treat conversion failure as overflow.
+            if "value cannot be converted" not in str(exc):
+                raise
+            return True
+
+    def _scan_grads_for_overflow(self) -> bool:
+        """M451: Pre-step gradient overflow scan — mirrors Megatron
+        DynamicLossScaler.has_overflow(params).  Iterates all param groups
+        and returns True on the first inf/nan found in any .grad tensor.
+
+        Returns False immediately (no scan) when _oas_enabled is False,
+        allowing bf16-only runs to skip the overhead entirely.
+
+        Knuth critique (TAOCP Vol.2 §4.2.3 — error propagation):
+          USER BUG:  A training loop that calls optimizer.step() without
+                     checking the return value of this method will silently
+                     ingest corrupt gradients.  The loop MUST call this
+                     before step() and skip the backward pass on True.
+          SYSTEM IMPACT: Each unchecked overflow that slips through doubles
+                         the likelihood of a subsequent overflow because inf
+                         values propagate through the computation graph into
+                         activations, poisoning future batch gradients and
+                         creating a cascade that no hysteresis counter can
+                         arrest once it starts.
+        """
+        if not self._oas_enabled:
+            return False
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is not None and DESLOCAdamW._grad_has_inf_or_nan(p.grad.data):
+                    return True
+        return False
+
     def step(self):
         self.global_step += 1
         
@@ -1170,6 +1235,46 @@ class DESLOCAdamW(torch.optim.Optimizer):
             else:
                 self._use_offload = False
         
+
+        # M451: Pre-step gradient overflow guard — Megatron fb4cbdc
+        # DynamicLossScaler.has_overflow pattern.  Scan ALL gradients before
+        # touching any optimizer state.  On overflow: adjust scale, skip this
+        # entire step (return early), let the training loop re-zero and retry.
+        # This is the critical missing piece from M448 which only checked params
+        # *after* the update — too late to prevent state corruption.
+        if self._oas_enabled:
+            _r = dist.get_rank() if dist.is_initialized() else 0
+            _pre_overflow = self._scan_grads_for_overflow()
+            if _pre_overflow:
+                self._oas_overflow_cnt += 1
+                self._oas_pending_ovf += 1
+                self._oas_clean_steps = 0
+                if self._oas_pending_ovf >= self._oas_hysteresis:
+                    _old = self._oas_scale
+                    self._oas_scale = max(self._oas_min_scale,
+                                         self._oas_scale / 2.0)
+                    self._oas_pending_ovf = 0
+                    self._oas_last_action = 'halve_grad'
+                    print(f"[OAS/GRAD-OVERFLOW] rank={_r} step={self.global_step} "
+                          f"inf/nan in grad — SKIPPING STEP, "
+                          f"SCALE {_old:.0f} -> {self._oas_scale:.0f} "
+                          f"(ovf_total={self._oas_overflow_cnt} "
+                          f"hysteresis={self._oas_hysteresis})")
+                else:
+                    self._oas_last_action = 'pending_grad'
+                    print(f"[OAS/GRAD-OVERFLOW] rank={_r} step={self.global_step} "
+                          f"inf/nan in grad — SKIPPING STEP (PENDING "
+                          f"{self._oas_pending_ovf}/{self._oas_hysteresis}) "
+                          f"scale={self._oas_scale:.0f} "
+                          f"ovf_total={self._oas_overflow_cnt}")
+                # Zero all gradients before returning — stale inf grads must
+                # not survive into the next backward pass.
+                for _grp in self.param_groups:
+                    for _p in _grp['params']:
+                        if _p.grad is not None:
+                            _p.grad = None
+                return  # abort this step entirely
+
         for group in self.param_groups:
             for p in group['params']:
                 if p.grad is None:
@@ -1256,8 +1361,12 @@ class DESLOCAdamW(torch.optim.Optimizer):
                   f"||p||={math.sqrt(total_p_norm_sq):.4f} "
                   f"offload={self._use_offload}")
 
-        # M448: Overflow-Aware Scaling (OAS) — post-step check
+        # M448/M451: Post-step parameter overflow guard (secondary layer).
         # Derived from Megatron DynamicLossScaler._has_inf_or_nan + update_scale.
+        # M451 adds a pre-step GRAD scan (_scan_grads_for_overflow) that fires
+        # before any state mutation; this block is the second safety net that
+        # catches overflows arising *inside* the Adam update itself (e.g.
+        # catastrophic cancellation in denom, weight-decay explosion).
         # Scans all param data for inf/nan after update. If detected:
         #   - Increment hysteresis counter
         #   - If hysteresis threshold hit: halve scale, reset counter
