@@ -528,6 +528,20 @@ class TrainingConfig:
     replacement_sampling: bool = False   # enable with-replacement RandomSampler (Megatron 66719e9)
     presplit_sentences: bool = False     # data pre-split into newline-separated sentences
 
+    # M457: Megatron 872b4a6 — multi-EOS edge case fix
+    # A sequence may contain multiple EOS/EOD tokens when documents are packed.
+    # Knuth §2.3.1: a singly-linked scan terminates at the *first* sentinel;
+    #   iterating over ALL EOD indices is O(k) not O(1) — acceptable because k≪seq_len.
+    # Knuth §3.2.2 critique: injecting EOS at a fixed stride creates a perfectly
+    #   periodic distribution; real corpora have Poisson-distributed document lengths,
+    #   so the synthetic injection is a controlled approximation, not a faithful model.
+    # eod_token_id: token ID used as end-of-document marker (vocab_size-1 by convention)
+    # eod_mask_loss: zero out loss on EOS positions (don't reward predicting EOS itself)
+    # reset_position_ids: restart position counter after each EOS (multi-doc packing)
+    eod_token_id: int = -1               # -1 → auto-set to vocab_size-1 at dataset init
+    eod_mask_loss: bool = True           # mask loss on EOD tokens (Megatron 872b4a6)
+    reset_position_ids: bool = True      # reset pos-ids after each EOD (multi-doc packing)
+
     # Logging
     log_interval: int = 10
     eval_interval: int = 100
@@ -1085,6 +1099,79 @@ def _make_dataloader_m452(dataset, config: 'TrainingConfig',
 # SYNTHETIC DATASET (For benchmarking - real data optional)
 # =============================================================================
 
+def _m457_ltor_masks_and_position_ids(
+    data: torch.Tensor,
+    eod_token: int,
+    eod_mask_loss: bool,
+    reset_position_ids: bool,
+) -> tuple:
+    """Build loss mask and position IDs for left-to-right model.
+
+    M457 / Megatron 872b4a6 — 'Fixed edge case with multiple end of sequence
+    in one sequence'.  The original single-EOS path assumed at most one EOD
+    per sequence; packed-document training can place k≥1 EOD tokens anywhere.
+
+    Knuth §2.3.1 critique: the prior code used a scalar sentinel scan that
+    silently stopped at the first EOD, leaving subsequent documents with
+    uncorrected position offsets.  This O(k) loop over ALL EOD positions is
+    the correct fix — k is small (avg doc length ≪ seq_len) so the overhead
+    is negligible in practice.
+
+    Knuth §3.6 critique: resetting position_ids to 0 after each EOD implicitly
+    treats each sub-document as independent, which is correct for causal LMs
+    but breaks rotary embeddings that cache sin/cos at initialisation time.
+    Callers using RoPE must re-compute freqs after position reset; the benchmark
+    model uses learned absolute embeddings so this is safe here.
+
+    Args:
+        data: 1-D token tensor of length seq_len (input_ids, NOT labels).
+        eod_token: integer token ID treated as end-of-document.
+        eod_mask_loss: if True, set loss_mask=0 at every EOD position.
+        reset_position_ids: if True, restart position counter after each EOD.
+
+    Returns:
+        loss_mask   – float32 tensor, shape (seq_len,), values in {0.0, 1.0}
+        position_ids – int64 tensor, shape (seq_len,)
+    """
+    seq_len = data.numel()
+    loss_mask = torch.ones(seq_len, dtype=torch.float32)
+    position_ids = torch.arange(seq_len, dtype=torch.long)
+
+    # --- locate ALL EOD positions in one vectorised call ---
+    eod_positions = (data == eod_token).nonzero(as_tuple=False).squeeze(1)  # shape (k,)
+    n_eod = eod_positions.numel()
+
+    # Diagnostic: warn when the edge case (k > 1) actually fires
+    if n_eod > 1:
+        print(
+            f"[M457-EOD] multi-EOS edge case: {n_eod} EOD tokens in seq_len={seq_len} "
+            f"at positions {eod_positions.tolist()}"
+        )
+    elif n_eod == 1:
+        pass  # normal single-document sequence — no diagnostic noise
+    # n_eod == 0: no EOD in this window — also silent
+
+    if eod_mask_loss and n_eod > 0:
+        loss_mask[eod_positions] = 0.0
+
+    if reset_position_ids and n_eod > 0:
+        # Clone so we can mutate without aliasing the arange buffer
+        position_ids = position_ids.clone()
+        prev = 0
+        for j in range(n_eod):
+            i = eod_positions[j].item()
+            # Shift positions after this EOD back to restart from 0
+            # M457 edge case: each iteration uses the *updated* prev, not
+            # the original index — this is the bug the Megatron commit fixed.
+            # Without the running `prev` accumulator, the second+ EOD would
+            # subtract an incorrect (too-large) offset, producing negative
+            # position IDs.
+            position_ids[i + 1:] -= (i + 1 - prev)
+            prev = i + 1
+
+    return loss_mask, position_ids
+
+
 class SyntheticDataset(Dataset):
     """Learnable synthetic dataset for benchmarking.
 
@@ -1093,21 +1180,56 @@ class SyntheticDataset(Dataset):
     of ln(vocab_size).  Each sample is seeded by its index, ensuring
     reproducibility across runs and ranks while still providing enough
     variety for meaningful training.
+
+    M457 / Megatron 872b4a6: supports multi-EOS sequences produced by
+    document packing.  EOS tokens are injected at a fixed stride derived
+    from `eos_stride`; real datasets use variable-length documents (Poisson
+    distributed) — the fixed stride is a synthetic approximation that
+    exercises the multi-EOS code path deterministically.
+
+    Knuth §3.2.2 critique: fixed-stride EOS injection creates a perfectly
+    periodic signal; a learnable model could exploit this regularity to
+    predict EOD "for free".  For throughput benchmarking this is acceptable
+    (we care about step/s, not convergence), but users training for real
+    should disable EOS injection (eos_stride=0) and use real packed data.
     """
-    def __init__(self, vocab_size: int, seq_len: int, num_samples: int = 100000):
+    def __init__(
+        self,
+        vocab_size: int,
+        seq_len: int,
+        num_samples: int = 100000,
+        eod_token_id: int = -1,       # -1 → vocab_size - 1
+        eod_mask_loss: bool = True,    # M457: mask loss on EOD positions
+        reset_position_ids: bool = True,  # M457: restart pos counter after EOD
+        eos_stride: int = 0,           # inject EOS every N tokens (0 = disabled)
+    ):
         self.vocab_size = vocab_size
         self.seq_len = seq_len
         self.num_samples = num_samples
+        # Resolve eod_token_id: convention is vocab_size-1 (GPT2 uses 50256)
+        self.eod_token_id = (vocab_size - 1) if eod_token_id < 0 else eod_token_id
+        self.eod_mask_loss = eod_mask_loss
+        self.reset_position_ids = reset_position_ids
+        self.eos_stride = eos_stride   # 0 means no injection
+
         # Pre-generate a pool of short n-gram patterns (bigrams to 5-grams)
         # that get tiled into full sequences.  Using a small effective vocab
         # (~2000 tokens) makes the distribution learnable in <500 steps.
         rng = torch.Generator().manual_seed(42)
-        self.eff_vocab = min(2000, vocab_size)
+        # Reserve the eod_token_id slot: effective vocab excludes it so that
+        # pattern-tiled tokens never accidentally coincide with the EOS marker.
+        self.eff_vocab = min(2000, vocab_size - 1)  # -1: exclude eod_token_id
         # 256 pattern templates, each 8-32 tokens long
         self.patterns = [
             torch.randint(0, self.eff_vocab, (torch.randint(8, 33, (1,), generator=rng).item(),), generator=rng)
             for _ in range(256)
         ]
+        print(
+            f"[M457-DATASET] SyntheticDataset init: vocab={vocab_size}, "
+            f"eod_token_id={self.eod_token_id}, eos_stride={eos_stride}, "
+            f"eod_mask_loss={eod_mask_loss}, reset_position_ids={reset_position_ids}, "
+            f"num_samples={num_samples}"
+        )
 
     def __len__(self) -> int:
         return self.num_samples
@@ -1119,10 +1241,41 @@ class SyntheticDataset(Dataset):
         tokens = pat.repeat(repeats)[: self.seq_len + 1]
         # Add a small per-sample offset so different indices aren't identical
         offset = idx % self.eff_vocab
-        tokens = (tokens + offset) % self.vocab_size
+        tokens = (tokens + offset) % self.eff_vocab   # stay within non-EOS vocab
+
+        # M457: inject EOS tokens at fixed stride to exercise multi-EOS code path.
+        # stride=0 disables injection; stride>0 places EOD at positions
+        # [stride-1, 2*stride-1, ...] within the seq_len+1 window.
+        if self.eos_stride > 0:
+            eos_positions = torch.arange(
+                self.eos_stride - 1, self.seq_len + 1, self.eos_stride, dtype=torch.long
+            )
+            tokens[eos_positions] = self.eod_token_id
+            n_injected = eos_positions.numel()
+            if n_injected > 1:
+                # Only log on the first few samples to avoid flooding
+                if idx < 3:
+                    print(
+                        f"[M457-INJECT] idx={idx}: injected {n_injected} EOS tokens "
+                        f"at stride={self.eos_stride} → positions {eos_positions.tolist()[:5]}{'...' if n_injected > 5 else ''}"
+                    )
+
+        input_ids = tokens[:-1]   # shape (seq_len,)
+        labels = tokens[1:]       # shape (seq_len,)
+
+        # M457: compute loss_mask and position_ids respecting ALL EOD positions
+        loss_mask, position_ids = _m457_ltor_masks_and_position_ids(
+            data=input_ids,
+            eod_token=self.eod_token_id,
+            eod_mask_loss=self.eod_mask_loss,
+            reset_position_ids=self.reset_position_ids,
+        )
+
         return {
-            "input_ids": tokens[:-1],
-            "labels": tokens[1:]
+            "input_ids": input_ids,
+            "labels": labels,
+            "loss_mask": loss_mask,
+            "position_ids": position_ids,
         }
 
 
@@ -2140,11 +2293,18 @@ class Trainer:
             if self.rank == 0:
                 print(f"[INIT] Loaded DDP checkpoint: {config.init_from_ckpt}")
 
-        # Dataset
+        # Dataset — M457: pass multi-EOS config (Megatron 872b4a6)
+        # eod_token_id=-1 resolved inside __init__ to vocab_size-1 unless overridden.
+        # eos_stride=64 exercises the multi-EOS edge case: one EOS every 64 tokens
+        # yields ~16 EOS per 1024-token sequence — enough to stress the loop.
         dataset = SyntheticDataset(
             vocab_size=config.vocab_size,
             seq_len=config.max_seq_len,
-            num_samples=config.max_steps * config.batch_size * config.gradient_accumulation * max(self.world_size, 1) * 2
+            num_samples=config.max_steps * config.batch_size * config.gradient_accumulation * max(self.world_size, 1) * 2,
+            eod_token_id=config.eod_token_id,
+            eod_mask_loss=config.eod_mask_loss,
+            reset_position_ids=config.reset_position_ids,
+            eos_stride=64,
         )
 
         if self.use_deepspeed:
@@ -2657,6 +2817,10 @@ class Trainer:
 
             input_ids = batch['input_ids'].to(self.engine.device)
             labels = batch['labels'].to(self.engine.device)
+            # M457: consume loss_mask from dataset (Megatron 872b4a6 multi-EOS fix)
+            loss_mask = batch.get('loss_mask', None)
+            if loss_mask is not None:
+                loss_mask = loss_mask.to(self.engine.device)
 
             if _autosp_prepare is not None:
                 _autosp_prepare(
@@ -2669,15 +2833,32 @@ class Trainer:
                 sp_src = self._sp_ranks[0]
                 dist.broadcast(input_ids, src=sp_src, group=self._sp_group)
                 dist.broadcast(labels, src=sp_src, group=self._sp_group)
+                if loss_mask is not None:
+                    dist.broadcast(loss_mask, src=sp_src, group=self._sp_group)
                 if self.rank in self._sp_ranks:
                     local_seq = input_ids.shape[1] // self._sp_size
                     sp_rk = self._sp_ranks.index(self.rank)
                     start = sp_rk * local_seq
                     input_ids = input_ids[:, start:start+local_seq].contiguous()
                     labels = labels[:, start:start+local_seq].contiguous()
+                    if loss_mask is not None:
+                        loss_mask = loss_mask[:, start:start+local_seq].contiguous()
 
             _t_fwd = time.time()
             _, loss = self.engine(input_ids, labels)
+            # M457: apply loss_mask — zero out loss at EOD positions so the model
+            # is not rewarded for predicting the EOS token itself.
+            # Knuth §1.2.10: normalise by the count of unmasked positions to keep
+            # gradient magnitude stable when EOS density varies between batches.
+            if loss_mask is not None:
+                n_active = loss_mask.sum().clamp(min=1.0)
+                loss = (loss * loss_mask).sum() / n_active
+                if step == 1 and self.rank == 0:
+                    print(
+                        f"[M457-DS] step={step} loss_mask applied: "
+                        f"active_tokens={int(n_active.item())}/{loss_mask.numel()}, "
+                        f"masked_loss={loss.item():.4f}"
+                    )
             _t_fwd = time.time() - _t_fwd
 
             _t_bwd = time.time()
@@ -2817,6 +2998,10 @@ class Trainer:
 
                 input_ids = batch['input_ids'].to(self.device)
                 labels = batch['labels'].to(self.device)
+                # M457: consume loss_mask from dataset (Megatron 872b4a6 multi-EOS fix)
+                loss_mask_batch = batch.get('loss_mask', None)
+                if loss_mask_batch is not None:
+                    loss_mask_batch = loss_mask_batch.to(self.device)
 
                 # M365 DIAG: pre-broadcast data hash on ALL ranks
                 if _diag and step % 50 == 1:
@@ -2828,6 +3013,9 @@ class Trainer:
                     sp_src = self._sp_ranks[0]
                     dist.broadcast(input_ids, src=sp_src, group=self._sp_group)
                     dist.broadcast(labels, src=sp_src, group=self._sp_group)
+                    # M457: broadcast loss_mask with the same SP group
+                    if loss_mask_batch is not None:
+                        dist.broadcast(loss_mask_batch, src=sp_src, group=self._sp_group)
 
                     # M365 DIAG: post-broadcast cross-rank hash verification
                     if _diag and step % 50 == 1:
@@ -2844,6 +3032,11 @@ class Trainer:
                     labels = self._sp_comm.scatter_along_seq(
                         labels, dim=1
                     )
+                    # M457: scatter loss_mask along sequence dim in sync with inputs
+                    if loss_mask_batch is not None:
+                        loss_mask_batch = self._sp_comm.scatter_along_seq(
+                            loss_mask_batch, dim=1
+                        )
                     # M365 DIAG: post-scatter per-rank data hash
                     if _diag and step % 50 == 1:
                         _diag.log_data_hash(step, self.rank, input_ids, "post-scatter-input")
@@ -2851,6 +3044,18 @@ class Trainer:
 
                 with autocast():
                     _, loss = self.model(input_ids, labels)
+                    # M457: apply loss_mask — normalise by active token count
+                    # Knuth §1.2.10: division by clamp(sum,1) avoids zero-div when
+                    # an entire micro-batch is masked (pathological but possible).
+                    if loss_mask_batch is not None:
+                        n_active = loss_mask_batch.sum().clamp(min=1.0)
+                        loss = (loss * loss_mask_batch).sum() / n_active
+                        if step == 1 and micro_step == 0 and self.rank == 0:
+                            print(
+                                f"[M457-DDP] step={step} loss_mask applied: "
+                                f"active_tokens={int(n_active.item())}/{loss_mask_batch.numel()}, "
+                                f"masked_loss={loss.item():.4f}"
+                            )
                     loss = loss / self.config.gradient_accumulation
 
                 self.scaler.scale(loss).backward() if self.scaler else loss.backward()
@@ -3494,6 +3699,23 @@ def main():
                         help='M452: Data is pre-split into newline-separated sentences '
                              '(Megatron --presplit-sentences flag from 66719e9 datasets.py). '
                              'Bypasses NLTK sent_tokenize at load time.')
+    # M457: Megatron 872b4a6 — multi-EOS edge case flags
+    parser.add_argument('--eod_token_id', type=int, default=-1,
+                        help='M457: EOD/EOS token ID (Megatron 872b4a6). '
+                             '-1 → auto-set to vocab_size-1 at dataset init. '
+                             'Knuth §2.3.1: this sentinel must be excluded from '
+                             'the learnable n-gram patterns to prevent accidental '
+                             'EOS prediction during normal token generation.')
+    parser.add_argument('--no_eod_mask_loss', action='store_true',
+                        help='M457: disable loss masking at EOD positions. '
+                             'By default loss is zeroed on EOS tokens so the model '
+                             'is not rewarded for predicting the EOS marker itself.')
+    parser.add_argument('--no_reset_position_ids', action='store_true',
+                        help='M457: disable position_ids reset after each EOD. '
+                             'By default position counters restart at 0 after each '
+                             'EOD to support multi-document packing. Knuth §3.6: '
+                             'absolute position embeddings require this reset; '
+                             'RoPE requires re-computation of sin/cos freqs.')
     
     args = parser.parse_args()
     
@@ -3519,6 +3741,10 @@ def main():
         seed=args.seed,
         replacement_sampling=args.replacement_sampling,
         presplit_sentences=args.presplit_sentences,
+        # M457: Megatron 872b4a6 multi-EOS edge case
+        eod_token_id=args.eod_token_id,
+        eod_mask_loss=not args.no_eod_mask_loss,
+        reset_position_ids=not args.no_reset_position_ids,
     )
     
     rank = int(os.environ.get('RANK', 0))
