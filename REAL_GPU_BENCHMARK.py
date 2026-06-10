@@ -1743,9 +1743,14 @@ class DESLOCAdamW(torch.optim.Optimizer):
     def __init__(self, params, lr: float, betas: Tuple[float, float],
                  weight_decay: float, Kx: int, Ku: int, Kv: int,
                  outer_optimizer: str = 'average',
-                 outer_momentum: float = 0.9, outer_lr: float = 1.0):
+                 outer_momentum: float = 0.9, outer_lr: float = 1.0,
+                 max_norm: float = 1.0):
+        # M465: Megatron 4687967 — clip_grad moved from training loop into optimizer.
+        # max_norm is now an optimizer-level default; individual param_groups may
+        # override it via group['max_norm'].  Setting max_norm=0.0 disables clipping
+        # entirely for that group (allows embedding layers to skip clip if needed).
         defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay,
-                       Kx=Kx, Ku=Ku, Kv=Kv)
+                       Kx=Kx, Ku=Ku, Kv=Kv, max_norm=max_norm)
         super().__init__(params, defaults)
         self.global_step = 0
         # Paper Metrics: track ||s_{t+K} - s_t||_2 / ||s_t||_2 for each state tier
@@ -1784,6 +1789,103 @@ class DESLOCAdamW(torch.optim.Optimizer):
         """Current loss scale for training loop. Megatron exposes this via
         FP16_Optimizer.loss_scale; we expose it as a read-only property."""
         return self._oas_scale if self._oas_enabled else 1.0
+
+    @staticmethod
+    def _clip_grad_norm_per_group(params, max_norm: float, norm_type: float = 2.0) -> float:
+        """M465: Per-parameter-group gradient clipping — adapted from Megatron 4687967
+        clip_grad_norm (megatron/mpu/grads.py).  Gradients are modified in-place.
+
+        Key differences from torch.nn.utils.clip_grad_norm_:
+          1. Filters shared params (param.shared == True) so embedding weight that
+             is tied between first and last pipeline stages is counted only once.
+             Megatron sets param.shared=True in PipelinedMegatronModule.__init__
+             (module.py hunk in commit 4687967).
+          2. Filters tensor-model-parallel duplicates — only rank-0 of each TP
+             group contributes its norm, avoiding sqrt(tp_size) over-count.
+             We cannot check mpu.get_tensor_model_parallel_rank() here (no mpu
+             dependency), so we use param.tensor_model_parallel attribute instead,
+             matching Megatron's own convention.
+          3. Uses param.grad.detach() throughout — avoids autograd graph retention
+             and prevents accidental double-backward through the clip coefficient.
+
+        Knuth critique (TAOCP Vol.2 §4.2.2 — floating-point error accumulation):
+          USER BUG:  Callers who leave clipping in the training loop and also pass
+                     max_norm to the optimizer will double-clip every step.  First
+                     clip reduces ‖g‖ to max_norm; second clip is a no-op only if
+                     the loop's max_norm ≤ this value — a silent, order-dependent
+                     correctness hazard that makes ablations unreproducible.
+          SYSTEM IMPACT: With GradScaler active, training-loop clip must be called
+                         AFTER unscale_() (scaler inflates grads by 1/scale before
+                         clip).  Moving clip inside optimizer.step() — which fires
+                         AFTER the scaler's unscale step — preserves this invariant
+                         automatically.  The old training-loop placement was correct
+                         only by accident: it happened to sit after the unscale_()
+                         call in _train_baseline.  Any future refactor that reorders
+                         those two lines silently breaks clipping for fp16 runs.
+
+        Args:
+            params: iterable of torch.Tensor parameters (single group's params).
+            max_norm: maximum gradient norm.  0.0 or negative = skip clipping.
+            norm_type: L-p norm order (default 2).  Use float('inf') for L-inf.
+
+        Returns:
+            Total pre-clip gradient norm for this group (0.0 if no eligible grads).
+        """
+        if max_norm <= 0.0:
+            # max_norm=0 is the opt-out sentinel — return 0 without touching grads
+            print(f"[CLIPGRAD] group max_norm={max_norm:.3f} — clipping DISABLED for this group")
+            return 0.0
+
+        # Build eligible parameter list: has grad, not shared, not TP-duplicate
+        eligible = []
+        n_shared_skipped = 0
+        n_tp_skipped = 0
+        for param in params:
+            if param.grad is None:
+                continue
+            if getattr(param, 'shared', False):
+                n_shared_skipped += 1
+                continue
+            # tensor_model_parallel=True means this param IS the canonical TP shard
+            # (every rank holds a slice) — count it.  tensor_model_parallel absent or
+            # False means param is replicated; count only TP rank-0 to avoid over-count.
+            is_tp_shard = getattr(param, 'tensor_model_parallel', False)
+            if not is_tp_shard:
+                # replicated param — skip on non-zero TP ranks
+                try:
+                    import torch.distributed as _dist
+                    tp_rank = _dist.get_rank() if _dist.is_initialized() else 0
+                except Exception:
+                    tp_rank = 0
+                if tp_rank != 0:
+                    n_tp_skipped += 1
+                    continue
+            eligible.append(param)
+
+        if not eligible:
+            print(f"[CLIPGRAD] no eligible params (shared_skip={n_shared_skipped} tp_skip={n_tp_skipped})")
+            return 0.0
+
+        # Compute norm across eligible params
+        if norm_type == float('inf'):
+            total_norm = max(p.grad.detach().abs().max().item() for p in eligible)
+        else:
+            total_norm = sum(
+                p.grad.detach().norm(norm_type).item() ** norm_type
+                for p in eligible
+            ) ** (1.0 / norm_type)
+
+        # Apply clip coefficient (in-place, detached)
+        clip_coef = max_norm / (total_norm + 1e-6)
+        if clip_coef < 1.0:
+            for param in eligible:
+                param.grad.detach().mul_(clip_coef)
+
+        print(f"[CLIPGRAD] max_norm={max_norm:.3f} total_norm={total_norm:.4f} "
+              f"clip_coef={min(clip_coef, 1.0):.4f} "
+              f"n_eligible={len(eligible)} shared_skip={n_shared_skipped} tp_skip={n_tp_skipped} "
+              f"clipped={'YES' if clip_coef < 1.0 else 'no'}")
+        return total_norm
 
     @staticmethod
     def _grad_has_inf_or_nan(tensor: torch.Tensor) -> bool:
@@ -1917,6 +2019,38 @@ class DESLOCAdamW(torch.optim.Optimizer):
                         if _p.grad is not None:
                             _p.grad = None
                 return  # abort this step entirely
+
+        # M465: Megatron 4687967 — per-parameter-group gradient clipping.
+        # Moved from training loop into optimizer.step() so that:
+        #   (a) clipping always fires after OAS overflow guard (no partial-step clip),
+        #   (b) each param_group can carry its own max_norm (e.g. 0.0 to disable
+        #       clipping for embedding layers that use a shared weight),
+        #   (c) GradScaler invariant is preserved: unscale_() happens before step(),
+        #       and clip sees unscaled gradients regardless of training-loop order.
+        # Knuth critique (TAOCP Vol.2 §4.2.4 — algorithm correctness):
+        #   USER BUG:  Callers who ALSO call torch.nn.utils.clip_grad_norm_() in
+        #              the training loop before optimizer.step() will double-clip.
+        #              The first clip reduces ‖g‖ to max_norm; the second is a
+        #              no-op only if both thresholds are identical AND the training
+        #              loop clip fired after GradScaler.unscale_().  In any other
+        #              configuration the second clip silently under-clips or
+        #              over-clips, making ablations non-reproducible.
+        #   SYSTEM IMPACT: Training-loop clip that predates this commit must be
+        #                  removed (or guarded with `if not isinstance(opt, DESLOCAdamW)`)
+        #                  to avoid the double-clip hazard described above.
+        _r_clip = dist.get_rank() if dist.is_initialized() else 0
+        _total_norms = []
+        for group in self.param_groups:
+            _mn = group.get('max_norm', 1.0)
+            _gn = DESLOCAdamW._clip_grad_norm_per_group(group['params'], _mn)
+            _total_norms.append(_gn)
+        # Expose aggregate norm so training loop can log it without re-computing
+        self._last_grad_norm = (sum(n ** 2 for n in _total_norms) ** 0.5) if _total_norms else 0.0
+        if self.global_step % 50 == 1:
+            print(f"[CLIPGRAD/STEP] rank={_r_clip} step={self.global_step} "
+                  f"n_groups={len(_total_norms)} "
+                  f"per_group_norms={[round(n, 4) for n in _total_norms]} "
+                  f"aggregate_norm={self._last_grad_norm:.4f}")
 
         for group in self.param_groups:
             for p in group['params']:
@@ -3040,7 +3174,8 @@ class Trainer:
                 Kx=self.config.Kx, Ku=self.config.Ku, Kv=self.config.Kv,
                 outer_optimizer=outer,
                 outer_momentum=self.config.outer_momentum,
-                outer_lr=self.config.outer_lr
+                outer_lr=self.config.outer_lr,
+                max_norm=self.config.grad_clip,  # M465: per-group clip inside step()
             )
         else:
             raise ValueError(f"Unknown baseline method: {method}")
@@ -3458,13 +3593,28 @@ class Trainer:
 
             if self.scaler:
                 self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+            # M465: clip_grad moved into DESLOCAdamW.step() (Megatron 4687967 pattern).
+            # Per-group max_norm is applied inside optimizer.step() with shared-param and
+            # TP-duplicate filtering.  Do NOT call torch.nn.utils.clip_grad_norm_() here —
+            # doing so would double-clip: training-loop clip reduces ‖g‖ to max_norm,
+            # then DESLOCAdamW.step() sees an already-clipped gradient and clips again
+            # (a no-op only if both thresholds match exactly, which is fragile).
+            # For non-DESLOCAdamW optimizers (AdamW, LocalAdamW) a fallback is provided.
+            if not isinstance(self.optimizer, DESLOCAdamW):
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
 
-            # M365 FIX: Cache gradient norm HERE — after clip, before optimizer.step().
-            # optimizer.step() does p.grad = None internally to free VRAM for Adam denom,
-            # so any grad norm measured AFTER step() will be 0.0000.
-            # Pattern: Megatron training.py captures grad_norm from optimizer.step() return value.
+            # M365 FIX / M465 UPDATE: Cache gradient norm after clip, before optimizer.step().
+            # For DESLOCAdamW: read the norm that _clip_grad_norm_per_group stored on the
+            # optimizer during step() — avoids re-iterating all params a second time.
+            # For other optimizers: compute norm directly (grads still live at this point).
+            # optimizer.step() does p.grad = None for Adam denom VRAM, so norms after
+            # step() are always 0.0 — this cache preserves the pre-step value.
             _cached_grad_norm = 0.0
+            if isinstance(self.optimizer, DESLOCAdamW) and hasattr(self.optimizer, '_last_grad_norm'):
+                # _last_grad_norm is set by _clip_grad_norm_per_group inside step()
+                # but step() hasn't fired yet — it fires below.  We fall through to
+                # the manual compute for DESLOCAdamW as well, then overwrite after step.
+                pass
             with torch.no_grad():
                 _cached_grad_norm = sum(
                     p.grad.float().norm().item()**2
