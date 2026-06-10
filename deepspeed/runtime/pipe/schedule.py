@@ -298,6 +298,165 @@ class TrainSchedule(PipeSchedule):
         return micro_batch_id
 
 
+class InterleavedTrainSchedule(PipeSchedule):
+    """Interleaved 1F1B schedule for pipeline parallelism with virtual pipeline stages.
+
+    Implements the three-phase structure from Megatron dd889062:
+      - Warmup  : pure forward passes to fill the pipeline (num_warmup_microbatches)
+      - Steady  : alternating 1F1B pairs draining the warmup queue
+      - Cooldown: remaining backward passes to flush all in-flight activations
+
+    With ``num_model_chunks > 1`` each device holds ``num_model_chunks`` virtual
+    stages, so the effective micro-batch count is scaled accordingly.  The
+    ``get_model_chunk_id`` helper mirrors Megatron's interleaved rank-to-chunk
+    mapping so downstream code can call
+    ``mpu.set_virtual_pipeline_model_parallel_rank(chunk)`` before each step.
+
+    Args:
+        micro_batches (int): Number of micro-batches per global batch.
+        stages (int): Number of pipeline-parallel ranks.
+        stage_id (int): Rank of this pipeline stage.
+        num_model_chunks (int): Virtual pipeline depth (``>= 1``).  Default 1
+            degrades to standard 1F1B behaviour.
+        forward_only (bool): Skip backward passes (inference mode).
+    """
+
+    def __init__(self, micro_batches, stages, stage_id,
+                 num_model_chunks=1, forward_only=False):
+        super().__init__(micro_batches, stages, stage_id)
+        self.num_model_chunks = max(1, num_model_chunks)
+        self.forward_only = forward_only
+
+        # Total virtual micro-batches = real micro-batches × model chunks
+        num_mb_total = self.micro_batches * self.num_model_chunks
+
+        if forward_only:
+            self._num_warmup = num_mb_total
+            self._all_warmup = True
+        elif self.micro_batches == self.stages:
+            # Edge case: pipeline fully saturated during warmup only
+            self._num_warmup = num_mb_total
+            self._all_warmup = True
+        else:
+            # Warmup depth = (P - rank - 1) * 2 + (V - 1) * P
+            # where P = pipeline_parallel_size, V = num_model_chunks
+            warmup = (self.stages - self.stage_id - 1) * 2
+            warmup += (self.num_model_chunks - 1) * self.stages
+            self._num_warmup = min(warmup, num_mb_total)
+            self._all_warmup = False
+
+        self._num_remaining = num_mb_total - self._num_warmup
+
+        print(
+            f"[InterleavedTrainSchedule] stage={stage_id}/{stages} "
+            f"chunks={num_model_chunks} mb_total={num_mb_total} "
+            f"warmup={self._num_warmup} steady_pairs={self._num_remaining} "
+            f"all_warmup={self._all_warmup}"
+        )
+
+    # ------------------------------------------------------------------
+    # Virtual-stage mapping  (mirrors Megatron interleaved chunk id logic)
+    # ------------------------------------------------------------------
+
+    def get_model_chunk_id(self, k, forward):
+        """Map global microbatch counter *k* to a virtual model-chunk index.
+
+        Forward passes cycle 0 → V-1 as *k* increases.
+        Backward passes reverse-cycle V-1 → 0 so that the last chunk whose
+        forward was issued first gets its backward last, matching the LIFO
+        activation-stack ordering required for correct gradient accumulation.
+        """
+        period = self.stages * self.num_model_chunks
+        k_in_group = k % period
+        chunk = k_in_group // self.stages
+        if not forward:
+            chunk = (self.num_model_chunks - chunk - 1)
+        return chunk
+
+    # ------------------------------------------------------------------
+    # Schedule generator
+    # ------------------------------------------------------------------
+
+    def steps(self):
+        """Yield ``_ScheduleStep`` instances in warmup / steady / cooldown order.
+
+        Each step carries ``(phase, forward, model_chunk_id, buffer_id)``.
+        Callers should set the virtual pipeline rank to ``model_chunk_id``
+        before dispatching compute and communication.
+        """
+        num_mb_total = self.micro_batches * self.num_model_chunks
+        fwd_k = 0   # global forward-microbatch counter
+        bwd_k = 0   # global backward-microbatch counter
+
+        # ---- Phase 1 : Warmup  (pure forward passes) ---- #
+        for _ in range(self._num_warmup):
+            chunk = self.get_model_chunk_id(fwd_k, forward=True)
+            buf = self._buffer_idx(fwd_k % self.micro_batches)
+            yield _ScheduleStep(phase='warmup', forward=True,
+                                model_chunk_id=chunk, buffer_id=buf,
+                                fwd_k=fwd_k, bwd_k=None)
+            fwd_k += 1
+
+        # ---- Phase 2 : Steady-state 1F1B pairs ---- #
+        for _ in range(self._num_remaining):
+            # Forward half
+            chunk_f = self.get_model_chunk_id(fwd_k, forward=True)
+            buf_f = self._buffer_idx(fwd_k % self.micro_batches)
+            yield _ScheduleStep(phase='steady', forward=True,
+                                model_chunk_id=chunk_f, buffer_id=buf_f,
+                                fwd_k=fwd_k, bwd_k=None)
+            fwd_k += 1
+
+            # Backward half
+            if not self.forward_only:
+                chunk_b = self.get_model_chunk_id(bwd_k, forward=False)
+                buf_b = self._buffer_idx(bwd_k % self.micro_batches)
+                yield _ScheduleStep(phase='steady', forward=False,
+                                    model_chunk_id=chunk_b, buffer_id=buf_b,
+                                    fwd_k=None, bwd_k=bwd_k)
+                bwd_k += 1
+
+        # ---- Phase 3 : Cooldown  (pure backward passes) ---- #
+        if not self.forward_only and not self._all_warmup:
+            while bwd_k < num_mb_total:
+                chunk_b = self.get_model_chunk_id(bwd_k, forward=False)
+                buf_b = self._buffer_idx(bwd_k % self.micro_batches)
+                yield _ScheduleStep(phase='cooldown', forward=False,
+                                    model_chunk_id=chunk_b, buffer_id=buf_b,
+                                    fwd_k=None, bwd_k=bwd_k)
+                bwd_k += 1
+
+        print(
+            f"[InterleavedTrainSchedule] stage={self.stage_id} done — "
+            f"fwd_issued={fwd_k} bwd_issued={bwd_k}"
+        )
+
+    def num_pipe_buffers(self):
+        """Buffer count scales with in-flight warmup depth, clamped to [2, mb]."""
+        buffers = min(self.stages - self.stage_id, self.micro_batches)
+        return max(2, buffers)
+
+
+class _ScheduleStep:
+    """Lightweight named container for a single interleaved schedule step."""
+
+    __slots__ = ('phase', 'forward', 'model_chunk_id', 'buffer_id', 'fwd_k', 'bwd_k')
+
+    def __init__(self, phase, forward, model_chunk_id, buffer_id, fwd_k, bwd_k):
+        self.phase = phase
+        self.forward = forward
+        self.model_chunk_id = model_chunk_id
+        self.buffer_id = buffer_id
+        self.fwd_k = fwd_k
+        self.bwd_k = bwd_k
+
+    def __repr__(self):
+        direction = 'F' if self.forward else 'B'
+        k = self.fwd_k if self.forward else self.bwd_k
+        return (f"_ScheduleStep(phase={self.phase!r}, {direction}, "
+                f"chunk={self.model_chunk_id}, buf={self.buffer_id}, k={k})")
+
+
 class DataParallelSchedule(PipeSchedule):
     """An example schedule that trains using traditional data parallelism with gradient
     accumulation.

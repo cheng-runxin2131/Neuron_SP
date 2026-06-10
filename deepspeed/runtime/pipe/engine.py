@@ -1530,3 +1530,150 @@ def desloc_pipe_bubble(ns, nm, Kx=32, fwd=10.0, bwd=20.0, comm=1.0):
             'total': round(actual, 2),
             'eff': round(compute / max(actual, 1e-6), 4),
             'bub%': round(100 * bubble / max(actual, 1e-6), 2)}
+
+
+# =========================================================================
+# M466: Interleaved 1F1B  ×  DES-LOC Kx warmup fusion
+# Ref: Megatron dd889062 (forward_backward_pipelining_with_interleaving)
+#      + DES-LOC Algorithm 1  (Kx-gated gradient allreduce)
+#
+# Design tension (Knuth §3 critique):
+#   - Megatron's warmup depth formula   (P-rank-1)*2 + (V-1)*P   is correct
+#     for latency-optimal bubble minimisation but adds O(V·P) in-flight
+#     activations per rank — a memory cliff for large V.
+#   - DES-LOC Kx gating amortises allreduce cost across Kx steps; during
+#     warmup the pipeline is not yet in steady state so skipping allreduce
+#     here is safe (no backward pass issues activations yet).
+#   - Coupling: the Kx warmup guard (step < warmup_steps → always sync)
+#     must respect the *schedule* warmup too; we therefore expose both
+#     facets through a single annotated step list so callers have one
+#     source of truth for both phase and sync decisions.
+# =========================================================================
+
+def desloc_interleaved_kx_warmup(ns, nm, num_model_chunks=1,
+                                  stage_id=0, Kx=32,
+                                  train_step=0, kx_warmup=5):
+    """Return an annotated interleaved 1F1B schedule with Kx grad-sync gates.
+
+    Fuses the three-phase warmup/steady/cooldown model from Megatron
+    ``forward_backward_pipelining_with_interleaving`` (dd889062) with the
+    DES-LOC Kx-gated allreduce strategy so every entry carries both a
+    *schedule phase* label and a *dp_sync* flag.
+
+    Parameters
+    ----------
+    ns : int
+        Number of pipeline stages (``pipeline_parallel_size``).
+    nm : int
+        Number of micro-batches per global batch.
+    num_model_chunks : int
+        Virtual pipeline depth V.  ``1`` → standard 1F1B.
+    stage_id : int
+        Zero-based rank of this pipeline stage.
+    Kx : int
+        DES-LOC allreduce period.  ``<= 1`` → sync every backward.
+    train_step : int
+        Global optimiser step counter (used to decide Kx gating).
+    kx_warmup : int
+        Number of initial training steps during which Kx gating is
+        *disabled* (always sync) so early-training gradients are accurate.
+        Maps to ``warmup`` in :class:`DeslocPipeKxGradSync`.
+
+    Returns
+    -------
+    list[dict]
+        One dict per schedule slot with keys:
+
+        ``mb``         – micro-batch index within the global batch  
+        ``chunk``      – virtual model-chunk index (set virtual PP rank)  
+        ``d``          – ``'F'`` forward / ``'B'`` backward  
+        ``phase``      – ``'warmup'`` | ``'steady'`` | ``'cooldown'``  
+        ``dp_sync``    – ``True`` if a DP allreduce should fire after this slot
+    """
+    V = max(1, num_model_chunks)
+    num_mb_total = nm * V
+
+    # --- Warmup depth (mirrors InterleavedTrainSchedule.__init__) ---
+    if nm == ns:
+        num_warmup = num_mb_total
+        all_warmup = True
+    else:
+        warmup_raw = (ns - stage_id - 1) * 2 + (V - 1) * ns
+        num_warmup = min(warmup_raw, num_mb_total)
+        all_warmup = False
+    num_remaining = num_mb_total - num_warmup
+
+    print(
+        f"[desloc_interleaved_kx_warmup] ns={ns} nm={nm} V={V} "
+        f"stage={stage_id} Kx={Kx} train_step={train_step} "
+        f"kx_warmup={kx_warmup} | sched_warmup={num_warmup} "
+        f"steady={num_remaining} all_warmup={all_warmup}"
+    )
+
+    # Kx gate: during kx_warmup training steps always sync; afterwards gate by Kx
+    do_kx_sync = (train_step < kx_warmup) or (Kx <= 1) or (train_step % Kx == 0)
+
+    def _chunk_id(k, forward):
+        """Interleaved chunk mapping — identical to Megatron get_model_chunk_id."""
+        k_in_group = k % (ns * V)
+        c = k_in_group // ns
+        if not forward:
+            c = (V - c - 1)
+        return c
+
+    sc = []
+    fwd_k = 0
+    bwd_k = 0
+
+    # Phase 1 — Warmup: forward only
+    for _ in range(num_warmup):
+        sc.append({
+            'mb': fwd_k % nm,
+            'chunk': _chunk_id(fwd_k, forward=True),
+            'd': 'F',
+            'phase': 'warmup',
+            'dp_sync': False,   # no backward yet → no sync needed
+        })
+        fwd_k += 1
+
+    # Phase 2 — Steady: interleaved 1F1B pairs
+    for _ in range(num_remaining):
+        sc.append({
+            'mb': fwd_k % nm,
+            'chunk': _chunk_id(fwd_k, forward=True),
+            'd': 'F',
+            'phase': 'steady',
+            'dp_sync': False,
+        })
+        fwd_k += 1
+
+        is_last_b_in_phase = (bwd_k == num_remaining - 1) and all_warmup
+        sc.append({
+            'mb': bwd_k % nm,
+            'chunk': _chunk_id(bwd_k, forward=False),
+            'd': 'B',
+            'phase': 'steady',
+            # Sync on the *last* backward of a steady pair when Kx gate opens
+            'dp_sync': do_kx_sync and is_last_b_in_phase,
+        })
+        bwd_k += 1
+
+    # Phase 3 — Cooldown: backward only
+    if not all_warmup:
+        while bwd_k < num_mb_total:
+            is_final_b = (bwd_k == num_mb_total - 1)
+            sc.append({
+                'mb': bwd_k % nm,
+                'chunk': _chunk_id(bwd_k, forward=False),
+                'd': 'B',
+                'phase': 'cooldown',
+                # Sync after the very last backward of the batch when gate opens
+                'dp_sync': do_kx_sync and is_final_b,
+            })
+            bwd_k += 1
+
+    print(
+        f"[desloc_interleaved_kx_warmup] stage={stage_id} schedule_len={len(sc)} "
+        f"fwd_issued={fwd_k} bwd_issued={bwd_k} do_kx_sync={do_kx_sync}"
+    )
+    return sc
