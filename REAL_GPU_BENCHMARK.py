@@ -1011,49 +1011,60 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
-            # M450: Numerically stable CE loss — derived from Megatron abe36e2
-            # _VocabParallelCrossEntropy.forward(). The key insight:
-            #   log_softmax(x) = x - max(x) - log(sum(exp(x - max(x))))
-            # Standard F.cross_entropy does this internally, but when DES-LOC
-            # skips sync steps, logit magnitudes can drift across ranks.
-            # We compute the max-subtracted version explicitly to:
-            #   (a) Monitor logit stability across ranks
-            #   (b) Detect when stale params cause logit explosion
-            # Pattern: Megatron subtracts logits_max then all_reduce(MAX)
-            # across model-parallel group. We skip the all_reduce (not doing
-            # tensor parallel) but keep the explicit max tracking for diag.
-            _logits_flat = logits.view(-1, logits.size(-1))
-            _targets_flat = targets.view(-1)
+            # M461 (57064fd): CE memory opt — no full logits clone; in-place max-sub
+            # then in-place exp after scalar predicted-logit is extracted.
+            # Megatron 57064fd key sequence:
+            #   1. max in-place (no clone) → subtract → extract predicted logit (clone+contiguous)
+            #   2. torch.exp(..., out=logits) reuses logits storage for exp — O(0) extra alloc
+            #   3. loss = log(sum_exp) − predicted_logit
+            # Knuth §2.3: "The real problem is that programmers have spent far too much
+            # time worrying about efficiency in the wrong places." — here the clone was
+            # exactly in the wrong place: O(B*T*V) before a O(B*T) extraction.
+            _logits_flat = logits.view(-1, logits.size(-1))   # [B*T, V]; no copy
+            _targets_flat = targets.view(-1)                  # [B*T]
+
+            # Step 1: max-subtract in-place (57064fd: skip clone, operate directly)
             with torch.no_grad():
-                _logit_max = _logits_flat.max(dim=-1)[0]
+                _logit_max = _logits_flat.max(dim=-1)[0]      # [B*T]
                 _logit_max_global = _logit_max.max().item()
                 _logit_min_global = _logit_max.min().item()
-                # M450 DIAG: logit range diagnostic — detects explosion
+                # M461 DIAG: logit range — detect explosion (57064fd threshold: >50)
                 if s % 50 == 1:
-                    print(f"[CE-STABLE] rank={_r} step={s} "
+                    print(f"[CE-M461] rank={_r} step={s} "
                           f"logit_max={_logit_max_global:.4f} "
                           f"logit_min_of_max={_logit_min_global:.4f} "
                           f"range={_logit_max_global - _logit_min_global:.4f} "
                           f"vocab={logits.size(-1)} "
-                          f"n_tokens={_targets_flat.numel()}")
-                # Detect logit explosion (Megatron pattern: if max > 50, warn)
+                          f"n_tokens={_targets_flat.numel()} "
+                          f"opt=no_clone+inplace_exp")
                 if _logit_max_global > 50.0:
-                    print(f"[CE-WARN] rank={_r} step={s} "
+                    print(f"[CE-WARN-M461] rank={_r} step={s} "
                           f"LOGIT EXPLOSION: max={_logit_max_global:.2f} "
                           f"(threshold=50). Stale params may be causing drift.")
-            loss = F.cross_entropy(_logits_flat, _targets_flat)
-            # M364: With Ulysses A2A, each SP rank sees full sequence in attention
-            # but computes CE loss on its LOCAL token subset. Each rank's gradient
-            # is valid for its tokens. Gradients sync via DES-LOC AllReduce.
-            # Do NOT all_reduce loss here — it destroys autograd graph.
+            _logits_flat.sub_(_logit_max.unsqueeze(dim=-1))   # in-place; 57064fd line
 
-            # M365 DIAG: full loss decomposition on ALL ranks
+            # Step 2: extract predicted logit BEFORE exp (critical: clone+contiguous
+            # — advanced-index shares storage with _logits_flat; in-place exp below
+            # would corrupt the slice without this.  57064fd: predicted_logits_1d.clone())
+            _arange = torch.arange(_logits_flat.size(0), device=_logits_flat.device)
+            _pred_logit = _logits_flat[_arange, _targets_flat].clone().contiguous()  # [B*T]
+
+            # Step 3: in-place exp — reuses _logits_flat storage (57064fd: out=exp_logits)
+            torch.exp(_logits_flat, out=_logits_flat)
+            _sum_exp = _logits_flat.sum(dim=-1)               # [B*T]
+
+            # Step 4: loss = log(Σexp) − predicted_logit
+            loss = torch.log(_sum_exp) - _pred_logit          # [B*T]
+            loss = loss.mean()
+            # M364: With Ulysses A2A each SP rank sees its local token subset.
+            # Gradients sync via DES-LOC AllReduce — do NOT all_reduce loss here.
+
+            # M461 DIAG: full loss decomposition on ALL ranks
             if _diag and s % 50 == 1:
                 _diag.log_loss_decomp(s, _r, loss, logits, targets, _SP_CTX['on'])
-                print(f"[FWD-LOSS] rank={_r} step={s} loss={loss.item():.6f} "
-                      f"logit_norm={logits.float().norm().item():.4f} "
-                      f"logit_std={logits.float().std().item():.4f} "
-                      f"logit_mean={logits.float().mean().item():.8f} "
+                print(f"[FWD-LOSS-M461] rank={_r} step={s} loss={loss.item():.6f} "
+                      f"sum_exp_mean={_sum_exp.float().mean().item():.4f} "
+                      f"pred_logit_mean={_pred_logit.float().mean().item():.6f} "
                       f"sp={'local' if _SP_CTX['on'] else 'full'} "
                       f"n_tokens={targets.numel()}")
         return logits, loss
