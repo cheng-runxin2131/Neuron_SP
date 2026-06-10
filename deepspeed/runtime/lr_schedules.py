@@ -874,6 +874,201 @@ class WarmupDecayLR(WarmupLR):
               f'lr={self.get_lr()}')
 
 
+class AnnealingLR(object):
+    """Anneals the learning rate from start_lr through a warmup phase then decays.
+
+    Ported from Megatron-LM commit b6e0377b (refactored learning-rate) and fused
+    with the checkpoint-resume contract established by WarmupDecayLR in this file.
+
+    Key differences from the Megatron original (20% adaptation):
+      - Backed by DeepSpeed's update_lr / get_torch_optimizer helpers so it plugs
+        into the same optimizer-wrapping infrastructure used by WarmupDecayLR.
+      - state_dict / load_state_dict follow the WarmupDecayLR._check_and_resume_
+        pattern: hyper-params are cross-validated on reload, not blindly overwritten.
+      - Diagnostic prints mirror the [WarmupDecayLR] / [WarmupCosineLR] format so
+        all schedule events appear in a consistent log stream.
+
+    Knuth double critique of the Megatron original:
+      (1) The class stored `num_iters = last_iter` and immediately called
+          `self.step(self.num_iters)`, meaning iteration 0 produced a non-zero LR
+          on the very first forward pass — a subtle off-by-one whose effect on the
+          first gradient update was never documented or intended.
+      (2) `state_dict` persisted only `num_iters`; resuming a run with a different
+          `decay_style` or `end_iter` silently continued with stale schedule config,
+          making "change the schedule at resume time" invisibly broken.
+
+    Args:
+        optimizer: Wrapped optimizer (may be a DeepSpeed wrapper).
+        start_lr (float): Peak learning rate after warmup.
+        warmup_iter (int): Number of warmup steps (linear ramp from 0 to start_lr).
+        total_iters (int): Total training iterations; must be > 0.
+        decay_style (str): One of 'linear', 'cosine', 'exponential', 'constant'.
+        last_iter (int): Step count to initialise from (0 for a fresh run).
+        min_lr (float): Absolute LR floor applied during decay. Default: 0.0.
+        use_checkpoint_lr_scheduler (bool): Load hyper-params from checkpoint on
+            resume; log a warning on mismatch. Default: True.
+        override_lr_scheduler (bool): Class-init values win over the checkpoint's
+            saved hyper-params. Mutually exclusive with use_checkpoint_lr_scheduler.
+            Default: False.
+    """
+
+    DECAY_STYLES = ('linear', 'cosine', 'exponential', 'constant')
+
+    def __init__(self,
+                 optimizer,
+                 start_lr: float,
+                 warmup_iter: int,
+                 total_iters: int,
+                 decay_style: str,
+                 last_iter: int,
+                 min_lr: float = 0.0,
+                 use_checkpoint_lr_scheduler: bool = True,
+                 override_lr_scheduler: bool = False):
+
+        self.optimizer = get_torch_optimizer(optimizer)
+        self.start_lr = start_lr
+        self.min_lr = min_lr
+        self.warmup_iter = warmup_iter
+        self.end_iter = total_iters
+        assert self.end_iter > 0, 'AnnealingLR: total_iters must be > 0'
+        # Normalise decay_style to lower-case; keep original for error messages.
+        raw_style = decay_style.lower() if isinstance(decay_style, str) else 'constant'
+        if raw_style not in self.DECAY_STYLES:
+            logger.warning(
+                f'[AnnealingLR] unknown decay_style "{decay_style}"; '
+                f'falling back to "constant". Valid: {self.DECAY_STYLES}')
+            raw_style = 'constant'
+        self.decay_style = raw_style
+        self.override_lr_scheduler = override_lr_scheduler
+        self.use_checkpoint_lr_scheduler = use_checkpoint_lr_scheduler
+        if self.override_lr_scheduler:
+            assert not self.use_checkpoint_lr_scheduler, (
+                'AnnealingLR: override_lr_scheduler and use_checkpoint_lr_scheduler '
+                'are mutually exclusive — set at most one.')
+
+        # Initialise iteration counter then snap LR to the formula (Megatron pattern).
+        self.num_iters = last_iter
+        self.step(self.num_iters)
+
+        print(
+            f'[AnnealingLR] init: decay_style={self.decay_style} '
+            f'start_lr={start_lr} warmup_iter={warmup_iter} total_iters={total_iters} '
+            f'min_lr={min_lr} last_iter={last_iter} '
+            f'use_ckpt_lr={use_checkpoint_lr_scheduler} override_lr={override_lr_scheduler}'
+        )
+
+    # ------------------------------------------------------------------
+    # Core schedule formula (Megatron b6e0377b, §4 of the BJYwwY9ll paper)
+    # ------------------------------------------------------------------
+
+    def get_lr(self):
+        """Return the current scalar learning rate according to the schedule.
+
+        Ref: https://openreview.net/pdf?id=BJYwwY9ll pg. 4
+        """
+        num_iters_ = min(self.num_iters, self.end_iter - self.warmup_iter)
+        # Warmup ramp: linear from 0 → start_lr over warmup_iter steps.
+        if self.warmup_iter > 0 and self.num_iters <= self.warmup_iter:
+            return float(self.start_lr) * num_iters_ / self.warmup_iter
+
+        num_iters_ = num_iters_ - self.warmup_iter
+        if self.decay_style == 'linear':
+            lr = self.start_lr * (self.end_iter - num_iters_) / self.end_iter
+        elif self.decay_style == 'cosine':
+            lr = self.start_lr / 2.0 * (
+                math.cos(math.pi * num_iters_ / self.end_iter) + 1)
+        elif self.decay_style == 'exponential':
+            # exp(-0.693) ≈ 1/2 — halves every end_iter steps
+            lr = self.start_lr * math.exp(-0.693 * num_iters_ / self.end_iter)
+        else:
+            # 'constant' — frozen at start_lr after warmup
+            lr = self.start_lr
+        return max(lr, self.min_lr)
+
+    # ------------------------------------------------------------------
+    # Step / optimizer update
+    # ------------------------------------------------------------------
+
+    def step(self, step_num=None):
+        """Advance the schedule and push the new LR into all optimizer param groups."""
+        if step_num is None:
+            step_num = self.num_iters + 1
+        self.num_iters = step_num
+        new_lr = self.get_lr()
+        # Reuse DeepSpeed's update_lr helper so Tensor-LR param groups work correctly.
+        self._last_lr = update_lr(self.optimizer.param_groups, [new_lr] * len(self.optimizer.param_groups))
+
+    def get_last_lr(self):
+        """Return last LR set by step(); raises if step() has not been called."""
+        assert getattr(self, '_last_lr', None) is not None, \
+            '[AnnealingLR] get_last_lr() called before step()'
+        return self._last_lr
+
+    # ------------------------------------------------------------------
+    # Checkpoint serialisation (fused from WarmupDecayLR, M463)
+    # ------------------------------------------------------------------
+
+    def state_dict(self):
+        """Persist both the iteration counter and the schedule hyper-params.
+
+        Rationale: the Megatron original saved only num_iters, so resuming with a
+        different decay_style or end_iter was silently broken — the schedule would
+        continue with the class-init values while load_state_dict quietly ignored
+        the mismatch.  Saving hyper-params here enables _check_and_resume_ to
+        surface that confusion.
+        """
+        return {
+            'num_iters': self.num_iters,
+            'start_lr': self.start_lr,
+            'min_lr': self.min_lr,
+            'warmup_iter': self.warmup_iter,
+            'end_iter': self.end_iter,
+            'decay_style': self.decay_style,
+        }
+
+    def _check_and_resume_(self, cls_value, sd_value, name):
+        """Resolve a single hyper-param between class-init and checkpoint values.
+
+        Mirrors WarmupDecayLR._check_and_resume_: if override_lr_scheduler is set
+        the class-init value wins; otherwise the checkpoint value wins and any
+        discrepancy is surfaced as a warning rather than silently discarded.
+        """
+        if self.override_lr_scheduler:
+            print(f'[AnnealingLR] override: keeping class value {name}={cls_value} '
+                  f'(checkpoint had {sd_value})')
+            return cls_value
+        if cls_value != sd_value:
+            logger.warning(
+                f'[AnnealingLR] {name}: class value {cls_value} != checkpoint value '
+                f'{sd_value}; adopting checkpoint value. '
+                f'Pass override_lr_scheduler=True to use class value instead.')
+        print(f'[AnnealingLR] resume: {name}={sd_value} (from checkpoint)')
+        return sd_value
+
+    def load_state_dict(self, sd):
+        """Restore schedule state from a checkpoint.
+
+        Hyper-params (start_lr, min_lr, warmup_iter, end_iter, decay_style) are
+        cross-validated through _check_and_resume_ before being applied; the
+        iteration counter is always taken from the checkpoint.  After restoring
+        all fields, step() is called to snap the LR into the optimizer — matching
+        the Megatron __init__ pattern and ensuring the first training step after
+        resume uses a formula-derived LR rather than a potentially stale float.
+        """
+        for attr in ('start_lr', 'min_lr', 'warmup_iter', 'end_iter', 'decay_style'):
+            if attr in sd:
+                setattr(self, attr,
+                        self._check_and_resume_(getattr(self, attr), sd[attr], attr))
+        # Always trust the checkpoint's iteration counter.
+        self.num_iters = sd['num_iters']
+        # Re-snap LR to formula at the restored iteration (Megatron b6e0377b discipline).
+        self.step(self.num_iters)
+        print(
+            f'[AnnealingLR] load_state_dict: resumed at iter={self.num_iters} '
+            f'lr={self.get_lr():.6e} decay_style={self.decay_style}'
+        )
+
+
 class WarmupCosineLR(object):
     """Increase the learning rate of each parameter group from min lr ratio to max lr
         ratio over warmup_num_steps steps, then decay at cosine rate over the remaining
