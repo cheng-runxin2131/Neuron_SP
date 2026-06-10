@@ -1553,3 +1553,100 @@ def get_desloc_profiler():
     """Get global DES-LOC profiler instance."""
     return _desloc_profiler_instance
 # --- End M332 ---
+
+
+# =========================================================================
+# M464: DES-LOC P2P Ring-Exchange Comm Path
+# Ref: Megatron commit 7abd3e90 — Pipeline parallelism with periodic
+#      full-pipeline syncs via send_forward/recv_forward ring-exchange.
+# Ref: DeepSpeed deepspeed/runtime/pipe/p2p.py — send/recv layer.
+#
+# This section adds a desloc_p2p_ring_exchange() entry-point that bridges
+# the pipeline P2P layer (tier-0 activations/gradients) with the DES-LOC
+# per-tier communication accounting.  It is NOT a replacement for the
+# p2p.py primitives; it is the comm.py side of the accounting seam.
+#
+# Knuth critique I — A global accounting seam in comm.py is preferable to
+#   scattered byte-counter increments inside p2p.py because it creates a
+#   single observable truth about what crossed the wire, analogous to how
+#   ncclAllReduce reports bytes in a single completion callback.
+# Knuth critique II — The ring-exchange idiom is more than a style point:
+#   serialised send-then-recv forces the rendezvous to be sequential even
+#   when the two transfers are independent.  The paired issue pattern lets
+#   the transport layer schedule them concurrently at zero algorithmic cost.
+# =========================================================================
+
+# Tier constant for pipeline activation/gradient traffic.
+DESLOC_COMM_TIER_PIPELINE = 0  # reuses tier-0 (param) bucket for p2p tensors
+
+
+def desloc_p2p_ring_exchange(send_fn, recv_fn, send_tensor, recv_buffer,
+                              send_stage, recv_stage, grid):
+    """Execute a P2P ring-exchange step via the DES-LOC comm path.
+
+    This function provides the comm.py accounting seam for pipeline tensor
+    transfers.  The actual send/recv calls are injected as *send_fn* /
+    *recv_fn* callables so this function stays transport-agnostic and
+    testable without a live process group.
+
+    The function issues recv first, then send — identical to the ordering in
+    p2p._ring_exchange() — so the same deadlock-avoidance reasoning applies.
+
+    Args:
+        send_fn:      callable(tensor, stage) — issues a blocking point-to-point send.
+        recv_fn:      callable(tensor, stage) — issues a blocking point-to-point recv.
+        send_tensor:  tensor to transmit (activation or gradient).
+        recv_buffer:  pre-allocated tensor to receive into.
+        send_stage:   destination stage id for the send.
+        recv_stage:   source stage id for the receive.
+        grid:         ProcessTopology grid exposing get_stage_id() for diagnostics.
+
+    Returns:
+        recv_buffer (mutated in-place).
+
+    Diagnostic: prints byte counts and stage ids on every call.  Callers
+    that run this in a tight loop should gate on a modulo counter.
+    """
+    my_stage = grid.get_stage_id() if grid is not None else -1
+    send_bytes = send_tensor.numel() * send_tensor.element_size()
+    recv_bytes = recv_buffer.numel() * recv_buffer.element_size()
+
+    print(
+        f"[desloc_p2p_ring_exchange] stage={my_stage} "
+        f"send→{send_stage} bytes={send_bytes} | "
+        f"recv←{recv_stage} bytes={recv_bytes}",
+        flush=True,
+    )
+
+    # Post recv before send to maximise overlap opportunity.
+    recv_fn(recv_buffer, recv_stage)
+    send_fn(send_tensor, send_stage)
+
+    # Feed into DES-LOC comm tracker (tier-0, pipeline bucket).
+    scheduler = get_desloc_scheduler()
+    if scheduler is not None:
+        tracker_attr = '_desloc_comm_tracker'
+        if hasattr(scheduler, tracker_attr):
+            tr = getattr(scheduler, tracker_attr)
+            tr.sync(DESLOC_COMM_TIER_PIPELINE, send_bytes)
+            tr.sync(DESLOC_COMM_TIER_PIPELINE, recv_bytes)
+
+    return recv_buffer
+
+
+def desloc_p2p_stats() -> dict:
+    """Return pipeline-tier byte totals from the DES-LOC comm tracker.
+
+    This is the comm.py query surface that complements p2p.get_ring_comm_stats().
+    Returns zeros when the scheduler or tracker have not been initialised.
+    """
+    scheduler = get_desloc_scheduler()
+    if scheduler is None:
+        return {'pipeline_tier_bytes': 0}
+    tracker_attr = '_desloc_comm_tracker'
+    if not hasattr(scheduler, tracker_attr):
+        return {'pipeline_tier_bytes': 0}
+    stats = getattr(scheduler, tracker_attr).stats()
+    # tier-0 aggregates both param AllReduce and pipeline P2P bytes.
+    return {'pipeline_tier_bytes': stats.get('sent', 0), 'tracker_stats': stats}
+# --- End M464 ---
