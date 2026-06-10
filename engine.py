@@ -4349,6 +4349,18 @@ class DeepSpeedEngine(Module):
         if self.load_universal_checkpoint() and not self.zero_optimization_partition_weights():
             self.optimizer.update_lp_params()
 
+        # M452: restore DES-LOC scheduler state from checkpoint if present.
+        # desloc_load_checkpoint() is a no-op when desloc_enabled is False or
+        # when the checkpoint predates M452 (missing 'desloc_state' key).
+        if self.desloc_enabled and client_states is not None:
+            desloc_sd = client_states.get('desloc_state', None)
+            if desloc_sd:
+                self.desloc_load_checkpoint(desloc_sd)
+                print(f"[M452] desloc_checkpoint_state restored: step={self.desloc_step} "
+                      f"Kx={self.desloc_Kx} Ku={self.desloc_Ku} Kv={self.desloc_Kv}")
+            else:
+                print("[M452] no desloc_state in checkpoint — desloc_step stays at 0")
+
         return load_path, client_states
 
     def _load_checkpoint(self,
@@ -4854,11 +4866,26 @@ class DeepSpeedEngine(Module):
             self.checkpoint_engine.save(saveable_state_dict, save_path)
 
     def _create_checkpoint_file(self, save_dir, tag, zero_checkpoint):
+        # M452: Megatron 0399d32c (fixed save race condition) — original bug used
+        # get_rank() > 1, which allowed rank-1 to race into makedirs alongside rank-0,
+        # corrupting the directory on shared filesystems.  Correct guard is > 0: only
+        # rank-0 creates the checkpoint subdirectory; all other ranks wait at the barrier.
+        # Knuth critique (user bug): the off-by-one (>1 vs >0) is a classic fence-post
+        # error — rank 1 falls through the guard and competes with rank 0.
+        # Knuth critique (system impact): on Lustre/NFS, concurrent mkdir for the same
+        # path can raise EEXIST or silently produce an incomplete directory entry,
+        # breaking every rank's subsequent save even when exist_ok=True is set.
         name_function = (self._get_zero_ckpt_name if zero_checkpoint else self._get_ckpt_name)
         try:
             checkpoint_name = name_function(save_dir, tag)
             path = os.path.dirname(checkpoint_name)
-            self.checkpoint_engine.makedirs(path, exist_ok=True)
+            # Only global rank-0 creates the directory; all ranks synchronise after.
+            if not (torch.distributed.is_initialized() and
+                    torch.distributed.get_rank() > 0):
+                print(f"[M452] rank-0 makedirs: {path}")
+                self.checkpoint_engine.makedirs(path, exist_ok=True)
+            if torch.distributed.is_initialized():
+                dist.barrier()
         except Exception:
             logger.error(f"Failed saving model checkpoint to {save_dir} with tag {tag}")
             return False
@@ -4915,6 +4942,21 @@ class DeepSpeedEngine(Module):
         if autotp_uc_info is not None:
             state[UNIVERSAL_CHECKPOINT_INFO] = autotp_uc_info
         state.update(client_state)
+
+        # M452: persist DES-LOC scheduler state (step, Kx/Ku/Kv) alongside the
+        # DeepSpeed checkpoint so that desloc_load_checkpoint() can restore it on
+        # resume without needing a separate sidecar file.
+        # Knuth critique (user bug): without this, desloc_step resets to 0 on every
+        # resume, causing the Kx/Ku/Kv sync schedule to restart — effectively
+        # wasting the communication-reduction benefit accumulated so far.
+        # Knuth critique (system impact): a mismatched desloc_step after resume shifts
+        # all tier sync boundaries, producing silent gradient staleness that cannot be
+        # diagnosed from loss curves alone.
+        if self.desloc_enabled:
+            state['desloc_state'] = self.desloc_checkpoint_state()
+            print(f"[M452] desloc_checkpoint_state saved: step={self.desloc_step} "
+                  f"Kx={self.desloc_Kx} Ku={self.desloc_Ku} Kv={self.desloc_Kv}")
+
         log_dist(message=f'Saving model checkpoint: {save_path}', ranks=[0])
 
         if self.save_non_zero_checkpoint:
