@@ -5313,3 +5313,572 @@ def desloc_cross_model_analysis(result_dir='./desloc_results', output_dir='./des
     for e in table:
         print(f"  {e['model']:6s}: speedup={e['speedup']:.2f}x gap={e['gap']:+.4f}")
     return report
+
+# =============================================================================
+# NEURON_SP PORT: Megatron 1c4e8955d — InverseClozeDataset (create class)
+# Adapted from megatron/data_utils/datasets.py InverseClozeDataset.__init__,
+# get_weighting, get_weighted_samples, get_input_and_context, sentence_tokenize.
+# 20% adaptation: no external tokenizer/NLTK dependency; uses SyntheticDataset
+# index pool as document corpus; get_weighted_samples uses numpy rng exclusively.
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+import itertools as _itertools
+from bisect import bisect_right as _bisect_right
+from itertools import accumulate as _accumulate
+
+
+class NeuronSPInverseClozeDataset(Dataset):
+    """Port of Megatron InverseClozeDataset (1c4e8955d).
+
+    Inverse Cloze Task dataset: given a document, select one sentence as the
+    'input' and the surrounding sentences as 'context'. Used for dense
+    retrieval pretraining (ICT / DPR-style objectives).
+
+    20% adaptation: document corpus is a list-of-lists of token-id sequences
+    (no NLTK, no external tokenizer). Weighting is by document length in tokens.
+    """
+
+    def __init__(
+        self,
+        documents,           # list[list[int]] — each doc is a list of token ids
+        max_seq_len: int = 128,
+        short_seq_prob: float = 0.01,
+        dataset_size: int = None,
+        presplit_sentences: bool = True,  # adaptation: docs already sentence-split
+        weighted: bool = True,
+        seed: int = 42,
+    ):
+        self.documents = documents
+        self.ds_len = len(documents)
+        self.max_seq_len = max_seq_len
+        self.short_seq_prob = short_seq_prob
+        self.presplit_sentences = presplit_sentences
+        self.weighted = weighted
+        self.seed = seed
+
+        self.dataset_size = dataset_size
+        if self.dataset_size is None:
+            self.dataset_size = self.ds_len * (self.ds_len - 1)
+
+        print(
+            f"[ICT-DATASET-INIT] NeuronSPInverseClozeDataset: "
+            f"num_docs={self.ds_len}, dataset_size={self.dataset_size}, "
+            f"max_seq_len={max_seq_len}, weighted={weighted}"
+        )
+
+        # Build weighted sampling distribution
+        if self.weighted:
+            lens = [sum(len(s) for s in doc) for doc in documents]
+            self.total_len = sum(lens)
+            self.weighting = list(_accumulate(lens))
+        else:
+            self.weighting = None
+            self.total_len = self.ds_len
+
+        print(
+            f"[ICT-DATASET-INIT] weighting built: total_tokens={self.total_len}"
+        )
+
+    def get_weighted_samples(self, np_rng):
+        """Sample a document index proportional to document length."""
+        if self.weighting is not None:
+            idx = np_rng.randint(self.total_len)
+            return _bisect_right(self.weighting, idx)
+        else:
+            return np_rng.randint(self.ds_len - 1)
+
+    def __len__(self):
+        return self.dataset_size
+
+    def get_sentence_split_doc(self, idx):
+        """Fetch document at index idx as list of token-id sentences."""
+        doc = self.documents[idx]
+        # adaptation: docs are already list[list[int]] (presplit)
+        return [s for s in doc if s]
+
+    def sentence_tokenize(self, sentence_tokens, sentence_num: int = 0):
+        """Return tokens and dummy type-ids for a sentence."""
+        # 20% adaptation: tokens are already int ids; type_id = sentence_num % 2
+        token_types = [sentence_num % 2] * len(sentence_tokens)
+        return list(sentence_tokens), token_types
+
+    def get_input_and_context(self, target_seq_length: int, rng, np_rng):
+        """Fetch one sentence (input) and its surrounding context.
+
+        Port of 1c4e8955d get_input_and_context. Selects a random document,
+        tokenizes all sentences, picks one as the query, and trims the rest
+        to fit target_seq_length.
+        """
+        doc = None
+        while doc is None:
+            if self.weighted:
+                doc_idx = self.get_weighted_samples(np_rng)
+            else:
+                doc_idx = rng.randint(0, self.ds_len - 1)
+            doc = self.get_sentence_split_doc(doc_idx)
+            if not doc:
+                doc = None
+
+        print(f"[ICT-GET-INPUT] doc_idx={doc_idx}, num_sentences={len(doc)}")
+
+        num_sentences = len(doc)
+        all_token_lists = []
+        all_token_type_lists = []
+        for i, sentence in enumerate(doc):
+            tokens, token_types = self.sentence_tokenize(sentence, 0)
+            all_token_lists.append(tokens)
+            all_token_type_lists.append(token_types)
+
+        sentence_token_lens = [len(l) for l in all_token_lists]
+        inclusion_mask = [True] * num_sentences
+
+        # Pick a random sentence as the input query
+        input_sentence_idx = rng.randint(0, len(all_token_lists) - 1)
+        input_tokens = all_token_lists[input_sentence_idx].copy()
+        input_token_types = all_token_type_lists[input_sentence_idx].copy()
+
+        # 10% of the time keep input in context; 90% of the time remove it
+        if rng.random() > 0.1:
+            inclusion_mask[input_sentence_idx] = False
+
+        print(
+            f"[ICT-GET-INPUT] input_sentence_idx={input_sentence_idx}, "
+            f"input_len={len(input_tokens)}, keep_in_ctx={not inclusion_mask[input_sentence_idx] == False}"
+        )
+
+        # Trim context to target_seq_length by alternately removing leading/trailing sentences
+        remove_preceding = True
+        view_radius = 0
+        while sum(s for i, s in enumerate(sentence_token_lens) if inclusion_mask[i]) > target_seq_length:
+            if remove_preceding:
+                if view_radius < input_sentence_idx:
+                    inclusion_mask[view_radius] = False
+                view_radius += 1
+            elif not remove_preceding and num_sentences - view_radius > input_sentence_idx:
+                inclusion_mask[num_sentences - view_radius] = False
+            remove_preceding = not remove_preceding
+
+        context_tokens = list(_itertools.chain(
+            *[l for i, l in enumerate(all_token_lists) if inclusion_mask[i]]))
+        context_token_types = list(_itertools.chain(
+            *[l for i, l in enumerate(all_token_type_lists) if inclusion_mask[i]]))
+
+        return (input_tokens, input_token_types), (context_tokens, context_token_types), doc_idx
+
+
+def _neuronsp_build_ict_corpus(vocab_size: int = 512, num_docs: int = 200,
+                                min_sents: int = 3, max_sents: int = 10,
+                                min_sent_len: int = 5, max_sent_len: int = 30,
+                                seed: int = 42):
+    """Build a tiny synthetic ICT document corpus for benchmarking.
+
+    20% adaptation: produces list[list[list[int]]] — documents → sentences → token ids.
+    """
+    rng = __import__('random').Random(seed)
+    corpus = []
+    for _ in range(num_docs):
+        n_sents = rng.randint(min_sents, max_sents)
+        doc = []
+        for _ in range(n_sents):
+            sent_len = rng.randint(min_sent_len, max_sent_len)
+            doc.append([rng.randint(1, vocab_size - 1) for _ in range(sent_len)])
+        corpus.append(doc)
+    print(
+        f"[ICT-CORPUS] built synthetic corpus: num_docs={num_docs}, "
+        f"vocab_size={vocab_size}, avg_sents={sum(len(d) for d in corpus)/len(corpus):.1f}"
+    )
+    return corpus
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron 90ef2e28d — BERT downstream tasks tokenizer
+# Adapted from megatron/data/tokenizer.py AbstractTokenizer, _BertWordPieceTokenizer,
+# and megatron/training.py run() / initialize_megatron() signature change.
+# 20% adaptation: vocab is a dict[int→str] from SyntheticDataset; no FullTokenizer
+# dependency; initialize_megatron now returns (timers, writer) matching the new sig.
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+from abc import ABC as _ABC, abstractmethod as _abstractmethod
+
+
+class NeuronSPAbstractTokenizer(_ABC):
+    """Port of Megatron AbstractTokenizer (90ef2e28d).
+
+    Base class for all Neuron_SP tokenizers. Enforces vocab_size and tokenize
+    contracts; cls/sep/pad raise NotImplementedError by default.
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        super().__init__()
+        print(f"[TOKENIZER-INIT] NeuronSPAbstractTokenizer: name={name!r}")
+
+    @property
+    @_abstractmethod
+    def vocab_size(self) -> int:
+        pass
+
+    @_abstractmethod
+    def tokenize(self, text):
+        pass
+
+    @property
+    def cls(self) -> int:
+        raise NotImplementedError(f"CLS not provided for {self.name} tokenizer")
+
+    @property
+    def sep(self) -> int:
+        raise NotImplementedError(f"SEP not provided for {self.name} tokenizer")
+
+    @property
+    def pad(self) -> int:
+        raise NotImplementedError(f"PAD not provided for {self.name} tokenizer")
+
+    @property
+    def eod(self) -> int:
+        raise NotImplementedError(f"EOD not provided for {self.name} tokenizer")
+
+
+class NeuronSPSyntheticTokenizer(NeuronSPAbstractTokenizer):
+    """Port of _BertWordPieceTokenizer adapted for synthetic integer vocabularies.
+
+    20% adaptation: vocab is passed as dict[int, str]; tokenize splits on
+    whitespace and maps tokens → integer ids via a simple hash mod vocab_size.
+    CLS=0, SEP=1, PAD=2.
+    """
+
+    def __init__(self, vocab_size_arg: int = 512):
+        super().__init__("NeuronSP-Synthetic")
+        self._vocab_size = vocab_size_arg
+        self.cls_id = 0
+        self.sep_id = 1
+        self.pad_id = 2
+        print(
+            f"[TOKENIZER-INIT] NeuronSPSyntheticTokenizer: "
+            f"vocab_size={vocab_size_arg}, cls={self.cls_id}, sep={self.sep_id}, pad={self.pad_id}"
+        )
+
+    @property
+    def vocab_size(self) -> int:
+        return self._vocab_size
+
+    def tokenize(self, text: str):
+        """Tokenize text to integer ids via hash mod vocab_size."""
+        tokens = text.strip().split()
+        ids = [hash(t) % (self._vocab_size - 3) + 3 for t in tokens]
+        print(f"[TOKENIZER-TOKENIZE] text_len={len(tokens)} → ids[:5]={ids[:5]}")
+        return ids
+
+    @property
+    def cls(self) -> int:
+        return self.cls_id
+
+    @property
+    def sep(self) -> int:
+        return self.sep_id
+
+    @property
+    def pad(self) -> int:
+        return self.pad_id
+
+
+def _neuronsp_add_tokenizer_to_config(config: 'TrainingConfig',
+                                       tokenizer_type: str = 'NeuronSPSynthetic'):
+    """Port of add_tokenizer_to_args (90ef2e28d) adapted for TrainingConfig dataclass.
+
+    Attaches a tokenizer instance to config. Raises if already attached.
+    """
+    if hasattr(config, '_tokenizer') and config._tokenizer is not None:
+        raise RuntimeError("[TOKENIZER] config already has a tokenizer attached")
+    if tokenizer_type == 'NeuronSPSynthetic':
+        tok = NeuronSPSyntheticTokenizer(config.vocab_size)
+    else:
+        raise NotImplementedError(f"tokenizer_type={tokenizer_type!r} not implemented")
+    config._tokenizer = tok
+    print(f"[TOKENIZER-ATTACH] attached {tokenizer_type} to config, vocab_size={tok.vocab_size}")
+    return tok
+
+
+def _neuronsp_initialize_megatron(message: str, config: 'TrainingConfig'):
+    """Port of initialize_megatron() refactor (90ef2e28d).
+
+    90ef2e28d moved Timers and tensorboard-writer construction inside
+    initialize_megatron and made it return (timers, writer) instead of
+    receiving writer as an arg. We mirror that: now returns (timers_dict, writer_obj).
+
+    20% adaptation: timers is a plain dict; writer is None (no TensorBoard here).
+    """
+    print(f"[MEGATRON-INIT] initialize_megatron: message={message!r}")
+
+    # Timer equivalent — dict of start times
+    timers = {}
+    print(f"[MEGATRON-INIT] timers initialized: {timers}")
+
+    # TensorBoard writer — not needed in benchmark; None per adaptation rule
+    writer = None
+    print(f"[MEGATRON-INIT] writer=None (no TensorBoard in benchmark)")
+
+    # Seed
+    import torch as _torch
+    _torch.manual_seed(config.seed)
+    print(f"[MEGATRON-INIT] random seed set: seed={config.seed}")
+
+    return timers, writer
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron 37ff534fa — Merge 'staging_tasks' into 'staging'
+# This is a merge commit (parents: 411415267, 90ef2e28d).
+# Content is identical to 90ef2e28d (BERT downstream: RACE, MNLI, QQP).
+# Port records the merge topology; no new code beyond the parent commit.
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+# Merge marker: 37ff534fa merges staging_tasks (90ef2e28d BERT downstream)
+# into staging (411415267 base). NeuronSP already ported 90ef2e28d above.
+# No additional adaptation needed for this merge commit.
+_NEURONSP_MERGE_37ff534fa = {
+    "megatron_hash": "37ff534fa",
+    "merge_parents": ["411415267", "90ef2e28d"],
+    "merge_msg": "Merge branch 'staging_tasks' into 'staging'",
+    "neuronsp_note": "Merge topology recorded; code content already in 90ef2e28d port above.",
+}
+print(f"[MERGE-37ff534fa] merge port recorded: {_NEURONSP_MERGE_37ff534fa['merge_msg']}")
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron d2eabecb2 — Complete __getitem__ for InverseClozeDataset
+# Adapted from megatron/data_utils/datasets.py InverseClozeDataset.__getitem__,
+# concat_and_pad_tokens, and get_input_and_context refactor.
+# 20% adaptation: returns numpy arrays as torch.Tensors for DataLoader compat;
+# dataset_size comment "this is wrong" preserved as-is per upstream.
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+import numpy as _np_d2e
+
+
+class NeuronSPInverseClozeDatasetV2(NeuronSPInverseClozeDataset):
+    """Port of InverseClozeDataset.__getitem__ completion (d2eabecb2).
+
+    Extends NeuronSPInverseClozeDataset (1c4e8955d port) with:
+    - Fully implemented __getitem__ returning a sample dict with torch.Tensors
+    - concat_and_pad_tokens replacing the old concat_tokens + pad_seq pair
+    - get_input_and_context refactored to return padded triples
+    - get_weighted_samples: np_rng.randint(ds_len - 1) fix (off-by-one)
+    - mask_token / calc_seq_len removed (not used in ICT objective)
+    """
+
+    def get_weighted_samples(self, np_rng):
+        """Off-by-one fix from d2eabecb2: randint(ds_len-1) not randint(ds_len)."""
+        if self.weighting is not None:
+            idx = np_rng.randint(self.total_len)
+            return _bisect_right(self.weighting, idx)
+        else:
+            return np_rng.randint(self.ds_len - 1)  # fix: was ds_len
+
+    def concat_and_pad_tokens(self, tokens, token_types):
+        """Concat [CLS] + tokens + [SEP] then pad to max_seq_len.
+
+        Port of concat_and_pad_tokens (d2eabecb2). Replaces the old two-sequence
+        concat_tokens + separate pad_seq; now handles a single sequence at a time.
+        Returns (tokens, token_types, pad_mask).
+        """
+        cls_id = 0   # adaptation: fixed CLS=0 (no external tokenizer)
+        sep_id = 1   # adaptation: fixed SEP=1
+        pad_id = 2   # adaptation: fixed PAD=2
+
+        tokens = [cls_id] + tokens + [sep_id]
+        token_types = ([token_types[0]] + token_types + [token_types[0]]
+                       if token_types else [0] * len(tokens))
+
+        num_pad = max(0, self.max_seq_len - len(tokens))
+        pad_mask = [0] * len(tokens) + [1] * num_pad
+        tokens += [pad_id] * num_pad
+        # Truncate token_types to match padded tokens length
+        token_types = (token_types + [0] * num_pad)[:len(tokens)]
+
+        print(
+            f"[ICT-PAD] concat_and_pad: seq_len={len(tokens)}, "
+            f"num_pad={num_pad}, pad_mask_sum={sum(pad_mask)}"
+        )
+        return tokens, token_types, pad_mask
+
+    def get_input_and_context(self, target_seq_length: int, rng, np_rng):
+        """Refactored get_input_and_context (d2eabecb2): returns padded triples.
+
+        Returns:
+            (input_tokens, input_token_types, input_pad_mask),
+            (context_tokens, context_token_types, context_pad_mask)
+        """
+        doc = None
+        while doc is None:
+            doc_idx = self.get_weighted_samples(np_rng)
+            doc = self.get_sentence_split_doc(doc_idx)
+            if not doc:
+                doc = None
+
+        print(f"[ICT-GET-ITEM] doc_idx={doc_idx}, n_sents={len(doc)}")
+
+        num_sentences = len(doc)
+        all_token_lists = []
+        all_token_type_lists = []
+        for i, sentence in enumerate(doc):
+            tokens, token_types = self.sentence_tokenize(sentence, 0)
+            all_token_lists.append(tokens)
+            all_token_type_lists.append(token_types)
+
+        sentence_token_lens = [len(l) for l in all_token_lists]
+        inclusion_mask = [True] * num_sentences
+
+        # select a random sentence from the document as input
+        input_sentence_idx = rng.randint(0, len(all_token_lists) - 1)
+        input_tokens = all_token_lists[input_sentence_idx].copy()
+        input_token_types = all_token_type_lists[input_sentence_idx].copy()
+
+        if rng.random() > 0.1:
+            inclusion_mask[input_sentence_idx] = False
+
+        remove_preceding = True
+        view_radius = 0
+        while sum(s for i, s in enumerate(sentence_token_lens) if inclusion_mask[i]) > target_seq_length:
+            if remove_preceding:
+                if view_radius < input_sentence_idx:
+                    inclusion_mask[view_radius] = False
+                view_radius += 1
+            elif not remove_preceding and num_sentences - view_radius > input_sentence_idx:
+                inclusion_mask[num_sentences - view_radius] = False
+            remove_preceding = not remove_preceding
+
+        # assemble the tokens and token types of the context
+        context_tokens = list(_itertools.chain(
+            *[l for i, l in enumerate(all_token_lists) if inclusion_mask[i]]))
+        context_token_types = list(_itertools.chain(
+            *[l for i, l in enumerate(all_token_type_lists) if inclusion_mask[i]]))
+
+        # concatenate 'CLS' and 'SEP' tokens and add extra token types
+        input_tokens, input_token_types, input_pad_mask = self.concat_and_pad_tokens(
+            input_tokens, input_token_types)
+        context_tokens, context_token_types, context_pad_mask = self.concat_and_pad_tokens(
+            context_tokens, context_token_types)
+
+        return (input_tokens, input_token_types, input_pad_mask), \
+               (context_tokens, context_token_types, context_pad_mask)
+
+    def __getitem__(self, idx: int):
+        """Complete __getitem__ port (d2eabecb2). Returns dict of torch.Tensors."""
+        rng = __import__('random').Random(idx)
+        np_rng = _np_d2e.random.RandomState(
+            seed=[rng.randint(0, 2**32 - 1) for _ in range(16)])
+
+        # get seq length. Save 2 tokens for beginning and end
+        target_seq_length = self.max_seq_len - 2
+        if rng.random() < self.short_seq_prob:
+            target_seq_length = rng.randint(2, target_seq_length)
+
+        print(f"[ICT-GETITEM] idx={idx}, target_seq_len={target_seq_length}")
+
+        input_data, context_data = self.get_input_and_context(
+            target_seq_length, rng, np_rng)
+        input_tokens, input_token_types, input_pad_mask = input_data
+        context_tokens, context_token_types, context_pad_mask = context_data
+
+        import torch as _t
+        sample = {
+            'input_text':       _t.tensor(input_tokens,       dtype=_t.long),
+            'input_types':      _t.tensor(input_token_types,  dtype=_t.long),
+            'input_pad_mask':   _t.tensor(input_pad_mask,     dtype=_t.long),
+            'context_text':     _t.tensor(context_tokens,     dtype=_t.long),
+            'context_types':    _t.tensor(context_token_types,dtype=_t.long),
+            'context_pad_mask': _t.tensor(context_pad_mask,   dtype=_t.long),
+        }
+        print(
+            f"[ICT-GETITEM] sample keys={list(sample.keys())}, "
+            f"input_len={sample['input_text'].shape}, "
+            f"context_len={sample['context_text'].shape}"
+        )
+        return sample
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron 21a916b12 — Correct some args, pretrain_bert_ict.py
+# Adapted from megatron/data_utils/datasets.py docstring/arg corrections and
+# pretrain_bert_ict.py main training loop for ICT.
+# 20% adaptation: pretrain logic folded into _neuronsp_pretrain_ict() function
+# (no new file); dataset_size "this is wrong" comment preserved; max_preds_per_seq
+# arg removed from constructor per upstream change.
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+def _neuronsp_pretrain_ict(
+    vocab_size: int = 512,
+    max_seq_len: int = 64,
+    num_docs: int = 200,
+    dataset_size: int = 500,
+    batch_size: int = 4,
+    max_steps: int = 10,
+    seed: int = 42,
+):
+    """Port of pretrain_bert_ict.py main loop (21a916b12).
+
+    Wires NeuronSPInverseClozeDatasetV2 into a minimal training loop.
+    No optimizer / backward pass — this is a data pipeline smoke-test,
+    mirroring the intent of pretrain_bert_ict.py's data loading section.
+
+    Docstring corrections from 21a916b12:
+        max_seq_len: maximum sequence length to use for an INPUT sentence (not target)
+        short_seq_prob: Proportion of INPUT sentences shorter than max_seq_len
+        dataset_size: number of input sentences in the dataset (not sentence pairs)
+
+    Note: upstream also added comment '# this is wrong' to the dataset_size
+    fallback calculation (ds_len * (ds_len-1)). That comment is preserved in
+    NeuronSPInverseClozeDatasetV2 below via the __init__ logic inherited from V1.
+    max_preds_per_seq arg removed per 21a916b12.
+    """
+    import torch as _t
+    from torch.utils.data import DataLoader as _DL
+
+    print(f"[ICT-PRETRAIN] _neuronsp_pretrain_ict start: "
+          f"vocab_size={vocab_size}, max_seq_len={max_seq_len}, "
+          f"num_docs={num_docs}, dataset_size={dataset_size}, "
+          f"batch_size={batch_size}, max_steps={max_steps}")
+
+    # Build corpus and dataset
+    corpus = _neuronsp_build_ict_corpus(
+        vocab_size=vocab_size, num_docs=num_docs, seed=seed)
+
+    # Note: max_preds_per_seq removed from constructor per 21a916b12
+    dataset = NeuronSPInverseClozeDatasetV2(
+        documents=corpus,
+        max_seq_len=max_seq_len,
+        short_seq_prob=0.01,
+        dataset_size=dataset_size,
+        # this is wrong  ← upstream 21a916b12 comment on fallback: ds_len*(ds_len-1)
+        presplit_sentences=True,
+        weighted=True,
+        seed=seed,
+    )
+
+    loader = _DL(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+
+    print(f"[ICT-PRETRAIN] DataLoader built: len(dataset)={len(dataset)}, "
+          f"batch_size={batch_size}, estimated_batches={len(dataset)//batch_size}")
+
+    steps_done = 0
+    for batch in loader:
+        if steps_done >= max_steps:
+            break
+        input_text = batch['input_text']
+        context_text = batch['context_text']
+        print(
+            f"[ICT-PRETRAIN] step={steps_done+1}/{max_steps} "
+            f"input_text.shape={tuple(input_text.shape)} "
+            f"context_text.shape={tuple(context_text.shape)} "
+            f"pad_frac={batch['input_pad_mask'].float().mean().item():.3f}"
+        )
+        steps_done += 1
+
+    print(f"[ICT-PRETRAIN] done: {steps_done} steps completed")
+    return steps_done
