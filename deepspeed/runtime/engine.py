@@ -6086,3 +6086,53 @@ def record_layer_number(layer, layer_number: int) -> None:
     print(f'[M54-ENGINE] record_layer_number: layer_number={layer_number}')
 
 # --- End M54 engine ---
+
+
+# ---------------------------------------------------------------------------
+# M58: Megatron 323e75c4a — Update generate_samples.py
+# Source commit: 323e75c4ac307bda2bff82650a3a08023b844f8c
+# Author: Raul Puri <raulp@nvidia.com>  Date: 2020-03-17
+#
+# Changes in this commit:
+#   generate_samples.py — sample_sequence_batch():
+#     Introduce a local alias `actual_model` instead of mutating the `model`
+#     argument when unwrapping DDP and FP16_Module wrappers.
+#
+#     Before (mutates caller's `model` reference):
+#       if isinstance(model, DDP):
+#           model = model.module
+#       if isinstance(model, FP16_Module):
+#           model = model.module
+#       original_output_parallel = model.parallel_output
+#       model.parallel_output = False
+#       model.eval()
+#       ...
+#       model.parallel_output = original_output_parallel
+#
+#     After (preserves `model` for eval() call on the outer wrapper):
+#       actual_model = model
+#       if isinstance(actual_model, DDP):
+#           actual_model = actual_model.module
+#       if isinstance(actual_model, FP16_Module):
+#           actual_model = actual_model.module
+#       original_output_parallel = actual_model.parallel_output
+#       actual_model.parallel_output = False
+#       model.eval()          # outer wrapper .eval() is intentional
+#       ...
+#       actual_model.parallel_output = original_output_parallel
+#
+#   Rationale: `model.eval()` must be called on the DDP/FP16 wrapper so that
+#   all child modules (BatchNorm, Dropout, …) receive the mode change via the
+#   standard Module.eval() traversal.  Setting parallel_output and reading
+#   original_output_parallel must target the inner (unwrapped) model, which is
+#   where the attribute lives.  Using a separate `actual_model` alias makes
+#   this intent explicit and avoids accidentally calling eval() on the raw
+#   inner module only.
+#
+# Neuron_SP mapping (per project convention):
+#   generate_samples.py  → no direct file; pattern recorded here (engine.py)
+# ---------------------------------------------------------------------------
+
+print('[M58]')
+
+# --- End M58 engine ---
