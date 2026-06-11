@@ -5901,3 +5901,59 @@ class NeuronSPBertModel(nn.Module):
             self.binary_head.load_state_dict(state_dict[self._binary_head_key], strict=strict)
         elif self.add_ict_head:
             self.ict_head.load_state_dict(state_dict[self._ict_head_key], strict=strict)
+
+
+# =============================================================================
+# PORT: Megatron fd33e9303 — Create ICTBertModel and update model/__init__.py
+# Original: megatron/model/bert_model.py — ICTBertModel wraps two BertModel
+# instances (question_model + evidence_model) sharing all architecture args.
+# megatron/model/__init__.py — exports ICTBertModel alongside BertModel.
+# 20% adaptation: NeuronSPICTBertModel wraps two NeuronSPBertModel instances;
+# __init__.py equivalent is this module's public symbol table (exported below);
+# uses plain nn.Module (no MegatronModule base class).
+# =============================================================================
+
+class NeuronSPICTBertModel(nn.Module):
+    """Neuron_SP port of Megatron ICTBertModel.
+
+    Port of megatron/model/bert_model.py::ICTBertModel (fd33e9303).
+    Wraps two NeuronSPBertModel instances — question_model and evidence_model
+    (renamed context_model in commit 371d2ea9d) — sharing the same architecture
+    hyperparameters. Each encodes one side of the retrieval pair.
+
+    Args:
+        hidden_size: Transformer hidden dimension.
+        vocab_size: Vocabulary size.
+        ict_head_size: Projection head output dimension for ICT scoring.
+        **bert_kwargs: Additional NeuronSPBertModel keyword arguments.
+    """
+
+    def __init__(self,
+                 hidden_size: int,
+                 vocab_size: int,
+                 ict_head_size: int,
+                 **bert_kwargs):
+        super().__init__()
+        bert_args = dict(
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+            add_binary_head=False,
+            ict_head_size=ict_head_size,
+            **bert_kwargs,
+        )
+        # Commit fd33e9303: two BertModel instances sharing architecture args
+        self.question_model = NeuronSPBertModel(**bert_args)
+        self.evidence_model = NeuronSPBertModel(**bert_args)
+        print(f'[NEURONSP-ICT] NeuronSPICTBertModel.__init__: '
+              f'question_model + evidence_model created, '
+              f'ict_head_size={ict_head_size}')
+
+
+# Module-level exports — port of megatron/model/__init__.py fd33e9303 line:
+#   from .bert_model import BertModel, ICTBertModel
+# In Neuron_SP engine.py, the equivalent is:
+_NEURONSP_MODEL_REGISTRY = {
+    'NeuronSPBertModel': NeuronSPBertModel,
+    'NeuronSPICTBertModel': NeuronSPICTBertModel,
+}
+print(f'[NEURONSP-ICT] model registry updated: {list(_NEURONSP_MODEL_REGISTRY.keys())}')
