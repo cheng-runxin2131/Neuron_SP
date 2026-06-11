@@ -748,3 +748,70 @@ def _m56_forward_step_sop(lm_logits, sop_logits, lm_labels, loss_mask, sentence_
 
     return loss, {'lm loss': reduced_losses[0], 'sop loss': reduced_losses[1]}
 # --- End M56 dataloader ---
+
+
+# ---------------------------------------------------------------------------
+# M59: Megatron 57f4a8a9b — Remove unused code
+# Ported from: megatron/data_utils/datasets.py
+#
+# Key changes carried over:
+#   1. json_dataset.__init__: removed binarize_sent parameter and the
+#      corresponding `if binarize_sent: self.Y = binarize_labels(...)` block.
+#      binarize_sent was unused — no caller passed it as True.
+#   2. Blank line before GPT2Dataset class (whitespace cleanup upstream).
+#   3. bert_sentencepair_dataset.__getitem__: removed short_seq = False and
+#      short_seq = True — the short_seq variable was set but never read, so
+#      it had no effect on model behaviour.
+# ---------------------------------------------------------------------------
+
+print('[M59]')
+
+
+def _m59_json_dataset_init(path, tokenizer, preprocess_fn,
+                            text_key, label_key, loose_json):
+    """Megatron 57f4a8a9b — json_dataset.__init__ without binarize_sent.
+
+    binarize_sent was removed because no caller ever passed it as True;
+    carrying a dead parameter and a dead binarize_labels() call served only
+    to confuse readers about what post-processing was applied to labels.
+
+    Returns (X, Y) lists populated from the JSON stream at path.
+    """
+    import json
+
+    X = []
+    Y = []
+
+    def load_json_stream(p):
+        with open(p) as f:
+            if loose_json:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        yield json.loads(line)
+            else:
+                data = json.load(f)
+                for item in data:
+                    yield item
+
+    for j in load_json_stream(path):
+        X.append(j[text_key])
+        Y.append(j[label_key])
+
+    return X, Y
+
+
+def _m59_bert_sentencepair_get_target_seq_length(rng, max_seq_len, short_seq_prob):
+    """Megatron 57f4a8a9b — target_seq_length selection without short_seq flag.
+
+    short_seq = False / short_seq = True were set in the original
+    __getitem__ but short_seq was never consumed downstream — removing
+    these assignments has no effect on sampling behaviour.
+
+    Returns target_seq_length only (short_seq flag dropped entirely).
+    """
+    target_seq_length = max_seq_len
+    if rng.random() < short_seq_prob:
+        target_seq_length = rng.randint(2, target_seq_length)
+    return target_seq_length
+# --- End M59 dataloader ---
