@@ -5797,3 +5797,107 @@ def desloc_scl_fit(hist, mp=5):
     my = sy / n; st = sum((y - my) ** 2 for y in ll); sr = sum((ll[i] - (ic + sl * lc[i])) ** 2 for i in range(n))
     return {'a': round(math.exp(ic), 6), 'b': round(-sl, 6), 'r2': round(1 - sr / max(1e-12, st), 6)}
 # --- End M303 ---
+
+# =============================================================================
+# PORT: Megatron bcb320eee — Add ICT-related parameters to BertModel
+# Original: megatron/model/bert_model.py — add ict_head_size param, add_ict_head
+# flag, and add_pooler logic; also add_binary_head and add_ict_head are mutually
+# exclusive.
+# 20% adaptation: BertModel renamed NeuronSPBertModel; uses nn.Linear instead of
+# megatron get_linear_layer; no language_model (mpu) dependency — this is a
+# standalone adapter class for DeepSpeed engine-side model registration.
+# =============================================================================
+
+import torch.nn as nn  # already imported at top; safe to re-import
+
+
+class NeuronSPBertModel(nn.Module):
+    """Neuron_SP port of Megatron BertModel with ICT head support.
+
+    Port of megatron/model/bert_model.py::BertModel (bcb320eee).
+    Adds ict_head_size parameter so the model can be used for
+    Information-retrieval Contrastive Training (ICT) in addition to
+    standard MLM + binary NSP head modes.
+
+    Args:
+        hidden_size: Transformer hidden dimension (e.g. 768 for BERT-Base).
+        vocab_size: Vocabulary size for LM head weight tie.
+        add_binary_head: If True, add a 2-class NSP head (mutually exclusive
+            with ict_head_size).
+        ict_head_size: If not None, add an ICT projection head of this
+            dimension. Mutually exclusive with add_binary_head.
+    """
+
+    def __init__(self,
+                 hidden_size: int,
+                 vocab_size: int,
+                 add_binary_head: bool = False,
+                 ict_head_size=None):
+        super().__init__()
+
+        # Commit bcb320eee: ict_head_size param + add_ict_head flag
+        self.add_binary_head = add_binary_head
+        self.ict_head_size = ict_head_size
+        self.add_ict_head = ict_head_size is not None
+        assert not (self.add_binary_head and self.add_ict_head), \
+            '[NEURONSP-BERT] add_binary_head and ict_head_size are mutually exclusive'
+
+        # Commit bcb320eee: add_pooler is True when either head variant is active
+        add_pooler = self.add_binary_head or self.add_ict_head
+
+        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+        self.pooler = nn.Linear(hidden_size, hidden_size) if add_pooler else None
+
+        if self.add_binary_head:
+            self.binary_head = nn.Linear(hidden_size, 2)
+            self._binary_head_key = 'binary_head'
+            print(f'[NEURONSP-BERT] __init__: add_binary_head=True, pooler=True')
+        elif self.add_ict_head:
+            # Commit bcb320eee: ict_head projects pooled output to ict_head_size
+            self.ict_head = nn.Linear(hidden_size, ict_head_size)
+            self._ict_head_key = 'ict_head'
+            print(f'[NEURONSP-BERT] __init__: add_ict_head=True, '
+                  f'ict_head_size={ict_head_size}, pooler=True')
+        else:
+            print(f'[NEURONSP-BERT] __init__: MLM-only mode, pooler=False')
+
+    def forward(self, lm_output, pooled_output=None):
+        """Forward pass returning (lm_logits, head_logits).
+
+        Port of BertModel.forward (bcb320eee): returns lm_logits + optional
+        head logits from binary_head or ict_head.
+        """
+        lm_logits = self.lm_head(lm_output)
+
+        # Commit bcb320eee: pooled_output required when either head is active
+        if self.add_binary_head or self.add_ict_head:
+            assert pooled_output is not None, \
+                '[NEURONSP-BERT] pooled_output required when add_binary_head or add_ict_head'
+
+        if self.add_binary_head:
+            binary_logits = self.binary_head(pooled_output)
+            return lm_logits, binary_logits
+        elif self.add_ict_head:
+            ict_logits = self.ict_head(pooled_output)
+            return lm_logits, ict_logits
+
+        return lm_logits, None
+
+    def state_dict_for_save_checkpoint(self, destination=None, prefix='', keep_vars=False):
+        """Customized state dict for checkpointing. Port of BertModel.state_dict_for_save_checkpoint."""
+        state_dict_ = {}
+        state_dict_['lm_head'] = self.lm_head.state_dict(destination, prefix, keep_vars)
+        if self.add_binary_head:
+            state_dict_[self._binary_head_key] = self.binary_head.state_dict(destination, prefix, keep_vars)
+        elif self.add_ict_head:
+            # Commit bcb320eee: save ict_head state
+            state_dict_[self._ict_head_key] = self.ict_head.state_dict(destination, prefix, keep_vars)
+        return state_dict_
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Customized load. Port of BertModel.load_state_dict (bcb320eee)."""
+        self.lm_head.load_state_dict(state_dict['lm_head'], strict=strict)
+        if self.add_binary_head:
+            self.binary_head.load_state_dict(state_dict[self._binary_head_key], strict=strict)
+        elif self.add_ict_head:
+            self.ict_head.load_state_dict(state_dict[self._ict_head_key], strict=strict)
