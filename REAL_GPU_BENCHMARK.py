@@ -2239,6 +2239,30 @@ class DESLOCAdamW(torch.optim.Optimizer):
         Ku_target = self.param_groups[0]['Ku']
         Kv_target = self.param_groups[0]['Kv']
 
+        # M447: Adaptive Kx — adjust sync frequency based on loss variance.
+        # High variance → landscape is bumpy, workers diverge fast → sync more.
+        # Low variance → landscape is smooth, local steps are safe → sync less.
+        # Uses the rate-of-change history already collected at sync points.
+        if not hasattr(self, '_adaptive_loss_window'):
+            self._adaptive_loss_window = []
+        _adaptive_Kx_ratio = 1.0
+        if len(self._adaptive_loss_window) >= 10 and Kx_target > 1:
+            _recent = self._adaptive_loss_window[-50:]
+            _mean = sum(_recent) / len(_recent)
+            _var = sum((x - _mean) ** 2 for x in _recent) / len(_recent)
+            _std = _var ** 0.5
+            if _std > 0.5:
+                _adaptive_Kx_ratio = 0.25
+            elif _std < 0.1:
+                _adaptive_Kx_ratio = 2.0
+            else:
+                _adaptive_Kx_ratio = 1.0
+            if self.global_step % 50 == 1:
+                _r = dist.get_rank() if dist.is_initialized() else 0
+                print(f"[ADAPTIVE-KX] rank={_r} step={self.global_step} "
+                      f"loss_std={_std:.4f} ratio={_adaptive_Kx_ratio:.2f} "
+                      f"Kx: target={Kx_target} -> effective={max(1, int(Kx_target * _adaptive_Kx_ratio))}")
+
         # --- Warmup: ramp Kx from 1 → Kx_target over warmup_steps ---
         # Charles et al. (2025): warm-start from DDP-equivalent training
         # prevents early divergence when loss landscape is highly stochastic.
@@ -2248,16 +2272,14 @@ class DESLOCAdamW(torch.optim.Optimizer):
             frac = self.global_step / max(warmup_steps, 1)
             effective_Kx = max(1, int(1 + (Kx_target - 1) * frac))
             # Claude-27 M335: u and v do NOT follow the Kx ramp.
-            # Kx ramp controls how quickly params shift from DDP→local.
-            # u (first moment) is an optimizer state that tracks gradient
-            # direction — it should sync on its own Ku schedule, not be
-            # dragged along by the param ramp. v piggybacks on x (below).
             effective_Ku = Ku_target
             effective_Kv = Kv_target
         else:
-            effective_Kx = Kx_target
+            # M447: apply adaptive ratio to post-warmup Kx
+            effective_Kx = max(1, int(Kx_target * _adaptive_Kx_ratio))
             effective_Ku = Ku_target
             effective_Kv = Kv_target
+        self._last_effective_Kx = effective_Kx
 
         sync_x = (effective_Kx <= 1) or (self.global_step % effective_Kx == 0)
         sync_u = (effective_Ku <= 1) or (self.global_step % effective_Ku == 0)
@@ -2476,7 +2498,33 @@ class DESLOCAdamW(torch.optim.Optimizer):
         # Their average points NOWHERE useful. Decaying is strictly better:
         # it removes the stale signal without injecting a meaningless average.
         if sync_x:
-            momentum_decay_on_sync = 0.1  # retain 10%, discard 90% of stale momentum
+            # M448: Gradient variance-aware momentum decay.
+            # When grad norms vary widely across params, workers have diverged
+            # significantly → aggressive decay (0.05). When grads are uniform,
+            # workers are still aligned → gentle decay (0.5) preserves momentum.
+            _grad_norms_for_decay = []
+            for grp in self.param_groups:
+                for p in grp['params']:
+                    st = self.state.get(p, {})
+                    if 'exp_avg' in st:
+                        _gn = st['exp_avg'].float().norm().item()
+                        _grad_norms_for_decay.append(_gn)
+            if len(_grad_norms_for_decay) > 1:
+                _gn_mean = sum(_grad_norms_for_decay) / len(_grad_norms_for_decay)
+                _gn_var = sum((x - _gn_mean) ** 2 for x in _grad_norms_for_decay) / len(_grad_norms_for_decay)
+                if _gn_var > 1.0:
+                    momentum_decay_on_sync = 0.05
+                elif _gn_var < 0.01:
+                    momentum_decay_on_sync = 0.5
+                else:
+                    momentum_decay_on_sync = 0.1
+            else:
+                momentum_decay_on_sync = 0.1
+                _gn_var = 0.0
+            _r_md = dist.get_rank() if dist.is_initialized() else 0
+            print(f"[MDECAY] rank={_r_md} step={self.global_step} "
+                  f"m_var={_gn_var:.6f} decay={momentum_decay_on_sync:.2f} "
+                  f"n_params={len(_grad_norms_for_decay)}")
             for group in self.param_groups:
                 for p in group['params']:
                     state = self.state[p]
@@ -3701,6 +3749,28 @@ class Trainer:
                 if hasattr(self.optimizer, 'global_step'):
                     self.optimizer.global_step = step
 
+                # M447: feed current loss into adaptive Kx window
+                if hasattr(self.optimizer, '_adaptive_loss_window'):
+                    self.optimizer._adaptive_loss_window.append(accumulated_loss)
+                    if len(self.optimizer._adaptive_loss_window) > 200:
+                        self.optimizer._adaptive_loss_window = self.optimizer._adaptive_loss_window[-200:]
+
+                # M447: STEP-DUMP — full state snapshot for debugging
+                if step % 10 == 0 or step <= 5:
+                    _sd_pnorm = sum(p.data.float().norm().item()**2
+                                    for p in self.model.parameters())**0.5
+                    _sd_gnorm = getattr(self.optimizer, '_last_grad_norm', 0.0)
+                    _sd_kx = getattr(self.optimizer, '_last_effective_Kx', self.config.Kx)
+                    _sd_oas = getattr(self.optimizer, '_oas_scale', 'N/A')
+                    print(f"[STEP-DUMP] rank={self.rank} step={step} "
+                          f"loss={accumulated_loss:.6f} "
+                          f"lr={self.optimizer.param_groups[0]['lr']:.2e} "
+                          f"grad_norm={_sd_gnorm:.4f} "
+                          f"param_norm={_sd_pnorm:.4f} "
+                          f"oas_scale={_sd_oas} "
+                          f"Kx_eff={_sd_kx} "
+                          f"mem={torch.cuda.memory_allocated(self.device)/1e9:.2f}GB")
+
                 # M365 DIAG: pre-sync param norm
                 _pre_sync_pnorm = None
                 if _diag and step % 50 == 1:
@@ -3870,7 +3940,12 @@ class Trainer:
         elif 'A6000' in gpu_name:
             peak_tflops = 38.7e12  # RTX A6000: BF16=38.7 TFLOPS
         elif 'H100' in gpu_name or 'H800' in gpu_name:
-            peak_tflops = 989.5e12 if 'SXM' in gpu_name else 756e12
+            if 'NVL' in gpu_name:
+                peak_tflops = 835e12  # H100 NVL: BF16=835 TFLOPS
+            elif 'SXM' in gpu_name:
+                peak_tflops = 989.5e12
+            else:
+                peak_tflops = 756e12  # H100 PCIe
         elif 'A100' in gpu_name or 'A800' in gpu_name:
             peak_tflops = 312e12   # A100 SXM: BF16=312 TFLOPS
         elif 'L40' in gpu_name:
@@ -3879,7 +3954,18 @@ class Trainer:
             peak_tflops = 165.2e12 # RTX 4090: BF16=165.2
         elif 'V100' in gpu_name:
             peak_tflops = 125e12   # V100: FP16=125 (no BF16)
+        elif 'PRO 6000' in gpu_name or 'Blackwell' in gpu_name:
+            peak_tflops = 300e12   # RTX PRO 6000 Blackwell: ~300 BF16 TFLOPS (est.)
         mfu_val = achieved_flops / peak_tflops if peak_tflops > 0 else 0.0
+
+        # M449: Clamp MFU to [0, 1.0] — values >1.0 indicate measurement error
+        # (e.g. heterogeneous cluster where fast GPU's TPS is divided by slow GPU's peak)
+        if mfu_val > 1.0:
+            _r_mfu = dist.get_rank() if dist.is_initialized() else 0
+            print(f"[MFU-WARN] rank={_r_mfu} computed MFU={mfu_val:.4f} > 1.0 "
+                  f"(achieved={achieved_flops/1e12:.2f}T peak={peak_tflops/1e12:.2f}T "
+                  f"gpu={gpu_name} tps={per_gpu_tps:.1f}) — clamping to 1.0")
+            mfu_val = min(mfu_val, 1.0)
 
         # Use desloc_mfu from timer.py for cross-check
         mfu_check = desloc_mfu(achieved_flops / 1e12, peak_tflops / 1e12)
