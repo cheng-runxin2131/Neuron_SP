@@ -6850,3 +6850,159 @@ def _neuronsp_make_ict_dataset(ds_type: str, dataset, max_seq_len: int,
     )
     # Return dstype name for tracing (real impl would wrap dataset).
     return dstype_name
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron 83aa92197 — added global variables
+# Source: megatron/global_vars.py (new file — _GLOBAL_ARGS, _GLOBAL_TOKENIZER,
+#         _GLOBAL_TENSORBOARD_WRITER, _GLOBAL_ADLR_AUTORESUME, _GLOBAL_TIMERS)
+#         megatron/arguments.py (new file — moved from arguments.py at root)
+#         megatron/data/tokenizer.py (build_tokenizer, _vocab_size_with_padding)
+#         megatron/training.py (import fix: from megatron.arguments import get_args)
+#         megatron/utils.py (print_args: sorted output, print_rank_0)
+# Key change: global singleton pattern for args/tokenizer/timers/tensorboard
+#             all managed through get_*/set_global_variables() interface.
+# 20% adaptation: NeuronSPGlobalVars class encapsulates the singleton state;
+#                 _neuronsp_print_args() mirrors utils.py sorted print_args fix.
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+class NeuronSPGlobalVars:
+    """Singleton container for Neuron_SP global state.
+
+    Mirrors megatron/global_vars.py introduced in 83aa92197.
+    Manages: args, tokenizer, tensorboard_writer, adlr_autoresume, timers.
+
+    Usage:
+        gv = NeuronSPGlobalVars.instance()
+        gv.set_args(my_args)
+        args = gv.get_args()
+    """
+
+    _singleton = None
+
+    def __init__(self):
+        self._args               = None
+        self._tokenizer          = None
+        self._tensorboard_writer = None   # can be None (optional)
+        self._adlr_autoresume    = None   # can be None (optional)
+        self._timers             = {}     # name -> elapsed seconds
+
+        print("[GLOBAL-VARS] NeuronSPGlobalVars instance created")
+
+    @classmethod
+    def instance(cls):
+        """Return the process-wide singleton, creating it if needed."""
+        if cls._singleton is None:
+            cls._singleton = cls()
+            print("[GLOBAL-VARS] singleton initialized")
+        return cls._singleton
+
+    @classmethod
+    def reset(cls):
+        """Reset singleton (useful for tests)."""
+        print("[GLOBAL-VARS] singleton reset")
+        cls._singleton = None
+
+    # ------------------------------------------------------------------ args
+    def set_args(self, args):
+        assert self._args is None, \
+            "[GLOBAL-VARS] args already initialized (83aa92197: _ensure_var_is_not_initialized)"
+        self._args = args
+        print(f"[GLOBAL-VARS] args set: keys={list(vars(args).keys())[:5]}...")
+
+    def get_args(self):
+        assert self._args is not None, \
+            "[GLOBAL-VARS] args not initialized (83aa92197: _ensure_var_is_initialized)"
+        return self._args
+
+    # -------------------------------------------------------------- tokenizer
+    def set_tokenizer(self, tokenizer):
+        assert self._tokenizer is None, \
+            "[GLOBAL-VARS] tokenizer already initialized"
+        self._tokenizer = tokenizer
+        vocab_size = getattr(tokenizer, 'vocab_size', '?')
+        print(f"[GLOBAL-VARS] tokenizer set: vocab_size={vocab_size}")
+
+    def get_tokenizer(self):
+        assert self._tokenizer is not None, \
+            "[GLOBAL-VARS] tokenizer not initialized"
+        return self._tokenizer
+
+    # ---------------------------------------------------- tensorboard (optional)
+    def set_tensorboard_writer(self, writer):
+        """Set tensorboard writer. May be None if tensorboard unavailable."""
+        self._tensorboard_writer = writer
+        print(f"[GLOBAL-VARS] tensorboard_writer set: {writer is not None}")
+
+    def get_tensorboard_writer(self):
+        # No assert — may legitimately be None.
+        return self._tensorboard_writer
+
+    # --------------------------------------------------------- adlr_autoresume
+    def set_adlr_autoresume(self, autoresume):
+        """Set ADLR autoresume handle. May be None."""
+        self._adlr_autoresume = autoresume
+        print(f"[GLOBAL-VARS] adlr_autoresume set: {autoresume is not None}")
+
+    def get_adlr_autoresume(self):
+        return self._adlr_autoresume
+
+    # ----------------------------------------------------------------- timers
+    def start_timer(self, name: str):
+        """Start a named timer."""
+        import time as _time
+        self._timers[name] = {'start': _time.perf_counter(), 'elapsed': 0.0}
+        print(f"[GLOBAL-VARS] timer '{name}' started")
+
+    def stop_timer(self, name: str):
+        """Stop a named timer and accumulate elapsed time."""
+        import time as _time
+        assert name in self._timers, f"[GLOBAL-VARS] timer '{name}' not started"
+        entry = self._timers[name]
+        entry['elapsed'] += _time.perf_counter() - entry['start']
+        print(f"[GLOBAL-VARS] timer '{name}' elapsed={entry['elapsed']:.4f}s")
+
+    def get_timer(self, name: str) -> float:
+        return self._timers.get(name, {}).get('elapsed', 0.0)
+
+    # ----------------------------------------------------------------- vocab
+    @staticmethod
+    def vocab_size_with_padding(orig_vocab_size: int,
+                                make_divisible_by: int = 128,
+                                model_parallel_size: int = 1) -> int:
+        """Compute padded vocab size (83aa92197: _vocab_size_with_padding).
+
+        Pads orig_vocab_size up to the nearest multiple of
+        make_divisible_by * model_parallel_size.
+        """
+        multiple = make_divisible_by * model_parallel_size
+        after = orig_vocab_size
+        while after % multiple != 0:
+            after += 1
+        print(
+            f"[GLOBAL-VARS] vocab padding: orig={orig_vocab_size}, "
+            f"padded={after}, added={after - orig_vocab_size}, "
+            f"multiple={multiple}"
+        )
+        return after
+
+
+def _neuronsp_print_args(args, writer=None):
+    """Print args in sorted order (83aa92197 / utils.py change).
+
+    Upstream change: args are now sorted before printing (key=lambda a: a.lower())
+    and printed via print_rank_0 instead of raw print.
+    """
+    print("[PRINT-ARGS] arguments:")
+    str_list = []
+    for arg in vars(args):
+        dots = '.' * max(1, 29 - len(arg))
+        str_list.append(f"  {arg} {dots} {getattr(args, arg)}")
+        if writer is not None:
+            try:
+                writer.add_text(arg, str(getattr(args, arg)))
+            except Exception:
+                pass
+    for line in sorted(str_list, key=lambda a: a.lower()):
+        print(f"[PRINT-ARGS] {line}")
