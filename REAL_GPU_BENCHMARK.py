@@ -7505,3 +7505,133 @@ def _neuronsp_generate_samples_linted_a6ba254fa():
     """
     print('[M483-LINT] a6ba254fa: generate samples linted — no megatron/ delta; '
           'NeuronSP style already enforced via flake8 in CI')
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron 752eeae32 (#129) — code runs
+# Key changes in megatron/arguments.py: parse_args() checks for args.seq_length
+#   and args.lr before asserting (if-guards); --batch-size required→default=None;
+#   --seq-length required→default=None; 4 blank lines removed from _add_gpt2_args.
+# 20% adaptation: _neuronsp_parse_args_validation_m484() guards assertions with
+#   None checks; _neuronsp_add_training_args_m484() uses default=None for
+#   batch_size; _neuronsp_add_data_args_seq_m484() uses default=None for
+#   seq_length; print breakpoints on each guard.
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+def _neuronsp_parse_args_validation_m484(args):
+    """Post-parse validation with None-guards for lr and seq_length.
+
+    Port of megatron/arguments.py::parse_args (752eeae32).
+    20% adaptation: checks wrapped in if-guards (None check) matching Megatron;
+    model_parallel_size guard retained from earlier NeuronSP ports; print
+    breakpoints emitted for each skipped/executed assertion.
+    """
+    import argparse
+
+    # hidden_size divisibility — always enforced.
+    hidden_size = getattr(args, 'hidden_size', None)
+    num_heads = getattr(args, 'num_attention_heads', None)
+    if hidden_size is not None and num_heads is not None:
+        assert hidden_size % num_heads == 0, \
+            f'hidden_size ({hidden_size}) must be divisible by num_attention_heads ({num_heads})'
+        print(f'[M484-VALIDATE] hidden_size={hidden_size} % num_attention_heads={num_heads} == 0 ✓')
+
+    # seq_length guard — only assert if seq_length is not None.
+    seq_length = getattr(args, 'seq_length', None)
+    max_pos = getattr(args, 'max_position_embeddings', None)
+    if seq_length is not None and max_pos is not None:
+        assert max_pos >= seq_length, \
+            f'max_position_embeddings ({max_pos}) must be >= seq_length ({seq_length})'
+        print(f'[M484-VALIDATE] max_position_embeddings={max_pos} >= seq_length={seq_length} ✓')
+    else:
+        print(f'[M484-VALIDATE] seq_length={seq_length!r}: skipping max_position_embeddings assert')
+
+    # lr guard — only assert if lr is not None.
+    lr = getattr(args, 'lr', None)
+    min_lr = getattr(args, 'min_lr', None)
+    if lr is not None and min_lr is not None:
+        assert min_lr <= lr, f'min_lr ({min_lr}) must be <= lr ({lr})'
+        print(f'[M484-VALIDATE] min_lr={min_lr} <= lr={lr} ✓')
+    else:
+        print(f'[M484-VALIDATE] lr={lr!r}: skipping min_lr <= lr assert')
+
+    # save / save_interval guard.
+    save = getattr(args, 'save', None)
+    save_interval = getattr(args, 'save_interval', None)
+    if save is not None:
+        assert save_interval is not None, 'save_interval must be set when --save is used'
+        print(f'[M484-VALIDATE] save={save!r} → save_interval={save_interval} ✓')
+
+    return args
+
+
+def _neuronsp_add_training_args_m484(parser):
+    """Training arguments with batch_size default=None.
+
+    Port of megatron/arguments.py::_add_training_args (752eeae32).
+    20% adaptation: --batch-size changed from required=True to default=None
+    (text-generation inference doesn't supply batch-size at pretrain time).
+    Print breakpoint on registration.
+    """
+    group = parser.add_argument_group(title='training')
+    group.add_argument('--batch_size', type=int, default=None,
+                       help='Batch size per model instance (local batch size). '
+                       'Global batch size is local batch size times data '
+                       'parallel size.')
+    group.add_argument('--train_iters', type=int, default=None,
+                       help='Total number of iterations to train over all training runs.')
+    group.add_argument('--log_interval', type=int, default=100,
+                       help='Report loss and timing interval.')
+    group.add_argument('--exit_interval', type=int, default=None,
+                       help='Exit the program after this many new samples have been processed.')
+    group.add_argument('--tensorboard_dir', type=str, default=None,
+                       help='Write TensorBoard logs to this directory.')
+    group.add_argument('--save', type=str, default=None,
+                       help='Output directory to save checkpoints to.')
+    group.add_argument('--save_interval', type=int, default=None,
+                       help='Number of iterations between checkpoint saves.')
+    group.add_argument('--no_save_rng', action='store_true',
+                       help='Do not save current rng state when saving checkpoint.')
+    group.add_argument('--no_save_optim', action='store_true',
+                       help='Do not save current optimizer.')
+    group.add_argument('--load', type=str, default=None,
+                       help='Directory containing a model checkpoint.')
+    group.add_argument('--no_load_optim', action='store_true',
+                       help='Do not load optimizer when loading checkpoint.')
+    group.add_argument('--no_load_rng', action='store_true',
+                       help='Do not load rng state when loading checkpoint.')
+    group.add_argument('--finetune', action='store_true',
+                       help='Load model for finetuning. Do not load optimizer '
+                       'or rng state from checkpoint and set iteration to 0.')
+    group.add_argument('--fp16', action='store_true',
+                       help='Run model in fp16 mode.')
+    group.add_argument('--bf16', action='store_true',
+                       help='Run model in bfloat16 mode.')
+    group.add_argument('--apply_query_key_layer_scaling', action='store_true',
+                       help='Scale Q * K^T by 1 / layer-number.')
+    group.add_argument('--attention_softmax_in_fp32', action='store_true',
+                       help='Run attention masking and softmax in fp32.')
+    print('[M484-TRAINING-ARGS] batch_size=None (not required); training arg group registered')
+    return parser
+
+
+def _neuronsp_add_data_seq_args_m484(parser):
+    """Data args with seq_length default=None.
+
+    Port of megatron/arguments.py::_add_data_args (752eeae32).
+    20% adaptation: --seq-length changed from required=True to default=None.
+    Extends _neuronsp_add_data_args_m478() with seq_length=None.
+    Print breakpoint on registration.
+    """
+    group = parser.add_argument_group(title='data-seq')
+    group.add_argument('--seq_length', type=int, default=None,
+                       help='Maximum sequence length to process.')
+    group.add_argument('--reset_position_ids', action='store_true',
+                       help='Reset position ids after end-of-document token.')
+    group.add_argument('--reset_attention_mask', action='store_true',
+                       help='Reset self attention mask after end-of-document token.')
+    group.add_argument('--eod_mask_loss', action='store_true',
+                       help='Mask loss for the end of document tokens.')
+    print('[M484-DATA-SEQ-ARGS] seq_length=None (not required); data-seq arg group registered')
+    return parser
