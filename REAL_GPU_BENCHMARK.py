@@ -7275,3 +7275,24 @@ def _neuronsp_add_data_args_m478(parser):
     print('[M478-DATA-ARGS] _neuronsp_add_data_args_m478: vocab_file=None (not required) '
           '— group registered')
     return parser
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron a0bcee948 (#134) — Merge branch 'staging' into
+#   staging_gpt2_evals (merge commit, no megatron/ delta)
+# Key changes: merge-only; no code change to megatron/ files.
+# 20% adaptation: allow-empty commit records lineage; print breakpoint confirms
+#   merge integration point in NeuronSP history.
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+def _neuronsp_merge_staging_gpt2_evals_a0bcee948():
+    """Marker for Megatron merge a0bcee948.
+
+    Port of Megatron merge commit a0bcee948: 'Merge branch staging into
+    staging_gpt2_evals'. No megatron/ file delta — pure branch integration.
+    20% adaptation: represented as a no-op function with a print breakpoint
+    so the merge event is observable in NeuronSP tracing logs.
+    """
+    print('[M479-MERGE] a0bcee948: staging → staging_gpt2_evals merge recorded; '
+          'no megatron/ changes in this commit')
