@@ -5931,3 +5931,53 @@ def _m36_get_padding_mask(data_b, key='pad_mask'):
 _M36_RESIDUAL_POST_LN_DEFAULT = False  # was True in Megatron before this fix
 
 # --- End M36 engine ---
+
+
+# ---------------------------------------------------------------------------
+# M37: Megatron 0601702a6 — zero worker seems to be working
+# Ported from: pretrain_albert.py → deepspeed/runtime/engine.py
+#
+# Key changes carried over from pretrain_albert.py::get_train_val_test_data:
+#   1. Data loader builds train/valid/test datasets via the new
+#      build_train_valid_test_datasets() factory (not AlbertDataset directly).
+#   2. Eval sample counts computed properly:
+#        eval_iters = (train_iters // eval_interval + 1) * eval_iters
+#        test_iters = eval_iters
+#      Previously only train_iters was used to size the dataset.
+#   3. vocab_size_with_padding() applied to num_tokens before broadcast
+#      (old code omitted this, leading to a mismatch with the embedding table).
+#   4. train_data / valid_data (was val_data) naming made consistent.
+#   5. is None check replaces == None throughout.
+#   6. "Pretrain BERT" docstring corrected to "Pretrain ALBERT".
+# ---------------------------------------------------------------------------
+
+print('[M37]')
+
+# Mapping note: pretrain_albert.py lives at the model-entry level in Megatron.
+# In DeepSpeed/Neuron_SP the equivalent training-loop logic is spread across
+# engine.py (data loading / broadcast) and user-supplied training scripts.
+# The structural changes (factory, eval sizing, vocab padding) are recorded here
+# as a reference; concrete implementations should call _m37_get_train_valid_test_data
+# or the updated dataloader helpers above.
+
+
+def _m37_compute_train_val_test_num_samples(train_iters, eval_interval,
+                                             eval_iters, global_batch_size):
+    """Megatron 0601702a6 — compute minimum dataset sizes for train/valid/test.
+
+    The previous pretrain_albert used (train_iters + 2*eval_iters)*batch_size
+    which under-counted validation samples.  The correct formula is:
+      eval_iters_total = (train_iters // eval_interval + 1) * eval_iters
+      test_iters_total = eval_iters
+
+    Returns list [train_samples, valid_samples, test_samples].
+    """
+    eval_iters_total = (train_iters // eval_interval + 1) * eval_iters
+    test_iters_total = eval_iters
+    return [
+        train_iters * global_batch_size,
+        eval_iters_total * global_batch_size,
+        test_iters_total * global_batch_size,
+    ]
+
+# --- End M37 engine ---

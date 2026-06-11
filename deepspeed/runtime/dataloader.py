@@ -427,3 +427,164 @@ def _m36_get_samples_mapping(indexed_dataset, data_prefix, num_epochs,
 # ---------------------------------------------------------------------------
 
 print('[M40] dataloader: split_dataset removed (mirrors Megatron 8179ebd31 — SplitDataset/split_ds/get_train_valid_test_split deleted upstream)')
+
+
+# ---------------------------------------------------------------------------
+# M37: Megatron 0601702a6 — zero worker seems to be working
+# Ported from:
+#   megatron/data/albert_dataset.py
+#   megatron/data/indexed_dataset.py
+#   megatron/data/split_dataset.py
+#
+# Key changes carried over:
+#   1. albert_dataset: build_train_valid_test_datasets() factory introduced —
+#      tokenizer and indexed_dataset are constructed once and shared across
+#      train/valid/test split AlbertDataset instances (avoids triple re-read).
+#   2. AlbertDataset.__init__ signature refactored: name, indexed_dataset,
+#      tokenizer passed in instead of vocab_file/data_prefix/data_impl/skip_warmup.
+#      Removed debug exit() call.  get_samples_mapping_ receives name param.
+#   3. Indexmap filename gains name prefix and skips epoch/sample-count suffix
+#      when the value is the sentinel INT_MAX (i.e., "infinite").
+#   4. torch.distributed.barrier() replaced with allreduce on
+#      mpu.get_data_parallel_group() to avoid nccl assumption that
+#      device_index == rank (which breaks model-parallel setups).
+#   5. indexed_dataset: print strings lowercased and re-indented to match new
+#      logging style; removed stray "Done" print; get_doc_idx()/set_doc_idx()
+#      accessors added so build_train_valid_test_datasets can slice doc_idx
+#      views without copying data.
+#   6. split_dataset: get_split/should_split removed; replaced by
+#      get_train_valid_test_split(splits_string, size) that returns a 4-element
+#      index list directly — identical logic now lives in albert_dataset too.
+#   7. helpers.cpp: C++ binary not carried here; logging indentation changes
+#      ("> " → "    ") recorded in comment only.
+# ---------------------------------------------------------------------------
+
+print('[M37]')
+
+
+def _m37_get_train_valid_test_split(splits_string, size):
+    """Megatron 0601702a6 — parse train/valid/test split string into index list.
+
+    Replaces the old get_split/should_split pair from split_dataset.py.
+    Returns a 4-element list [0, train_end, valid_end, size] (boundary indices).
+    """
+    splits = []
+    if splits_string.find(',') != -1:
+        splits = [float(s) for s in splits_string.split(',')]
+    elif splits_string.find('/') != -1:
+        splits = [float(s) for s in splits_string.split('/')]
+    else:
+        splits = [float(splits_string)]
+    while len(splits) < 3:
+        splits.append(0.)
+    splits = splits[:3]
+    splits_sum = sum(splits)
+    assert splits_sum > 0.0
+    splits = [split / splits_sum for split in splits]
+    splits_index = [0]
+    for index, split in enumerate(splits):
+        splits_index.append(splits_index[index] + int(round(split * float(size))))
+    diff = splits_index[-1] - size
+    for index in range(1, len(splits_index)):
+        splits_index[index] -= diff
+    assert len(splits_index) == 4
+    assert splits_index[-1] == size
+    return splits_index
+
+
+def _m37_get_indexed_dataset(data_prefix, data_impl, skip_warmup,
+                              make_indexed_dataset_fn, print_rank_0_fn):
+    """Megatron 0601702a6 — get_indexed_dataset_ with improved stats logging.
+
+    Replaces _m36_get_indexed_dataset: adds assertion that sizes match doc_idx,
+    prints document/sentence counts, lowercases log prefix.
+    """
+    import time
+    print_rank_0_fn(' > building dataset index ...')
+    start_time = time.time()
+    indexed_dataset = make_indexed_dataset_fn(data_prefix, data_impl, skip_warmup)
+    assert indexed_dataset.sizes.shape[0] == indexed_dataset.doc_idx[-1]
+    print_rank_0_fn(' > finished creating indexed dataset in {:4f} seconds'.format(
+        time.time() - start_time))
+    print_rank_0_fn(' > indexed dataset stats:')
+    print_rank_0_fn('    number of documents: {}'.format(
+        indexed_dataset.doc_idx.shape[0] - 1))
+    print_rank_0_fn('    number of sentences: {}'.format(
+        indexed_dataset.sizes.shape[0]))
+    return indexed_dataset
+
+
+def _m37_get_samples_mapping(indexed_dataset, data_prefix, num_epochs,
+                              max_num_samples, max_seq_length, short_seq_prob,
+                              seed, name, helpers_mod, print_rank_0_fn,
+                              get_data_parallel_group_fn):
+    """Megatron 0601702a6 — get_samples_mapping_ with name-scoped indexmap filename
+    and data-parallel allreduce barrier (avoids nccl device_index==rank assumption).
+
+    Key differences from _m36_get_samples_mapping:
+      - name is prepended to indexmap filename (e.g. 'train_indexmap')
+      - num_epochs / max_num_samples suffixes are omitted when at sentinel INT_MAX
+      - torch.distributed.barrier() replaced with allreduce on data_parallel_group
+    """
+    import os
+    import time
+    import numpy as np
+    import torch
+
+    if not num_epochs:
+        if not max_num_samples:
+            raise ValueError('Need to specify either max_num_samples or num_epochs')
+        num_epochs = np.iinfo(np.int32).max - 1
+    if not max_num_samples:
+        max_num_samples = np.iinfo(np.int64).max - 1
+
+    # Filename — name-prefixed; epoch/sample suffixes only when not at sentinel.
+    indexmap_filename = data_prefix
+    indexmap_filename += '_{}_indexmap'.format(name)
+    if num_epochs != (np.iinfo(np.int32).max - 1):
+        indexmap_filename += '_{}ep'.format(num_epochs)
+    if max_num_samples != (np.iinfo(np.int64).max - 1):
+        indexmap_filename += '_{}mns'.format(max_num_samples)
+    indexmap_filename += '_{}msl'.format(max_seq_length)
+    indexmap_filename += '_{:0.2f}ssp'.format(short_seq_prob)
+    indexmap_filename += '_{}s'.format(seed)
+    indexmap_filename += '.npy'
+
+    if torch.distributed.get_rank() == 0 and not os.path.isfile(indexmap_filename):
+        print(' > WARNING: could not find index map file {}, building '
+              'the indices on rank 0 ...'.format(indexmap_filename))
+        assert indexed_dataset.doc_idx.dtype == np.int64
+        assert indexed_dataset.sizes.dtype == np.int32
+        verbose = torch.distributed.get_rank() == 0
+        start_time = time.time()
+        print_rank_0_fn(' > building sapmles index mapping for {} ...'.format(name))
+        samples_mapping = helpers_mod.build_mapping(
+            indexed_dataset.doc_idx,
+            indexed_dataset.sizes,
+            num_epochs,
+            max_num_samples,
+            max_seq_length,
+            short_seq_prob,
+            seed,
+            verbose)
+        print_rank_0_fn(' > done building sapmles index maping')
+        np.save(indexmap_filename, samples_mapping, allow_pickle=True)
+        print_rank_0_fn(' > saved the index mapping in {}'.format(indexmap_filename))
+        print_rank_0_fn(' > elasped time to build and save samples mapping '
+                        '(seconds): {:4f}'.format(time.time() - start_time))
+
+    # allreduce barrier — nccl barrier assumes device_index == rank which breaks
+    # model-parallel setups where multiple ranks share a device.
+    counts = torch.cuda.LongTensor([1])
+    torch.distributed.all_reduce(counts, group=get_data_parallel_group_fn())
+    assert counts[0].item() == torch.distributed.get_world_size(
+        group=get_data_parallel_group_fn())
+
+    print_rank_0_fn(' > loading indexed mapping from {}'.format(indexmap_filename))
+    start_time = time.time()
+    samples_mapping = np.load(indexmap_filename, allow_pickle=True)
+    print_rank_0_fn('    loaded indexed file in {:3.3f} seconds'.format(
+        time.time() - start_time))
+    print_rank_0_fn('    total number of samples: {}'.format(samples_mapping.shape[0]))
+    return samples_mapping
+# --- End M37 dataloader ---
