@@ -7466,3 +7466,23 @@ def _neuronsp_detokenize(tokenizer, token_ids):
     print(f'[M481-DETOKENIZE] decoded {len(token_ids)} token_ids → '
           f'{len(result)} chars')
     return result
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron a19820b13 (#131) — Merge staging into
+#   staging_text_generation (merge commit, no megatron/ delta)
+# Key changes: merge-only; picks up staging (3977b7219 args changes) into
+#   the text_generation branch.
+# 20% adaptation: allow-empty marker function records merge point.
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+def _neuronsp_merge_staging_text_generation_a19820b13():
+    """Marker for Megatron merge a19820b13.
+
+    Port of Megatron merge commit a19820b13: 'Merge branch staging into
+    staging_text_generation'. No megatron/ file delta.
+    20% adaptation: no-op function with print breakpoint records merge lineage.
+    """
+    print('[M482-MERGE] a19820b13: staging → staging_text_generation merge recorded; '
+          'no megatron/ changes in this commit')
