@@ -5845,7 +5845,16 @@ class NeuronSPBertModel(nn.Module):
         # Commit bcb320eee: add_pooler is True when either head variant is active
         add_pooler = self.add_binary_head or self.add_ict_head
 
-        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+        # Commit 9873a8dac: lm_head only instantiated when NOT in ICT mode —
+        # ICT uses pooled output directly, so the lm_head and its vocab
+        # embedding weight tie are unnecessary compute/memory overhead.
+        if not self.add_ict_head:
+            self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+            self._lm_head_key = 'lm_head'
+            print(f'[NEURONSP-BERT] __init__: lm_head created (not ICT mode)')
+        else:
+            print(f'[NEURONSP-BERT] __init__: lm_head SKIPPED (ICT mode)')
+
         self.pooler = nn.Linear(hidden_size, hidden_size) if add_pooler else None
 
         if self.add_binary_head:
@@ -5864,29 +5873,40 @@ class NeuronSPBertModel(nn.Module):
     def forward(self, lm_output, pooled_output=None):
         """Forward pass returning (lm_logits, head_logits).
 
-        Port of BertModel.forward (bcb320eee): returns lm_logits + optional
-        head logits from binary_head or ict_head.
+        Port of BertModel.forward (9873a8dac): ICT path now returns BEFORE
+        lm_head computation — avoids unnecessary vocab projection cost when
+        running in ICT retrieval mode.
         """
+        # Commit 9873a8dac: ICT output path is checked FIRST, before lm_head.
+        # In original BertModel this was elif after lm_head; now it exits early
+        # with (ict_logits, None) so lm_head weight is never touched in ICT mode.
+        if self.add_ict_head:
+            assert pooled_output is not None, \
+                '[NEURONSP-BERT] pooled_output required for ICT forward'
+            ict_logits = self.ict_head(pooled_output)
+            print(f'[NEURONSP-BERT] forward: ICT path — ict_logits shape={tuple(ict_logits.shape)}')
+            return ict_logits, None
+
         lm_logits = self.lm_head(lm_output)
 
-        # Commit bcb320eee: pooled_output required when either head is active
-        if self.add_binary_head or self.add_ict_head:
-            assert pooled_output is not None, \
-                '[NEURONSP-BERT] pooled_output required when add_binary_head or add_ict_head'
-
         if self.add_binary_head:
+            assert pooled_output is not None, \
+                '[NEURONSP-BERT] pooled_output required when add_binary_head'
             binary_logits = self.binary_head(pooled_output)
             return lm_logits, binary_logits
-        elif self.add_ict_head:
-            ict_logits = self.ict_head(pooled_output)
-            return lm_logits, ict_logits
 
         return lm_logits, None
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='', keep_vars=False):
-        """Customized state dict for checkpointing. Port of BertModel.state_dict_for_save_checkpoint."""
+        """Customized state dict for checkpointing. Port of BertModel.state_dict_for_save_checkpoint.
+
+        Commit 9873a8dac: lm_head only included when not in ICT mode —
+        consistent with __init__ where lm_head is not created for ICT models.
+        load_state_dict reformatted to two-space indent style (9873a8dac).
+        """
         state_dict_ = {}
-        state_dict_['lm_head'] = self.lm_head.state_dict(destination, prefix, keep_vars)
+        if not self.add_ict_head:
+            state_dict_['lm_head'] = self.lm_head.state_dict(destination, prefix, keep_vars)
         if self.add_binary_head:
             state_dict_[self._binary_head_key] = self.binary_head.state_dict(destination, prefix, keep_vars)
         elif self.add_ict_head:
@@ -5895,12 +5915,19 @@ class NeuronSPBertModel(nn.Module):
         return state_dict_
 
     def load_state_dict(self, state_dict, strict=True):
-        """Customized load. Port of BertModel.load_state_dict (bcb320eee)."""
-        self.lm_head.load_state_dict(state_dict['lm_head'], strict=strict)
+        """Customized load. Port of BertModel.load_state_dict (9873a8dac).
+
+        Reformatted to consistent 8-space continuation indent (9873a8dac style).
+        """
+        if not self.add_ict_head:
+            self.lm_head.load_state_dict(
+                state_dict['lm_head'], strict=strict)
         if self.add_binary_head:
-            self.binary_head.load_state_dict(state_dict[self._binary_head_key], strict=strict)
+            self.binary_head.load_state_dict(
+                state_dict[self._binary_head_key], strict=strict)
         elif self.add_ict_head:
-            self.ict_head.load_state_dict(state_dict[self._ict_head_key], strict=strict)
+            self.ict_head.load_state_dict(
+                state_dict[self._ict_head_key], strict=strict)
 
 
 # =============================================================================
