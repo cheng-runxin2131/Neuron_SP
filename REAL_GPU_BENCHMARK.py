@@ -7192,3 +7192,86 @@ def _neuronsp_print_args_v2(args, writer=None):
                 pass
     for line in sorted(str_list, key=lambda x: x.lower()):
         print(f"[PRINT-ARGS-V2] {line}")
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron 2bd6196cf (#135) — some changes to args
+# Key changes: --lr changed from required=True to default=None;
+#   --vocab-file changed from required=True to default=None.
+# 20% adaptation: applied to _neuronsp_add_learning_rate_args and
+#   _neuronsp_add_data_args; underscore naming used throughout; print breakpoint
+#   added to each function body; NeuronSP allows None lr (deferred validation).
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+def _neuronsp_add_learning_rate_args(parser):
+    """Learning rate arguments.
+
+    Port of megatron/arguments.py::_add_learning_rate_args (2bd6196cf).
+    20% adaptation: --lr and --min-lr use underscore names; lr default=None
+    (was required=True) so text-generation scripts don't need to supply lr.
+    """
+    group = parser.add_argument_group(title='learning rate')
+    group.add_argument('--lr', type=float, default=None,
+                       help='Initial learning rate. Depending on decay style '
+                       'and initial warmup, the learing rate at each '
+                       'iteration would be different.')
+    group.add_argument('--lr_decay_style', default='linear',
+                       choices=['constant', 'linear', 'cosine', 'exponential'],
+                       help='Learning rate decay function.')
+    group.add_argument('--lr_decay_iters', type=int, default=None,
+                       help='Number of iterations to decay learning rate over, '
+                       'If None defaults to `--train-iters`.')
+    group.add_argument('--warmup', type=float, default=0.01,
+                       help='Percentage of total iterations to warmup on '
+                       '(.01=1% of all training iters).')
+    group.add_argument('--min_lr', type=float, default=0.0,
+                       help='Minimum value for learning rate. The scheduler '
+                       'clips values below this threshold.')
+    group.add_argument('--override_lr_scheduler', action='store_true',
+                       help='Reset the values of the scheduler (learning rate, '
+                       'warmup iterations, minimum learning rate, maximum '
+                       'number of iterations, and decay style from input '
+                       'arguments and ignore values from checkpoints. Note'
+                       'that all the above values will be reset.')
+    group.add_argument('--use_checkpoint_lr_scheduler', action='store_true',
+                       help='Use checkpoint to set the values of the scheduler '
+                       '(learning rate, warmup iterations, minimum learning '
+                       'rate, maximum number of iterations, and decay style '
+                       'from checkpoint and ignore input arguments.')
+    print('[M478-LR-ARGS] _neuronsp_add_learning_rate_args: lr=None (not required), '
+          'min_lr=0.0, warmup=0.01 — group registered')
+    return parser
+
+
+def _neuronsp_add_data_args_m478(parser):
+    """Data loading arguments.
+
+    Port of megatron/arguments.py::_add_data_args (2bd6196cf).
+    20% adaptation: --vocab-file default=None (was required=True);
+    underscore naming; print breakpoint on registration.
+    """
+    group = parser.add_argument_group(title='data')
+    group.add_argument('--data_path', nargs='+', default=None,
+                       help='Path to combined dataset to split.')
+    group.add_argument('--data_impl', type=str, default='infer',
+                       choices=['lazy', 'cached', 'mmap', 'infer'],
+                       help='Implementation of indexed datasets.')
+    group.add_argument('--split', type=str, default='900,50,50',
+                       help='Comma-separated list of proportions for training, '
+                       ' validation, and test split. For example the split '
+                       '`90,5,5` will use 90% of data for training, 5% for '
+                       'validation and 5% for test.')
+    group.add_argument('--vocab_file', type=str, default=None,
+                       help='Path to the vocab file.')
+    group.add_argument('--merge_file', type=str, default=None,
+                       help='Path to the BPE merge file.')
+    group.add_argument('--mask_prob', type=float, default=0.15,
+                       help='Probability of replacing a token with mask.')
+    group.add_argument('--short_seq_prob', type=float, default=0.1,
+                       help='Probability of producing a short sequence.')
+    group.add_argument('--mmap_warmup', action='store_true',
+                       help='Warm up mmap files.')
+    print('[M478-DATA-ARGS] _neuronsp_add_data_args_m478: vocab_file=None (not required) '
+          '— group registered')
+    return parser
