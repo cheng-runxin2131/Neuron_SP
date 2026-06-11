@@ -7006,3 +7006,189 @@ def _neuronsp_print_args(args, writer=None):
                 pass
     for line in sorted(str_list, key=lambda a: a.lower()):
         print(f"[PRINT-ARGS] {line}")
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron a9e19f8ef — added initialize megatron
+# Source: megatron/initialize.py (new file — initialize_megatron(),
+#         _initialize_distributed(), _init_autoresume(), _set_random_seed())
+#         megatron/arguments.py (_print_args() added)
+# Key change: initialize_megatron() is now the single entry-point that:
+#   1. calls set_global_variables() (parse args, build tokenizer, etc.)
+#   2. initializes torch.distributed + mpu model-parallel groups
+#   3. initializes ADLR autoresume
+#   4. sets random seeds (random, numpy, torch, mpu cuda seed)
+# 20% adaptation: _neuronsp_initialize_megatron() implements the same sequence
+#                 for Neuron_SP's single-process benchmark mode; distributed
+#                 init is skipped when not needed but the seed logic is faithful.
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+def _neuronsp_initialize_megatron(
+    seed: int = 1234,
+    model_parallel_size: int = 1,
+    extra_args=None,
+    skip_distributed: bool = True,
+):
+    """Initialize Neuron_SP global state (port of megatron/initialize.py a9e19f8ef).
+
+    Sequence mirrors initialize_megatron():
+      1. set_global_variables (args + tokenizer + tensorboard + timers)
+      2. _initialize_distributed (skipped in single-process mode)
+      3. _init_autoresume (no-op if not using ADLR cluster)
+      4. _set_random_seed
+
+    Arguments:
+        seed:               random seed for reproducibility
+        model_parallel_size: number of GPUs for model parallelism
+        extra_args:         optional namespace of extra arguments
+        skip_distributed:   if True, skip torch.distributed init (benchmark mode)
+    """
+    print(
+        f"[INIT-MEGATRON] initialize_megatron start: "
+        f"seed={seed}, model_parallel_size={model_parallel_size}, "
+        f"skip_distributed={skip_distributed}"
+    )
+
+    # Step 1: set global variables.
+    gv = NeuronSPGlobalVars.instance()
+    print("[INIT-MEGATRON] step 1/4: global variables ready")
+
+    # Step 2: distributed init.
+    if skip_distributed:
+        print("[INIT-MEGATRON] step 2/4: skipping distributed init (benchmark mode)")
+    else:
+        _neuronsp_initialize_distributed(model_parallel_size=model_parallel_size)
+
+    # Step 3: autoresume (no-op in benchmark mode).
+    print("[INIT-MEGATRON] step 3/4: autoresume init (no-op in benchmark mode)")
+
+    # Step 4: random seeds.
+    _neuronsp_set_random_seed(seed)
+    print(f"[INIT-MEGATRON] step 4/4: random seeds set to {seed}")
+
+    print("[INIT-MEGATRON] initialization complete")
+    return gv
+
+
+def _neuronsp_initialize_distributed(model_parallel_size: int = 1):
+    """Initialize torch.distributed and model-parallel groups.
+
+    Mirrors _initialize_distributed() in megatron/initialize.py (a9e19f8ef).
+    Handles the case where torch.distributed is already initialized (e.g.,
+    launched via torchrun) vs. needs to be started from env vars.
+    """
+    print(
+        f"[INIT-DIST] _initialize_distributed: "
+        f"model_parallel_size={model_parallel_size}"
+    )
+
+    if dist.is_initialized():
+        rank       = dist.get_rank()
+        world_size = dist.get_world_size()
+        device     = torch.cuda.current_device() if torch.cuda.is_available() else 0
+        local_rank = rank % max(torch.cuda.device_count(), 1)
+        print(
+            f"[INIT-DIST] already initialized: rank={rank}, "
+            f"world_size={world_size}, device={device}, local_rank={local_rank}"
+        )
+        # Verify local_rank matches device (upstream assertion).
+        if torch.cuda.is_available():
+            assert local_rank == device, (
+                f"[INIT-DIST] expected local_rank ({local_rank}) == device ({device})"
+            )
+    else:
+        import os as _os
+        master_ip   = _os.getenv('MASTER_ADDR', 'localhost')
+        master_port = _os.getenv('MASTER_PORT', '6000')
+        rank        = int(_os.getenv('RANK', '0'))
+        world_size  = int(_os.getenv('WORLD_SIZE', '1'))
+        print(
+            f"[INIT-DIST] initializing: master={master_ip}:{master_port}, "
+            f"rank={rank}, world_size={world_size}"
+        )
+        if world_size > 1:
+            init_method = f"tcp://{master_ip}:{master_port}"
+            dist.init_process_group(
+                backend='nccl',
+                world_size=world_size,
+                rank=rank,
+                init_method=init_method,
+            )
+            print(f"[INIT-DIST] process group initialized via {init_method}")
+        else:
+            print("[INIT-DIST] single-process mode, skipping dist init")
+
+    print(
+        f"[INIT-DIST] model-parallel groups: model_parallel_size={model_parallel_size} "
+        f"(mpu.initialize_model_parallel would be called here)"
+    )
+
+
+def _neuronsp_set_random_seed(seed: int):
+    """Set random seeds for reproducibility (port of _set_random_seed, a9e19f8ef).
+
+    Sets: random, numpy, torch (CPU+CUDA), and mpu model-parallel CUDA seed.
+
+    Arguments:
+        seed: must be a positive integer (upstream raises ValueError otherwise)
+    """
+    import random as _random
+
+    if seed is None or seed <= 0:
+        raise ValueError(
+            f"[SET-SEED] Seed ({seed}) should be a positive integer. "
+            f"(a9e19f8ef: _set_random_seed raises ValueError for invalid seed)"
+        )
+
+    print(f"[SET-SEED] setting random seeds to {seed}")
+
+    _random.seed(seed)
+    print(f"[SET-SEED] random.seed({seed}) done")
+
+    try:
+        import numpy as _np
+        _np.random.seed(seed)
+        print(f"[SET-SEED] numpy.random.seed({seed}) done")
+    except ImportError:
+        print("[SET-SEED] numpy not available, skipping")
+
+    torch.manual_seed(seed)
+    print(f"[SET-SEED] torch.manual_seed({seed}) done")
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        print(f"[SET-SEED] torch.cuda.manual_seed_all({seed}) done")
+    else:
+        print("[SET-SEED] CUDA not available, skipping cuda seed")
+
+    # mpu model-parallel CUDA seed would be set here in full Megatron:
+    # mpu.model_parallel_cuda_manual_seed(seed)
+    print(f"[SET-SEED] (mpu.model_parallel_cuda_manual_seed({seed}) "
+          f"skipped — no mpu in benchmark mode)")
+    print(f"[SET-SEED] all seeds set to {seed}")
+
+
+def _neuronsp_print_args_v2(args, writer=None):
+    """_print_args() from megatron/arguments.py addition in a9e19f8ef.
+
+    Slight variant of _neuronsp_print_args() (83aa92197): this version also
+    calls get_tensorboard_writer() from global_vars rather than taking writer
+    as a parameter in the module-level function.
+
+    In Neuron_SP we keep writer as an explicit parameter for testability.
+    """
+    gv = NeuronSPGlobalVars.instance()
+    writer = writer or gv.get_tensorboard_writer()
+    print("[PRINT-ARGS-V2] arguments (a9e19f8ef version):")
+    str_list = []
+    for arg in vars(args):
+        dots = '.' * max(1, 29 - len(arg))
+        str_list.append(f"  {arg} {dots} {getattr(args, arg)}")
+        if writer is not None:
+            try:
+                writer.add_text(arg, str(getattr(args, arg)))
+            except Exception:
+                pass
+    for line in sorted(str_list, key=lambda x: x.lower()):
+        print(f"[PRINT-ARGS-V2] {line}")
