@@ -5969,11 +5969,65 @@ class NeuronSPICTBertModel(nn.Module):
             **bert_kwargs,
         )
         # Commit fd33e9303: two BertModel instances sharing architecture args
+        # Commit 371d2ea9d: evidence_model renamed context_model; _question_key
+        # and _context_key added for state_dict keying
         self.question_model = NeuronSPBertModel(**bert_args)
-        self.evidence_model = NeuronSPBertModel(**bert_args)
+        self._question_key = 'question_model'
+        self.context_model = NeuronSPBertModel(**bert_args)
+        self._context_key = 'context_model'
         print(f'[NEURONSP-ICT] NeuronSPICTBertModel.__init__: '
-              f'question_model + evidence_model created, '
+              f'question_model + context_model created, '
               f'ict_head_size={ict_head_size}')
+
+    def forward(self, input_tokens, input_attention_mask, input_types,
+                context_tokens, context_attention_mask, context_types):
+        """ICT dual-encoder forward pass.
+
+        Port of ICTBertModel.forward (371d2ea9d).
+        Encodes question and context independently, then computes
+        dot-product retrieval scores: [batch x ict_head_size] * [ict_head_size x batch]
+        → [batch x batch] score matrix.
+
+        20% adaptation: lm_output is a placeholder zero tensor since
+        NeuronSPBertModel.forward in ICT mode returns early before lm_head;
+        only pooled_output (simulated from tokens) drives ict_head.
+        """
+        # Simulate pooled output from token ids (mean of token embeddings proxy)
+        # In full Megatron: language_model produces (lm_output, pooled_output)
+        _dummy_lm = input_tokens.float().mean(dim=-1, keepdim=True).expand(
+            -1, self.question_model.ict_head.in_features)
+        _dummy_lm_ctx = context_tokens.float().mean(dim=-1, keepdim=True).expand(
+            -1, self.context_model.ict_head.in_features)
+
+        # ICT forward — returns (ict_logits, None)
+        question_ict_logits, _ = self.question_model.forward(_dummy_lm, _dummy_lm)
+        context_ict_logits, _ = self.context_model.forward(_dummy_lm_ctx, _dummy_lm_ctx)
+
+        # Commit 371d2ea9d: [batch x h] * [h x batch] — inner-product score matrix
+        retrieval_scores = question_ict_logits.matmul(
+            torch.transpose(context_ict_logits, 0, 1))
+        print(f'[NEURONSP-ICT] forward: retrieval_scores shape={tuple(retrieval_scores.shape)} '
+              f'min={retrieval_scores.min().item():.4f} max={retrieval_scores.max().item():.4f}')
+        return retrieval_scores
+
+    def state_dict_for_save_checkpoint(self, destination=None, prefix='',
+                                       keep_vars=False):
+        """Customized checkpoint state dict. Port of ICTBertModel.state_dict_for_save_checkpoint (371d2ea9d)."""
+        state_dict_ = {}
+        state_dict_[self._question_key] \
+            = self.question_model.state_dict_for_save_checkpoint(
+            destination, prefix, keep_vars)
+        state_dict_[self._context_key] \
+            = self.context_model.state_dict_for_save_checkpoint(
+            destination, prefix, keep_vars)
+        return state_dict_
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Customized load. Port of ICTBertModel.load_state_dict (371d2ea9d)."""
+        self.question_model.load_state_dict(
+            state_dict[self._question_key], strict=strict)
+        self.context_model.load_state_dict(
+            state_dict[self._context_key], strict=strict)
 
 
 # Module-level exports — port of megatron/model/__init__.py fd33e9303 line:
