@@ -2876,6 +2876,35 @@ class DeepSpeedEngine(Module):
         elif self.zenflow:
             self.optimizer.reduce_gradients(pipeline_parallel=self.pipeline_parallelism)
 
+    def _reduce_gradients_at_boundary(self, bucket_size=MEMORY_OPT_ALLREDUCE_SIZE):
+        """M506: Megatron 318d68c28 — helper extracted from allreduce_gradients.
+
+        Megatron refactored the per-boundary reduce logic out of train_step
+        into forward_step_with_communication / backward_step_with_communication
+        helpers.  Here we mirror that pattern: the communication decision at
+        gradient-accumulation boundaries is now a standalone method so callers
+        (pipeline schedule, ZeRO stage router) can invoke it directly without
+        duplicating the ZeRO / zenflow branching logic.
+
+        Replaces the inline elif block in allreduce_gradients() with a
+        reusable call.  Kept as additive — allreduce_gradients() still works
+        unchanged; callers may opt into the helper for pipeline schedules.
+        """
+        print(f"[M506-COMM-HELPER] _reduce_gradients_at_boundary called "
+              f"gas_boundary={self.is_gradient_accumulation_boundary()} "
+              f"zero_stage={self.zero_optimization_stage()} "
+              f"zenflow={getattr(self, 'zenflow', False)}")
+        if self.zero_optimization_partition_gradients():
+            self.optimizer.overlapping_partition_gradients_reduce_epilogue()
+        elif self.is_gradient_accumulation_boundary():
+            if self.zero_optimization_stage() == ZeroStageEnum.optimizer_states and hasattr(
+                    self.optimizer, 'reduce_gradients'):
+                self.optimizer.reduce_gradients(pipeline_parallel=self.pipeline_parallelism)
+            else:
+                self.buffered_allreduce_fallback(grads=None, elements_per_buffer=bucket_size)
+        elif getattr(self, 'zenflow', False):
+            self.optimizer.reduce_gradients(pipeline_parallel=self.pipeline_parallelism)
+
     def _backward_prologue(self):
         self._start_timers(self.engine_timers.backward_timers)
 
