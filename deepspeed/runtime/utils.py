@@ -3011,3 +3011,39 @@ def desloc_per_bucket_grad_norm_fp32(buckets, norm_type=2.0, dp_group=None):
         nt.div_(dist.get_world_size(group=dp_group))
         norms = nt.tolist()
     return norms
+
+
+# ---------------------------------------------------------------------------
+# M43: Megatron b9b6fe0d4 — force output gathering
+# vocab_size_with_padding: guard while-loop with `if multiple > 0`
+# to prevent infinite loop when make_vocab_size_divisible_by == 0.
+# Original in megatron/utils.py lines 275-281.
+# ---------------------------------------------------------------------------
+
+print('[M43]')
+
+
+def _m43_vocab_size_with_padding(num_tokens, make_vocab_size_divisible_by,
+                                  model_parallel_world_size):
+    """Pad vocab size to be divisible by make_vocab_size_divisible_by * world_size.
+
+    Port of Megatron b9b6fe0d4 fix: guard the padding loop with
+    ``if multiple > 0`` to avoid an infinite loop when
+    ``make_vocab_size_divisible_by`` is zero.
+
+    Args:
+        num_tokens (int): raw vocabulary size.
+        make_vocab_size_divisible_by (int): divisibility target (0 = no padding).
+        model_parallel_world_size (int): tensor-parallel world size.
+
+    Returns:
+        int: padded vocabulary size.
+    """
+    after = num_tokens
+    multiple = make_vocab_size_divisible_by * model_parallel_world_size
+    if multiple > 0:                          # M43: guard added (was unconditional)
+        while (after % multiple) != 0:
+            after += 1
+    return after
+
+# --- End M43 utils ---

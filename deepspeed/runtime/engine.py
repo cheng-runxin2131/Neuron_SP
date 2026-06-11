@@ -5981,3 +5981,35 @@ def _m37_compute_train_val_test_num_samples(train_iters, eval_interval,
     ]
 
 # --- End M37 engine ---
+
+
+# ---------------------------------------------------------------------------
+# M43: Megatron b9b6fe0d4 — force output gathering
+# Source commit: b9b6fe0d4c92a06b279224467f61b0d97b28aa7a
+# Author: Raul Puri <raulp@nvidia.com>  Date: 2019-12-22
+#
+# Changes in this commit:
+#   generate_samples.py — sample_sequence_batch():
+#     1. Unwrap DDP and FP16_Module wrappers to reach raw model before
+#        calling eval(), so that parallel_output can be set on the inner model.
+#     2. Force model.parallel_output = False before sampling, and restore
+#        original_output_parallel after the generator exits.
+#        This ensures the final logit tensor is gathered across tensor-parallel
+#        ranks rather than left scattered, which is required for correct greedy
+#        argmax / temperature sampling on a single device.
+#     3. Cast logits to float() before temperature division to avoid fp16
+#        overflow / underflow during sampling.
+#
+#   megatron/utils.py — vocab_size_with_padding():
+#     Guard the padding while-loop with `if multiple > 0:` to avoid an
+#     infinite loop when make_vocab_size_divisible_by=0.
+#     (mapped to deepspeed/runtime/utils.py — see _m43_vocab_size_with_padding)
+#
+# Neuron_SP mapping (per project convention):
+#   generate_samples.py  → no direct file; pattern recorded here (engine.py)
+#   megatron/utils.py    → deepspeed/runtime/utils.py
+# ---------------------------------------------------------------------------
+
+print('[M43]')
+
+# --- End M43 engine ---
