@@ -205,6 +205,99 @@ class EngineTimers(object):
         return self.micro_timers + self.global_timers
 
 
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron 3e4e1ab29 — moved pretrain albert to pretrain bert
+# Adapted from pretrain_bert.py / pretrain_albert.py consolidation.
+#
+# The original commit replaces the pretrain_bert.py forward_step and
+# get_train_val_test_data implementations with the ALBERT-compatible
+# dataset format (SOP loss instead of NSP, sentence_order labels, binary
+# data loader, vocab_size_with_padding broadcast).  pretrain_albert.py is
+# deleted and its logic merged into pretrain_bert.py.
+#
+# Adaptation to engine.py (20% rule):
+# We add _neuronsp_resolve_bert_data_config() — a unified helper that
+# selects the correct dataset kwargs for BERT vs ALBERT pretraining based
+# on the config flag 'use_sop_loss'.  This mirrors the consolidation intent:
+# both BERT (NSP) and ALBERT (SOP) share the same model architecture and
+# data pipeline; only the loss head and dataset labels differ.
+#
+# Key changes ported:
+#   - nsp_loss/nsp_logits → sop_loss/sop_logits rename (sentence order prediction)
+#   - data keys: 'mask'/'pad_mask' → 'loss_mask'/'padding_mask'
+#   - val_data → valid_data rename (matches python convention)
+#   - Data loader: 'raw'/'lazy'/'tfrecords' → 'binary' only for ALBERT/SOP
+#   - num_tokens broadcast via token_counts[0] directly (no num_type_tokens proxy)
+#
+# Print breakpoints: fires at config resolution and at data-loader-type guard.
+# =============================================================================
+
+def _neuronsp_resolve_bert_data_config(engine_config: dict) -> dict:
+    """Unified BERT/ALBERT data config resolver (port of Megatron 3e4e1ab29).
+
+    3e4e1ab29 key consolidation: ALBERT moved into pretrain_bert.py by replacing
+    the NSP (next-sentence prediction) head with SOP (sentence-order prediction).
+    The data key rename 'mask'->'loss_mask', 'pad_mask'->'padding_mask' and the
+    loader-type restriction to 'binary' are the minimal API surface that changed.
+
+    Args:
+        engine_config: dict from DeepSpeed config with optional 'bert' sub-key.
+                       Relevant fields:
+                         'use_sop_loss' (bool)    -- True → ALBERT SOP mode
+                         'data_loader'  (str)     -- 'binary' | 'lazy' | 'raw'
+                         'tokentype_size' (int)   -- type vocab size (2 for SOP)
+
+    Returns:
+        Resolved config dict with canonical field names matching 3e4e1ab29.
+    """
+    bert_cfg = engine_config.get('bert', {})
+    use_sop = bert_cfg.get('use_sop_loss', False)
+    loader_type = bert_cfg.get('data_loader', 'lazy')
+    tokentype_size = bert_cfg.get('tokentype_size', 2 if use_sop else 0)
+
+    print(f"[3e4e1ab29-BERT-CONFIG] use_sop_loss={use_sop} "
+          f"data_loader='{loader_type}' "
+          f"tokentype_size={tokentype_size}")
+
+    # 3e4e1ab29: ALBERT/SOP path only supports 'binary' data loader
+    # pretrain_bert.py get_train_val_test_data: `if args.data_loader != 'binary': exit(1)`
+    if use_sop and loader_type != 'binary':
+        print(f"[3e4e1ab29-WARN] SOP mode requires data_loader='binary', "
+              f"got '{loader_type}' — overriding to 'binary'")
+        loader_type = 'binary'
+
+    # Canonical data keys post-3e4e1ab29 (renamed from BERT legacy names):
+    #   BERT (pre-merge):  'mask' -> loss_mask,  'pad_mask' -> padding_mask,
+    #                      'is_random' -> next_sentence (NSP label)
+    #   ALBERT (3e4e1ab29): 'loss_mask', 'padding_mask', 'is_random' -> sentence_order (SOP)
+    data_keys_nsp = ['text', 'types', 'is_random', 'mask', 'mask_labels', 'pad_mask']
+    data_keys_sop = ['text', 'types', 'labels', 'is_random', 'loss_mask', 'padding_mask']
+    canonical_keys = data_keys_sop if use_sop else data_keys_nsp
+
+    # Loss head label: 3e4e1ab29 renames nsp_loss/nsp_logits -> sop_loss/sop_logits
+    loss_label = 'sop loss' if use_sop else 'nsp loss'
+    logits_key = 'sop_logits' if use_sop else 'nsp_logits'
+
+    # val_data -> valid_data rename (3e4e1ab29 line: `(train_data, valid_data, test_data)`)
+    # hard_coded num_type_tokens = 2 for SOP (3e4e1ab29: `token_counts[1] = 2`)
+    resolved = {
+        'use_sop_loss': use_sop,
+        'data_loader': loader_type,
+        'tokentype_size': tokentype_size,
+        'data_keys': canonical_keys,
+        'loss_label': loss_label,
+        'logits_key': logits_key,
+        'hard_coded_tokentype': use_sop,   # 3e4e1ab29: `2, # hard coded num_type_tokens`
+    }
+    print(f"[3e4e1ab29-BERT-CONFIG] resolved: "
+          f"keys={canonical_keys[:3]}... "
+          f"loss_label='{loss_label}' "
+          f"hard_coded_tokentype={use_sop}")
+    return resolved
+
+
 class DeepSpeedEngine(Module):
     r"""DeepSpeed engine for training."""
 
