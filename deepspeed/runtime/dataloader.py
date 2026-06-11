@@ -1097,3 +1097,146 @@ def _m62_concat_and_pad_tokens(tokens, token_types, max_seq_len, enc_id, sep_id,
     # token_types is not padded (Megatron leaves it at CLS+seq+SEP length).
     return tokens, token_types, pad_mask
 # --- End M62 dataloader ---
+# ---------------------------------------------------------------------------
+# M70: Megatron 599e959ae — working on bert
+# Ported from:
+#   arguments.py         — add_data_args() refactored; add_data_args_() legacy kept
+#   megatron/training.py — get_train_val_test_data_iterators resume_dataloader removed
+#   pretrain_bert.py     — get_train_val_test_data simplified; arg renames
+#
+# Key changes carried over:
+#   1. arguments.py — add_data_args() replaced with a clean BERT-focused version:
+#      New args: --data-path (str, single path, required), --split (required),
+#      --vocab-file (required), --seq-length (required), --mask-prob (default 0.15),
+#      --short-seq-prob (default 0.1), --mmap-warmup (store_true), --num-workers (2).
+#      Old add_data_args() renamed to add_data_args_() to avoid collision.
+#      --resume-dataloader arg removed from add_training_args_().
+#      get_args_() call order: add_data_args() (new, clean) called before the
+#      legacy group; add_data_args_() called in place of the old add_data_args().
+#   2. megatron/training.py — get_train_val_test_data_iterators:
+#      Removed the `if args.resume_dataloader:` guard — start_iter is now always
+#      set unconditionally for both train_data and val_data.
+#   3. pretrain_bert.py — get_train_val_test_data:
+#      - Removed data_loader guard (if args.data_loader is None / != 'binary' /
+#        not args.data_path) — binary loader is the only supported path.
+#      - args.train_iters → train_iters (local variable, set a few lines above).
+#      - assert len(args.data_path) == 1 removed.
+#      - vocab_file=args.vocab → vocab_file=args.vocab_file (new arg name).
+#      - data_prefix=args.data_path[0] → data_prefix=args.data_path (single str).
+#      - skip_warmup=args.skip_mmap_warmup → skip_warmup=(not args.mmap_warmup)
+#        (flag polarity inverted: old --skip-mmap-warmup = store_true to skip;
+#         new --mmap-warmup = store_true to enable; DeepSpeed callers must flip).
+#
+# Neuron_SP adaptation:
+#   The clean argument set (vocab_file, data_path as str, mmap_warmup polarity)
+#   is reflected in _m70_bert_data_args_spec() below.  The resume_dataloader
+#   removal is noted in _m70_unconditional_start_iter().  The pretrain_bert.py
+#   simplifications inform _m70_build_bert_datasets_kwargs().
+# ---------------------------------------------------------------------------
+
+print('[M70]')
+
+
+def _m70_bert_data_args_spec():
+    """Megatron 599e959ae — canonical BERT data argument specification.
+
+    Documents the clean argument set introduced in add_data_args() (new function).
+    DeepSpeed callers that build their own argument parsers should register these
+    args instead of the legacy add_data_args_() equivalents.
+
+    Returns a list of (name, kwargs) pairs matching the upstream argparse calls.
+    """
+    return [
+        # Single combined dataset path; required (replaces nargs='+' list).
+        ('--data-path', dict(type=str, required=True,
+                             help='Path to combined dataset to split.')),
+        # Comma-separated train/valid/test proportions, e.g. "90,5,5"; required.
+        ('--split', dict(type=str, required=True,
+                         help='Comma-separated proportions for train/valid/test split.')),
+        # Vocabulary file path; required (replaces legacy --vocab default="vocab.txt").
+        ('--vocab-file', dict(type=str, required=True,
+                              help='Path to the vocab file.')),
+        # Maximum sequence length; required (was default=512 in old add_data_args_).
+        ('--seq-length', dict(type=int, required=True,
+                              help='Maximum sequence length to process.')),
+        # MLM mask probability; default unchanged.
+        ('--mask-prob', dict(type=float, default=0.15,
+                             help='Probability of replacing a token with mask.')),
+        # Short sequence probability; default unchanged.
+        ('--short-seq-prob', dict(type=float, default=0.1,
+                                  help='Probability of producing a short sequence.')),
+        # Warmup flag — polarity INVERTED vs old --skip-mmap-warmup:
+        #   old: --skip-mmap-warmup  store_true → skip_warmup=True
+        #   new: --mmap-warmup       store_true → skip_warmup=False  (i.e. not mmap_warmup)
+        ('--mmap-warmup', dict(action='store_true',
+                               help='Warm up mmap files.')),
+        # Number of dataloader workers; default unchanged.
+        ('--num-workers', dict(type=int, default=2,
+                               help='Dataloader number of workers.')),
+    ]
+
+
+def _m70_unconditional_start_iter(train_data, val_data, iteration, eval_interval, eval_iters,
+                                  print_rank_0_fn):
+    """Megatron 599e959ae — set dataloader start_iter unconditionally.
+
+    Before this commit get_train_val_test_data_iterators() guarded the
+    start_iter assignment behind `if args.resume_dataloader:`.  The guard
+    was removed; start_iter is now always set so that a restarted job always
+    resumes from the correct sample regardless of the --resume-dataloader flag
+    (which is itself removed from the argument parser in this commit).
+
+    In DeepSpeed the equivalent is handled by the checkpoint / dataloader-state
+    restore path in DeepSpeedEngine.load_checkpoint(); this function documents
+    the upstream change for callers that manage their own DataLoader objects.
+    """
+    if train_data is not None:
+        train_data.batch_sampler.start_iter = iteration % len(train_data)
+        print_rank_0_fn('setting training data start iteration to {}'.format(
+            train_data.batch_sampler.start_iter))
+    if val_data is not None:
+        start_iter_val = (iteration // eval_interval) * eval_iters
+        val_data.batch_sampler.start_iter = start_iter_val % len(val_data)
+        print_rank_0_fn('setting validation data start iteration to {}'.format(
+            val_data.batch_sampler.start_iter))
+
+
+def _m70_build_bert_datasets_kwargs(args):
+    """Megatron 599e959ae — build keyword arguments for build_train_valid_test_datasets.
+
+    Reflects the three pretrain_bert.py simplifications:
+      1. vocab_file: args.vocab (old str default) → args.vocab_file (new required arg).
+      2. data_prefix: args.data_path[0] (old list[0]) → args.data_path (new str).
+      3. skip_warmup: args.skip_mmap_warmup (old flag) → not args.mmap_warmup (new flag).
+      4. train_iters: args.train_iters replaced by local train_iters variable
+         (no behavioural difference; just uses the pre-computed local).
+      5. The data_loader-type guard and assert len(args.data_path)==1 are gone;
+         binary loader is now assumed unconditionally.
+
+    Returns a dict ready to unpack into build_train_valid_test_datasets(**kwargs).
+    """
+    data_parallel_size = getattr(args, 'data_parallel_size', 1)
+    global_batch_size = args.batch_size * data_parallel_size
+
+    train_iters = args.train_iters
+    eval_iters = (train_iters // args.eval_interval + 1) * args.eval_iters
+    test_iters = args.eval_iters
+    train_val_test_num_samples = [
+        train_iters * global_batch_size,
+        eval_iters * global_batch_size,
+        test_iters * global_batch_size,
+    ]
+
+    return dict(
+        vocab_file=args.vocab_file,
+        data_prefix=args.data_path,
+        data_impl=args.data_impl,
+        splits_string=args.split,
+        train_valid_test_num_samples=train_val_test_num_samples,
+        max_seq_length=args.seq_length,
+        masked_lm_prob=args.mask_prob,
+        short_seq_prob=args.short_seq_prob,
+        seed=args.seed,
+        skip_warmup=(not args.mmap_warmup),
+    )
+# --- End M70 dataloader ---
