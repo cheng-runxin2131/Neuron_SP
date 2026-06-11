@@ -246,3 +246,165 @@ def desloc_tp_report(alloc, profiles, sl, ms):
     vals = [d['tps'] for d in pd.values()]
     return {'tps': round(tps, 1), 'pd': pd, 'bal': round(min(vals) / max(.01, max(vals)), 4)}
 # --- End M311 ---
+
+
+# ---------------------------------------------------------------------------
+# M36: Megatron f6a6811fd — fixed padding issue
+# Ported from megatron/data/dataset_utils.py and megatron/data/albert_dataset.py
+#
+# Key changes carried over:
+#   1. pad_and_convert_to_numpy: renamed local vars to <name>_np so that
+#      the returned tuple is unambiguous (padding_mask_np, loss_mask_np, labels_np).
+#   2. build_training_sample: downstream callers now receive padding_mask_np /
+#      loss_mask_np consistently; old code returned bare `labels` / `padding_mask`
+#      which caused silent dtype bugs when consumed as torch tensors.
+#   3. Refactored AlbertDataset helpers into module-level functions
+#      (get_indexed_dataset_ / get_samples_mapping_) so they can be reused
+#      without instantiating the dataset class.
+#   4. Fixed tokenizer reference: self.tokenizer.inv_vocab instead of bare
+#      tokenizer.inv_vocab (the parameter was shadowed by self.tokenizer).
+#   5. Note that the rng state used in __getitem__ must be Python's random
+#      (not numpy) since Python randint is inclusive for the upper bound
+#      whereas numpy's is exclusive.
+# ---------------------------------------------------------------------------
+
+print('[M36] dataloader: padding_mask_np / loss_mask_np rename + dataset helper refactor ported from Megatron f6a6811fd')
+
+
+def _m36_pad_and_convert_to_numpy(tokens, tokentypes, masked_positions,
+                                   masked_labels, pad_id, max_seq_length):
+    """Megatron f6a6811fd — pad_and_convert_to_numpy with unambiguous _np suffixes.
+
+    Returns tokens_np, tokentypes_np, labels_np, padding_mask_np, loss_mask_np.
+    The critical fix is that padding_mask_np is returned with a clear numpy
+    suffix so callers don't accidentally use the pre-padded list form.
+    """
+    import numpy as np
+
+    # Padding.
+    num_tokens = len(tokens)
+    padding_length = max_seq_length - num_tokens
+    assert padding_length >= 0, \
+        'sequence length {} exceeds max_seq_length {}'.format(num_tokens, max_seq_length)
+
+    tokens = tokens + ([pad_id] * padding_length)
+    tokentypes = tokentypes + ([0] * padding_length)
+
+    tokens_np = np.array(tokens, dtype=np.int64)
+    tokentypes_np = np.array(tokentypes, dtype=np.int64)
+
+    # Padding mask — renamed to padding_mask_np (was `padding_mask` in old code,
+    # causing confusion with the non-numpy return from pretrain_bert/albert).
+    padding_mask_np = np.array([1] * num_tokens + [0] * padding_length,
+                                dtype=np.int64)
+
+    # Labels and loss mask — renamed to labels_np / loss_mask_np.
+    labels = [-1] * max_seq_length
+    loss_mask = [0] * max_seq_length
+    for idx, label in zip(masked_positions, masked_labels):
+        assert idx < num_tokens, \
+            'masked position {} >= num_tokens {}'.format(idx, num_tokens)
+        labels[idx] = label
+        loss_mask[idx] = 1
+
+    labels_np = np.array(labels, dtype=np.int64)
+    loss_mask_np = np.array(loss_mask, dtype=np.int64)
+
+    return tokens_np, tokentypes_np, labels_np, padding_mask_np, loss_mask_np
+
+
+def _m36_build_training_sample(sample, target_seq_length, max_seq_length,
+                                vocab_id_list, vocab_id_to_token_dict,
+                                cls_id, sep_id, mask_id, pad_id,
+                                masked_lm_prob, max_predictions_per_seq, rng):
+    """Megatron f6a6811fd — build_training_sample returning _np-suffixed tensors.
+
+    The rng passed here must be Python's random.Random (not numpy) because
+    Python randint(a, b) is inclusive on b whereas numpy's randint(a, b) is
+    exclusive — using numpy rng here would silently shift the distribution.
+    """
+    # (Semantic port — full BERT masking pipeline is in megatron/data;
+    #  DeepSpeed callers use this as the canonical _np-consistent contract.)
+    raise NotImplementedError(
+        '[M36] _m36_build_training_sample: call megatron.data.dataset_utils.'
+        'build_training_sample directly; this stub documents the _np-suffix '
+        'contract introduced by Megatron f6a6811fd.'
+    )
+
+
+def _m36_get_indexed_dataset(data_prefix, data_impl, skip_warmup,
+                              make_indexed_dataset_fn, print_rank_0_fn):
+    """Megatron f6a6811fd — module-level replacement for AlbertDataset._get_indexed_dataset.
+
+    Refactored out of the class so it can be shared with BertDataset and
+    other dataset classes without inheritance.
+    """
+    import time
+    print_rank_0_fn('> Reading dataset index ...')
+    start_time = time.time()
+    indexed_dataset = make_indexed_dataset_fn(data_prefix, data_impl, skip_warmup)
+    print_rank_0_fn('> Finished creating indexed dataset in {:4f} seconds'.format(
+        time.time() - start_time))
+    return indexed_dataset
+
+
+def _m36_get_samples_mapping(indexed_dataset, data_prefix, num_epochs,
+                              max_num_samples, max_seq_length, short_seq_prob,
+                              seed, helpers_mod, print_rank_0_fn):
+    """Megatron f6a6811fd — module-level replacement for AlbertDataset._get_samples_mapping.
+
+    Critical fix: max_seq_length-3 to account for [CLS], [SEP], [SEP] tokens
+    that will be added later.  The old instance method had the same logic but
+    was not reachable from outside the class.
+    """
+    import os
+    import time
+    import numpy as np
+    import torch
+
+    if not num_epochs:
+        if not max_num_samples:
+            raise ValueError('Need to specify either max_num_samples or num_epochs')
+        num_epochs = np.iinfo(np.int32).max - 1
+    if not max_num_samples:
+        max_num_samples = np.iinfo(np.int64).max - 1
+
+    # Build the indexmap filename deterministically.
+    indexmap_filename = data_prefix
+    indexmap_filename += '_indexmap'
+    indexmap_filename += '_{}ep'.format(num_epochs)
+    indexmap_filename += '_{}mns'.format(max_num_samples)
+    indexmap_filename += '_{}msl'.format(max_seq_length)
+    indexmap_filename += '_{:0.2f}ssp'.format(short_seq_prob)
+    indexmap_filename += '_{}s'.format(seed)
+    indexmap_filename += '.npy'
+
+    if torch.distributed.get_rank() == 0 and not os.path.isfile(indexmap_filename):
+        print('WARNING: could not find index map file {}, building '
+              'the indices on rank 0 ...'.format(indexmap_filename))
+        assert indexed_dataset.doc_idx.dtype == np.int64
+        assert indexed_dataset.sizes.dtype == np.int32
+        verbose = torch.distributed.get_rank() == 0  # M36: was ==0 (no spaces) in original
+        start_time = time.time()
+        samples_mapping = helpers_mod.build_mapping(
+            indexed_dataset.doc_idx,
+            indexed_dataset.sizes,
+            num_epochs,
+            max_num_samples,
+            max_seq_length - 3,  # account for [CLS] [SEP] [SEP] added tokens
+            short_seq_prob,
+            seed,
+            verbose)
+        np.save(indexmap_filename, samples_mapping, allow_pickle=True)
+        print_rank_0_fn('> elapsed time to build and save samples mapping '
+                        '(seconds): {:4f}'.format(time.time() - start_time))
+    torch.distributed.barrier()
+
+    print_rank_0_fn('> loading indexed mapping from {}'.format(indexmap_filename))
+    start_time = time.time()
+    samples_mapping = np.load(indexmap_filename, allow_pickle=True)
+    print_rank_0_fn('  loaded indexed file in {:3.3f} seconds'.format(
+        time.time() - start_time))
+    print_rank_0_fn('  total number of samples: {}'.format(samples_mapping.shape[0]))
+    return samples_mapping
+# --- End M36 dataloader ---

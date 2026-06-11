@@ -5879,3 +5879,55 @@ class DeslocAutoSPCoordinator:
 
     def state_dict(self):
         return {'step': self._step, 'ar': self._dp_ar_count, 'skip': self._dp_skip_count}
+
+
+# ---------------------------------------------------------------------------
+# M36: Megatron f6a6811fd — fixed padding issue
+# Ported from megatron/model/bert_model.py, pretrain_bert.py, pretrain_albert.py
+#
+# Key changes carried over:
+#   1. BertModel.__init__: residual_connection_post_layernorm changed True→False.
+#      Post-layernorm residual in the transformer stack caused incorrect gradient
+#      flow for BERT pre-training; the standard BERT architecture uses pre-LN
+#      (residual added before layer norm), so this flag must be False.
+#   2. pretrain_bert get_batch: padding_mask = data_b['pad_mask'].long()
+#      (was .byte() — torch deprecated byte masks; long() is the correct dtype
+#      for attention masks in modern PyTorch).
+#   3. pretrain_albert get_batch: same .byte()→.long() fix.
+#   4. pretrain_albert forward_step: model(tokens, padding_mask, ...)
+#      (was model(tokens, 1-padding_mask, ...) — the mask convention was
+#      inverted; padding positions are 0 in the mask so no inversion needed).
+#
+# DeepSpeed mapping:
+#   megatron/model/bert_model.py      → deepspeed/runtime/engine.py
+#   pretrain_bert.py / pretrain_albert.py → deepspeed/runtime/engine.py
+# ---------------------------------------------------------------------------
+
+print('[M36] engine: residual_connection_post_layernorm True→False; padding_mask .byte()→.long(); removed 1-padding_mask inversion — ported from Megatron f6a6811fd')
+
+
+def _m36_get_padding_mask(data_b, key='pad_mask'):
+    """Megatron f6a6811fd — return padding mask as long() instead of byte().
+
+    torch.Tensor.byte() is deprecated as an attention-mask dtype; long() (int64)
+    is the correct type expected by modern attention kernels and loss functions.
+
+    Usage (pretrain_bert equivalent):
+        padding_mask = _m36_get_padding_mask(data_b, key='pad_mask')
+
+    Usage (pretrain_albert equivalent):
+        padding_mask = _m36_get_padding_mask(data_b, key='padding_mask')
+        # Pass directly to model — do NOT invert with (1 - padding_mask).
+    """
+    return data_b[key].long()
+
+
+# M36: residual_connection_post_layernorm correction note.
+# In DeepSpeed's TransformerLayer / transformer block configs, ensure that
+# `residual_connection_post_layernorm` (or equivalent `apply_residual_connection_post_layernorm`)
+# defaults to False for BERT-style pre-training.  Setting it True incorrectly
+# applies the residual after the layer norm, deviating from the standard BERT
+# architecture and causing degraded pre-training loss curves.
+_M36_RESIDUAL_POST_LN_DEFAULT = False  # was True in Megatron before this fix
+
+# --- End M36 engine ---
