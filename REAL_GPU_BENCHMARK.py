@@ -7296,3 +7296,86 @@ def _neuronsp_merge_staging_gpt2_evals_a0bcee948():
     """
     print('[M479-MERGE] a0bcee948: staging → staging_gpt2_evals merge recorded; '
           'no megatron/ changes in this commit')
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron 3977b7219 (#133) — Merge staging_gpt2_evals into staging
+# Key changes in megatron/: arguments.py loses add_evaluation_args() (eval args
+#   removed); utils.py::get_ltor_masks_and_position_ids gains fp16 param +
+#   attention_mask.half() conversion.
+# 20% adaptation: _neuronsp_add_evaluation_args_removed() documents removal;
+#   _neuronsp_get_ltor_masks_fp16() adds fp16 branch with print breakpoint;
+#   underscore naming; merge lineage recorded.
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+def _neuronsp_add_evaluation_args_removed():
+    """Documents removal of add_evaluation_args() from arguments.py.
+
+    Port of megatron/arguments.py delta in 3977b7219: add_evaluation_args()
+    (--eval-batch-size, --eval-seq-length, --overlapping-eval, --cloze-eval,
+    --strict-lambada, --eval-hf, --load-openai) was deleted in this merge.
+    20% adaptation: function kept as tombstone with print breakpoint so
+    downstream callers that attempt to register eval args get a clear error.
+    """
+    print('[M480-EVAL-ARGS-REMOVED] add_evaluation_args() was removed in '
+          'Megatron 3977b7219; do not call this — use task-specific arg groups instead')
+    raise NotImplementedError(
+        'add_evaluation_args() removed in Megatron 3977b7219 merge; '
+        'use tasks/zeroshot_gpt2 task-specific parsers instead')
+
+
+def _neuronsp_get_ltor_masks_and_position_ids_fp16(
+        data, eod_token, reset_position_ids, reset_attention_mask,
+        eod_mask_loss, fp16):
+    """Build masks and position ids for left-to-right model, with fp16 support.
+
+    Port of megatron/utils.py::get_ltor_masks_and_position_ids (3977b7219).
+    20% adaptation: fp16 param added to NeuronSP variant; attention_mask.half()
+    branch guarded by fp16 flag; print breakpoint on conversion; function name
+    extended with _fp16 suffix to coexist with earlier NeuronSP version.
+    """
+    import torch
+
+    seq_length = data.numel() // data.shape[0] if data.dim() > 1 else data.numel()
+    batch_size = data.shape[0] if data.dim() > 1 else 1
+
+    # Attention mask (lower triangular).
+    attention_mask = torch.tril(
+        torch.ones((batch_size, seq_length, seq_length), device=data.device)
+    ).view(batch_size, 1, seq_length, seq_length)
+
+    # Loss mask — default all ones.
+    loss_mask = torch.ones(data.size(), dtype=torch.float, device=data.device)
+
+    # Position ids.
+    position_ids = torch.arange(seq_length, dtype=torch.long, device=data.device)
+    position_ids = position_ids.unsqueeze(0).expand_as(data) if data.dim() > 1 \
+        else position_ids
+
+    if reset_position_ids or reset_attention_mask:
+        # Walk the sequence and reset on EOD tokens.
+        for b in range(batch_size):
+            prev_index = 0
+            for i in range(seq_length):
+                token = data[b, i].item() if data.dim() > 1 else data[i].item()
+                if token == eod_token:
+                    if eod_mask_loss:
+                        loss_mask[b, i] = 0.0 if data.dim() > 1 else 0.0
+                    if reset_attention_mask:
+                        attention_mask[b, 0, (i + 1):, :(i + 1)] = 0
+                    if reset_position_ids:
+                        position_ids[b, (i + 1):] -= (i + 1 - prev_index) \
+                            if data.dim() > 1 else 0
+                        prev_index = i + 1
+
+    # 20% adaptation: fp16 branch — convert attention_mask to half precision.
+    if fp16:
+        attention_mask = attention_mask.half()
+        print(f'[M480-LTOR-MASKS] fp16=True: attention_mask converted to half(); '
+              f'shape={list(attention_mask.shape)} dtype={attention_mask.dtype}')
+    else:
+        print(f'[M480-LTOR-MASKS] fp16=False: attention_mask kept as '
+              f'{attention_mask.dtype}')
+
+    return attention_mask, loss_mask, position_ids
