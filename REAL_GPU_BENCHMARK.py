@@ -6654,3 +6654,86 @@ class NeuronSPICTBertModelStub:
 
     def __call__(self, query_tokens, context_tokens):
         return self.forward(query_tokens, context_tokens)
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron 599e959ae — working on bert
+# Source: megatron/training.py get_train_val_test_data_iterators()
+#         arguments.py (BERT arg refactoring)
+#         pretrain_bert.py cleanup
+# Key change: remove `if args.resume_dataloader` guard — always shift
+#             batch_sampler.start_iter unconditionally.
+# 20% adaptation: _neuronsp_get_data_iterators() implements the same
+#                 unconditional start-iter logic in Neuron_SP's benchmark loop.
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+def _neuronsp_get_data_iterators(
+    train_dataset,
+    val_dataset,
+    test_dataset,
+    current_iteration: int = 0,
+    eval_interval: int = 1000,
+    eval_iters: int = 100,
+    batch_size: int = 4,
+):
+    """Build train/val/test iterators with unconditional start-iter shift.
+
+    Mirrors the change in 599e959ae: the `if args.resume_dataloader` guard
+    was removed so that start_iter is ALWAYS shifted based on current_iteration.
+    This is the correct behaviour for deterministic data resumption regardless
+    of checkpoint flags.
+
+    Arguments:
+        train_dataset:     dataset or None
+        val_dataset:       dataset or None
+        test_dataset:      dataset or None
+        current_iteration: current global training step (args.iteration)
+        eval_interval:     how often validation runs (args.eval_interval)
+        eval_iters:        number of validation steps (args.eval_iters)
+        batch_size:        local batch size
+
+    Returns:
+        (train_iter, val_iter, test_iter) — each is an iterator or None
+    """
+    from torch.utils.data import DataLoader as _DL, SequentialSampler
+
+    print(
+        f"[DATA-ITERS] building iterators: current_iteration={current_iteration}, "
+        f"eval_interval={eval_interval}, eval_iters={eval_iters}, "
+        f"batch_size={batch_size}"
+    )
+
+    def _make_iter(ds, start_idx, name):
+        if ds is None:
+            print(f"[DATA-ITERS] {name}: dataset is None, returning None")
+            return None
+        n = len(ds)
+        # Clamp start_idx to valid range.
+        start_idx = start_idx % max(n, 1)
+        print(
+            f"[DATA-ITERS] {name}: len={n}, start_idx={start_idx} "
+            f"(remaining={n - start_idx} samples before wrap)"
+        )
+        # Build a simple sequential iterator offset by start_idx.
+        # In full Megatron this uses DistributedBatchSampler.start_iter.
+        indices = list(range(start_idx, n)) + list(range(0, start_idx))
+        subset = torch.utils.data.Subset(ds, indices)
+        loader = _DL(subset, batch_size=batch_size, shuffle=False, num_workers=0)
+        return iter(loader)
+
+    # Unconditional start-iter shift (599e959ae: no resume_dataloader guard).
+    train_start = current_iteration
+    val_start = (current_iteration // eval_interval) * eval_iters if eval_interval > 0 else 0
+
+    train_iter = _make_iter(train_dataset, train_start, "train")
+    val_iter   = _make_iter(val_dataset,   val_start,   "val")
+    test_iter  = _make_iter(test_dataset,  0,           "test")
+
+    print(
+        f"[DATA-ITERS] iterators ready: "
+        f"train={'yes' if train_iter else 'None'}, "
+        f"val={'yes' if val_iter else 'None'}, "
+        f"test={'yes' if test_iter else 'None'}"
+    )
+    return train_iter, val_iter, test_iter
