@@ -7379,3 +7379,90 @@ def _neuronsp_get_ltor_masks_and_position_ids_fp16(
               f'{attention_mask.dtype}')
 
     return attention_mask, loss_mask, position_ids
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron ce29d4d54 (#132) — working on refactoring text generation
+# Key changes in megatron/: arguments.py loses add_text_generate_args() body
+#   (replaced with empty stubs); model/gpt2_model.py gains
+#   forward_method_parallel_output param + parallel_output override logic;
+#   model/bert_model.py: BertModel.forward signature whitespace cleanup;
+#   tokenizer/tokenizer.py: AbstractTokenizer.detokenize() + _GPT2BPETokenizer.
+#   detokenize() added.
+# 20% adaptation: text-gen args tombstoned; GPT2 forward override in
+#   NeuronSPGPT2ForwardWrapper; detokenize routed through _neuronsp_detokenize;
+#   print breakpoints added throughout.
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+def _neuronsp_add_text_generate_args_removed():
+    """Tombstone for add_text_generate_args() removed in ce29d4d54.
+
+    Port of megatron/arguments.py delta (ce29d4d54): function body deleted,
+    leaving only empty stub. 20% adaptation: raises NotImplementedError with
+    guidance to use _neuronsp_add_text_generate_args_m481() instead.
+    """
+    print('[M481-TEXT-GEN-ARGS-REMOVED] add_text_generate_args() body was emptied '
+          'in ce29d4d54; use _neuronsp_add_text_generate_args_m481() instead')
+    raise NotImplementedError(
+        'add_text_generate_args() was refactored away in ce29d4d54; '
+        'see _neuronsp_add_text_generate_args_m481()')
+
+
+def _neuronsp_gpt2_forward_with_parallel_override(
+        model, input_ids, position_ids, attention_mask,
+        tokentype_ids=None, layer_past=None, get_key_value=False,
+        forward_method_parallel_output=None):
+    """GPT2Model.forward() with dynamic parallel_output override.
+
+    Port of megatron/model/gpt2_model.py::GPT2Model.forward (ce29d4d54).
+    20% adaptation: implemented as a standalone wrapper function rather than
+    monkey-patching GPT2Model; forward_method_parallel_output kwarg accepted;
+    print breakpoint logs when override is active.
+    """
+    # Determine effective parallel_output: use model's default unless overridden.
+    parallel_output = getattr(model, 'parallel_output', True)
+    if forward_method_parallel_output is not None:
+        parallel_output = forward_method_parallel_output
+        print(f'[M481-GPT2-FWD] forward_method_parallel_output override: '
+              f'{forward_method_parallel_output} (model default was '
+              f'{getattr(model, "parallel_output", "N/A")})')
+    else:
+        print(f'[M481-GPT2-FWD] using model.parallel_output={parallel_output}')
+
+    # Delegate to the real model forward (parallel_output patched for this call).
+    orig = getattr(model, 'parallel_output', None)
+    try:
+        model.parallel_output = parallel_output
+        output = model(input_ids, position_ids, attention_mask,
+                       tokentype_ids=tokentype_ids,
+                       layer_past=layer_past,
+                       get_key_value=get_key_value)
+    finally:
+        if orig is not None:
+            model.parallel_output = orig
+    return output
+
+
+def _neuronsp_detokenize(tokenizer, token_ids):
+    """Detokenize a list of token ids to a string.
+
+    Port of megatron/tokenizer/tokenizer.py::AbstractTokenizer.detokenize +
+    _GPT2BPETokenizer.detokenize (ce29d4d54).
+    20% adaptation: dispatches on tokenizer type; falls back to
+    tokenizer.decode() for HF-compatible tokenizers; print breakpoint logs
+    the decoded length.
+    """
+    if hasattr(tokenizer, 'detokenize'):
+        # Megatron tokenizer exposes detokenize directly.
+        result = tokenizer.detokenize(token_ids)
+    elif hasattr(tokenizer, 'decode'):
+        # HuggingFace-compatible tokenizer.
+        result = tokenizer.decode(token_ids)
+    else:
+        raise NotImplementedError(
+            f'Tokenizer {type(tokenizer).__name__} has no detokenize/decode method; '
+            f'add detokenize() as per Megatron ce29d4d54')
+    print(f'[M481-DETOKENIZE] decoded {len(token_ids)} token_ids → '
+          f'{len(result)} chars')
+    return result
