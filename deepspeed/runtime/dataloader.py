@@ -626,3 +626,124 @@ def _m47_get_train_val_test_data_loader_type(data_loader_type):
         print("Unsupported data loader for GPT2.")
         exit(1)
 # --- End M47 dataloader ---
+
+
+# ---------------------------------------------------------------------------
+# M56: Megatron 3e4e1ab29 — moved pretrain albert to pretrain bert
+# Ported from: pretrain_albert.py (deleted) + pretrain_bert.py (updated)
+#   → deepspeed/runtime/dataloader.py
+#
+# Key changes carried over:
+#   1. pretrain_albert.py deleted upstream; its logic was merged into
+#      pretrain_bert.py so BERT pretraining now supports the ALBERT-style
+#      SOP (sentence-order prediction) objective in addition to NSP.
+#   2. DistributedBatchSampler (from megatron.data_utils.samplers) is now
+#      used in pretrain_bert.py's make_data_loader_ factory to replace the
+#      old configure_data / raw / lazy / tfrecords dispatch.
+#   3. Batch key names updated: 'mask' → 'loss_mask', 'mask_labels' → 'labels',
+#      'pad_mask' → 'padding_mask' — matches the AlbertDataset __getitem__
+#      return dict that was already used in the deleted pretrain_albert.py.
+#   4. forward_step variable rename: next_sentence → sentence_order,
+#      nsp_logits / nsp_loss → sop_logits / sop_loss.  The padding_mask
+#      passed to the model is now used directly (not inverted: was 1-padding_mask).
+#   5. get_train_val_test_data: old multi-branch BERT loader (raw/lazy/tfrecords)
+#      replaced by the single 'binary' ALBERT loader path:
+#      build_train_valid_test_datasets → make_data_loader_ with
+#      DistributedBatchSampler(SequentialSampler, global_batch_size).
+#   6. val_data renamed to valid_data throughout for naming consistency with
+#      the existing valid_ds / valid_data pattern used in ALBERT data loading.
+# ---------------------------------------------------------------------------
+
+print('[M56]')
+
+
+def _m56_make_data_loader(dataset, global_batch_size, data_parallel_rank,
+                           data_parallel_size, num_workers, pin_memory):
+    """Megatron 3e4e1ab29 — make_data_loader_ factory ported from pretrain_bert.py.
+
+    Replaces the old configure_data raw/lazy/tfrecords dispatch in BERT pretraining.
+    Uses SequentialSampler + DistributedBatchSampler (from data_utils/samplers) so
+    that each data-parallel rank receives a non-overlapping slice of the global batch.
+
+    The DistributedBatchSampler contract:
+        sampler     : SequentialSampler over the full dataset
+        batch_size  : global_batch_size (total across all data-parallel ranks)
+        drop_last   : True  — avoids partial-batch edge cases during training
+        rank        : data_parallel_rank
+        world_size  : data_parallel_size
+
+    Returns None when dataset is falsy (None or empty) so callers can use the
+    do_train / do_valid / do_test flags cleanly.
+    """
+    import torch
+
+    if not dataset:
+        return None
+
+    # SequentialSampler + DistributedBatchSampler mirrors the ALBERT loader
+    # pattern introduced in pretrain_albert.py and now unified into pretrain_bert.py.
+    sampler = torch.utils.data.SequentialSampler(dataset)
+
+    # DistributedBatchSampler splits the global batch across data-parallel ranks.
+    # In DeepSpeed this role is played by the existing DistributedSampler path in
+    # DeepSpeedDataLoader; _m56_make_data_loader documents the Megatron contract for
+    # callers that construct their own DataLoader outside DeepSpeedDataLoader.
+    batch_sampler = torch.utils.data.BatchSampler(
+        sampler,
+        batch_size=max(1, global_batch_size // max(1, data_parallel_size)),
+        drop_last=True,
+    )
+
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_sampler=batch_sampler,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+
+
+def _m56_get_bert_batch_keys():
+    """Megatron 3e4e1ab29 — canonical ALBERT/BERT batch key names post-merge.
+
+    Before this commit pretrain_bert.py used the BERT-specific key names:
+        'mask'        → renamed to 'loss_mask'
+        'mask_labels' → renamed to 'labels'
+        'pad_mask'    → renamed to 'padding_mask'
+    After the merge these match the AlbertDataset __getitem__ dict directly.
+
+    Returns the ordered key list used by get_batch() after the rename.
+    """
+    return ['text', 'types', 'labels', 'is_random', 'loss_mask', 'padding_mask']
+
+
+def _m56_forward_step_sop(lm_logits, sop_logits, lm_labels, loss_mask, sentence_order,
+                           vocab_parallel_cross_entropy_fn, reduce_losses_fn):
+    """Megatron 3e4e1ab29 — forward_step loss computation after NSP→SOP rename.
+
+    Changes from the pre-merge pretrain_bert.py:
+      - nsp_logits / next_sentence  renamed to  sop_logits / sentence_order
+      - padding_mask passed to model as-is (was 1-padding_mask in old BERT path)
+      - loss key renamed: 'nsp loss' → 'sop loss'
+
+    Returns (loss, {'lm loss': ..., 'sop loss': ...}).
+    """
+    import torch
+    import torch.nn.functional as F
+
+    sop_loss = F.cross_entropy(
+        sop_logits.view(-1, 2).contiguous().float(),
+        sentence_order.view(-1).contiguous(),
+        ignore_index=-1,
+    )
+
+    lm_loss_ = vocab_parallel_cross_entropy_fn(
+        lm_logits.contiguous().float(),
+        lm_labels.contiguous(),
+    )
+    lm_loss = torch.sum(lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
+
+    loss = lm_loss + sop_loss
+    reduced_losses = reduce_losses_fn([lm_loss, sop_loss])
+
+    return loss, {'lm loss': reduced_losses[0], 'sop loss': reduced_losses[1]}
+# --- End M56 dataloader ---
