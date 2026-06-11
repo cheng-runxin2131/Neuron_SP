@@ -170,6 +170,144 @@ assert torch.cuda.device_count() >= 1, "No GPU found - HARD FAIL"
 
 
 # =============================================================================
+# PORT: Megatron 1446bb643 — working on args
+# Original: arguments.py — restructure flat add_*_args() helpers + _GLOBAL_ARGS
+# singleton so callers share one parsed namespace without re-parsing.
+# 20% adaptation: helpers target DES-LOC/Neuron_SP flags, not BERT-only flags;
+# _GLOBAL_ARGS is optional (benchmark may parse inline in main()).
+# =============================================================================
+
+_GLOBAL_ARGS = None
+
+
+def _neuronsp_parse_args(extra_args_provider=None):
+    """Parse args once, cache in _GLOBAL_ARGS, and return.
+
+    Port of Megatron arguments.py::parse_args (1446bb643).
+    Asserts the singleton is unset before writing, preventing double-init bugs.
+    """
+    global _GLOBAL_ARGS
+    assert _GLOBAL_ARGS is None, '[NEURONSP-ARGS] args already initialized'
+    print('[NEURONSP-ARGS] _neuronsp_parse_args: initializing _GLOBAL_ARGS singleton')
+    _GLOBAL_ARGS = _neuronsp_get_args_(extra_args_provider=extra_args_provider)
+    return _GLOBAL_ARGS
+
+
+def _neuronsp_get_args(extra_args_provider=None):
+    """Return cached args, parsing once on first call.
+
+    Port of Megatron arguments.py::get_args (1446bb643).
+    Idempotent: subsequent calls return the cached object.
+    """
+    global _GLOBAL_ARGS
+    if _GLOBAL_ARGS is None:
+        return _neuronsp_parse_args(extra_args_provider=extra_args_provider)
+    return _GLOBAL_ARGS
+
+
+def _neuronsp_add_network_size_args(parser):
+    """Network architecture arguments.
+
+    Port of Megatron arguments.py::add_network_size_args (1446bb643).
+    20% adaptation: --make-vocab-size-divisible-by renamed make_vocab_divisible_by
+    to match Python underscore convention used throughout this file.
+    """
+    group = parser.add_argument_group(title='network size')
+    group.add_argument('--num_layers', type=int, default=12,
+                       help='Number of transformer layers.')
+    group.add_argument('--hidden_size', type=int, default=768,
+                       help='Transformer hidden size.')
+    group.add_argument('--num_attention_heads', type=int, default=12,
+                       help='Number of transformer attention heads.')
+    group.add_argument('--max_position_embeddings', type=int, default=1024,
+                       help='Maximum number of position embeddings to use. '
+                       'This is the size of position embedding.')
+    group.add_argument('--make_vocab_divisible_by', type=int, default=128,
+                       help='Pad the vocab size to be divisible by this value. '
+                       'Added for computational efficiency reasons.')
+    print('[NEURONSP-ARGS] _neuronsp_add_network_size_args: group registered')
+    return parser
+
+
+def _neuronsp_add_regularization_args(parser):
+    """Regularization arguments.
+
+    Port of Megatron arguments.py::add_regularization_args (1446bb643).
+    """
+    group = parser.add_argument_group(title='regularization')
+    group.add_argument('--attention_dropout', type=float, default=0.1,
+                       help='Post attention dropout probability.')
+    group.add_argument('--hidden_dropout', type=float, default=0.1,
+                       help='Dropout probability for hidden state transformer.')
+    print('[NEURONSP-ARGS] _neuronsp_add_regularization_args: group registered')
+    return parser
+
+
+def _neuronsp_add_mixed_precision_args(parser):
+    """Mixed-precision / fp16 arguments.
+
+    Port of Megatron arguments.py::add_mixed_precision_args (1446bb643).
+    20% adaptation: hysteresis/loss-scale flags kept; apply_query_key_layer_scaling
+    already exposed at TrainingConfig level — parser flag is the CLI surface.
+    """
+    group = parser.add_argument_group(title='mixed precision')
+    group.add_argument('--hysteresis', type=int, default=2,
+                       help='Hysteresis for dynamic loss scaling.')
+    group.add_argument('--loss_scale', type=float, default=None,
+                       help='Static loss scaling, positive power of 2 values can '
+                       'improve fp16 convergence. If None, dynamic loss scaling is used.')
+    group.add_argument('--loss_scale_window', type=float, default=1000,
+                       help='Window over which to raise/lower dynamic scale.')
+    group.add_argument('--min_scale', type=float, default=1,
+                       help='Minimum loss scale for dynamic loss scale.')
+    print('[NEURONSP-ARGS] _neuronsp_add_mixed_precision_args: group registered')
+    return parser
+
+
+def _neuronsp_add_distributed_args(parser):
+    """Distributed training arguments.
+
+    Port of Megatron arguments.py::add_distributed_args (1446bb643).
+    20% adaptation: backend choices match DeepSpeed (nccl/gloo); DDP-impl
+    renamed ddp_impl (underscore) for argparse compatibility.
+    """
+    group = parser.add_argument_group(title='distributed')
+    group.add_argument('--distributed_backend', default='nccl',
+                       choices=['nccl', 'gloo'],
+                       help='Which backend to use for distributed training.')
+    group.add_argument('--ddp_impl', default='local',
+                       choices=['local', 'torch'],
+                       help='Which DistributedDataParallel implementation to use.')
+    group.add_argument('--local_rank', type=int, default=None,
+                       help='Local rank passed from distributed launcher.')
+    print('[NEURONSP-ARGS] _neuronsp_add_distributed_args: group registered')
+    return parser
+
+
+def _neuronsp_get_args_(extra_args_provider=None):
+    """Build parser from structured groups and parse argv.
+
+    Port of Megatron arguments.py::get_args_ (1446bb643).
+    20% adaptation: structured groups registered first, then legacy flat
+    benchmark args appended via extra_args_provider pattern so existing
+    callers (main()) can still extend the parser freely.
+    """
+    parser = argparse.ArgumentParser(description='Neuron_SP / DES-LOC Arguments')
+    parser = _neuronsp_add_network_size_args(parser)
+    parser = _neuronsp_add_regularization_args(parser)
+    parser = _neuronsp_add_mixed_precision_args(parser)
+    parser = _neuronsp_add_distributed_args(parser)
+    if extra_args_provider is not None:
+        parser = extra_args_provider(parser)
+    args = parser.parse_args()
+    print(f'[NEURONSP-ARGS] _neuronsp_get_args_: parsed args '
+          f'hidden_size={getattr(args, "hidden_size", "N/A")} '
+          f'num_layers={getattr(args, "num_layers", "N/A")} '
+          f'distributed_backend={getattr(args, "distributed_backend", "N/A")}')
+    return args
+
+
+# =============================================================================
 # CONFIGURATION
 # =============================================================================
 
