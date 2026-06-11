@@ -1200,6 +1200,33 @@ class MegatronRandomSampler(torch.utils.data.Sampler):
         return self.num_samples
 
 
+# =============================================================================
+# NEURON_SP PORT: Megatron b8e0129f4 — reverted init in data_utils
+# Adapted from megatron/data_utils/__init__.py should_split() / get_split().
+# The original commit reverts __init__.py: removes get_split() entirely and
+# keeps only the lean should_split() with trailing-whitespace cleanup.
+# 20% adaptation: Python dataclass split ratios instead of argparse args;
+# should_split takes a list directly. get_split removed (reverted per commit).
+# =============================================================================
+
+
+def _neuronsp_should_split(split: list) -> bool:
+    """Check if dataset should be split into train/val/test sub-sets.
+
+    Port of megatron/data_utils/__init__.py::should_split (b8e0129f4).
+    Returns False when a single partition holds 100% of data.
+
+    Examples:
+    >>> _neuronsp_should_split([10, 0, 0])
+    False
+    >>> _neuronsp_should_split([1, 0.1, 0.2])
+    True
+    """
+    print(f"[NEURONSP-SPLIT] should_split check: split={split} "
+          f"→ max/sum={max(split)/sum(split):.4f}")
+    return max(split) / sum(split) != 1.
+
+
 def _make_dataloader_m452(dataset, config: 'TrainingConfig',
                           world_size: int, rank: int) -> DataLoader:
     """Build DataLoader using Megatron 66719e9 sampling strategy.
