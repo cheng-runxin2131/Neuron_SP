@@ -610,6 +610,80 @@ class LayerNorm(nn.Module):
 
 
 # ── M364: SP runtime context (set by benchmark init, read by attention/forward) ──
+# =============================================================================
+# NEURON_SP PORT: Megatron 57c2060fe — Model parallel merger
+# Adapted from megatron/mpu/initialize.py.
+# Adds _MPU_WORLD_SIZE / _MPU_RANK override globals so tests and checkpointing
+# code can call set_model_parallel_world_size / set_model_parallel_rank to
+# override the distributed query without rebuilding process groups.
+# Also ports partition_dim + stride metadata on model-parallel weight tensors
+# (megatron/mpu/layers.py _initialize_affine_weight), allowing checkpoint
+# merging code to discover how each shard is split without extra bookkeeping.
+# 20% adaptation: uses dist instead of mpu; adds print breakpoints; stores
+# metadata on nn.Parameter directly (same pattern, no MegatronModule base).
+# =============================================================================
+
+# These values enable callers to override the MPU sizes on the fly
+# (e.g. checkpoint merge tools that pretend world_size=1).
+_MPU_WORLD_SIZE = None
+_MPU_RANK = None
+
+
+def set_model_parallel_world_size(world_size: int) -> None:
+    """Override model-parallel world size (Megatron 57c2060fe mpu/initialize.py)."""
+    global _MPU_WORLD_SIZE
+    _MPU_WORLD_SIZE = world_size
+    print(f"[MPU-OVERRIDE] set_model_parallel_world_size({world_size})")
+
+
+def get_model_parallel_world_size() -> int:
+    """Return model-parallel world size, honouring override if set."""
+    global _MPU_WORLD_SIZE
+    if _MPU_WORLD_SIZE is not None:
+        return _MPU_WORLD_SIZE
+    if dist.is_initialized():
+        return dist.get_world_size()
+    return 1
+
+
+def set_model_parallel_rank(rank: int) -> None:
+    """Override model-parallel rank (Megatron 57c2060fe mpu/initialize.py)."""
+    global _MPU_RANK
+    _MPU_RANK = rank
+    print(f"[MPU-OVERRIDE] set_model_parallel_rank({rank})")
+
+
+def get_model_parallel_rank() -> int:
+    """Return model-parallel rank, honouring override if set."""
+    global _MPU_RANK
+    if _MPU_RANK is not None:
+        return _MPU_RANK
+    if dist.is_initialized():
+        return dist.get_rank()
+    return 0
+
+
+def _neuronsp_mark_weight_parallel(weight: nn.Parameter,
+                                    partition_dim: int,
+                                    stride: int = 1) -> None:
+    """Tag a weight tensor with model-parallel shard metadata.
+
+    Port of Megatron mpu/layers.py _initialize_affine_weight (57c2060fe):
+      weight.model_parallel = True
+      weight.partition_dim  = partition_dim
+      weight.stride         = stride
+    These three attributes let checkpoint-merge utilities reconstruct the
+    full weight from per-rank shards without extra config files.
+
+    20% adaptation: standalone function instead of inline in init;
+    adds a print so checkpoint tools can verify the annotation fired.
+    """
+    weight.model_parallel = True
+    weight.partition_dim = partition_dim
+    weight.stride = stride
+    print(f"[MPU-WEIGHT] marked model_parallel weight: "
+          f"shape={list(weight.shape)} partition_dim={partition_dim} stride={stride}")
+
 _SP_CTX = {'on': False, 'grp': None, 'sz': 1, 'rk': 0, 'step': 0}
 
 def _sp_ctx_set(on, grp=None, sz=1, rk=0):
@@ -998,7 +1072,19 @@ class GPT(nn.Module):
         
         # Weight tying
         self.transformer.wte.weight = self.lm_head.weight
-        
+
+        # NEURON_SP PORT: Megatron 57c2060fe — layers.py _initialize_affine_weight
+        # Mark the vocab-parallel embedding weight with partition_dim + stride so
+        # checkpoint merge tools can reconstruct the full tensor from rank shards.
+        # In model-parallel mode the vocab dimension (dim=0) is split across ranks;
+        # stride=1 means no interleaving (contiguous sharding, same as Megatron default).
+        # Bias partition_dim=0 matches ColumnParallelLinear convention in 57c2060fe.
+        _neuronsp_mark_weight_parallel(self.transformer.wte.weight,
+                                       partition_dim=0, stride=1)
+        print(f"[MPU-INIT-57c2060fe] vocab_parallel weight tagged: "
+              f"world_size={get_model_parallel_world_size()} "
+              f"rank={get_model_parallel_rank()}")
+
         # Init weights
         self.apply(self._init_weights)
         
