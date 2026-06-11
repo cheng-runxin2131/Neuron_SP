@@ -929,6 +929,38 @@ class TransformerBlock(nn.Module):
         return self._block_forward(x)
 
 
+# =============================================================================
+# NEURON_SP PORT: Megatron b9b6fe0d4 — force output gathering
+# Adapted from megatron/utils.py vocab_size_with_padding.
+# Key fix: guard `if multiple > 0` prevents zero-division when
+# make_vocab_size_divisible_by=0 or model_parallel_world_size=0.
+# 20% adaptation: uses world_size from dist instead of mpu; adds print breakpoint.
+# =============================================================================
+NEURONSP_VOCAB_DIVISIBLE_BY: int = 128  # Megatron default make_vocab_size_divisible_by
+
+
+def _neuronsp_vocab_size_with_padding(num_tokens: int,
+                                      divisible_by: int = NEURONSP_VOCAB_DIVISIBLE_BY,
+                                      world_size: int = 1) -> int:
+    """Pad vocab size to be divisible by divisible_by * world_size.
+
+    Port of Megatron utils.py::vocab_size_with_padding (b9b6fe0d4).
+    Critical guard: if multiple > 0 prevents infinite loop when either
+    divisible_by or world_size is 0 (model-parallel not initialised yet).
+    """
+    after = num_tokens
+    multiple = divisible_by * world_size
+    print(f"[NEURONSP-VOCAB] padding vocab {num_tokens} → multiple={multiple} "
+          f"(divisible_by={divisible_by}, world_size={world_size})")
+    if multiple > 0:
+        while (after % multiple) != 0:
+            after += 1
+    dummy_tokens = after - num_tokens
+    print(f"[NEURONSP-VOCAB] padded vocab (size: {num_tokens}) with {dummy_tokens} "
+          f"dummy tokens (new size: {after})")
+    return after
+
+
 class GPT(nn.Module):
     """GPT-2 Model with optional activation checkpointing."""
     def __init__(self, vocab_size: int, max_seq_len: int, n_layer: int,
