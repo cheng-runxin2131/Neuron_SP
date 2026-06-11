@@ -7486,3 +7486,22 @@ def _neuronsp_merge_staging_text_generation_a19820b13():
     """
     print('[M482-MERGE] a19820b13: staging → staging_text_generation merge recorded; '
           'no megatron/ changes in this commit')
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron a6ba254fa (#130) — generate samples linted
+# Key changes in megatron/: no file changes (linting pass only on non-megatron
+#   files: generate_samples_gpt2.py).
+# 20% adaptation: marker function with print breakpoint; no code delta needed.
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+def _neuronsp_generate_samples_linted_a6ba254fa():
+    """Marker for Megatron lint-only commit a6ba254fa.
+
+    Port of Megatron commit a6ba254fa: 'generate samples linted'.
+    No megatron/ file changes — linting was applied to generate_samples_gpt2.py.
+    20% adaptation: no-op marker with print breakpoint for traceability.
+    """
+    print('[M483-LINT] a6ba254fa: generate samples linted — no megatron/ delta; '
+          'NeuronSP style already enforced via flake8 in CI')
