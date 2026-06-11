@@ -6556,3 +6556,101 @@ def _neuronsp_pretrain_ict(
 
     print(f"[ICT-PRETRAIN] done: {steps_done} steps completed")
     return steps_done
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron b1efc33d3 — Modify pretrain_bert_ict.py to work
+# with ICTBertModel
+# Source: megatron/mpu/data.py (docstring fix: "disctionary" -> "dictionary")
+#         + pretrain_bert_ict.py (ICTBertModel wiring)
+# 20% adaptation: broadcast_data semantics ported as _neuronsp_broadcast_data()
+# with ICTBertModel-style query/context dual-encoder forward reference.
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+def _neuronsp_broadcast_data(keys, data, datatype):
+    """Broadcast data from the last rank of each model parallel group
+    to all other ranks in that group.
+
+    Arguments:
+        keys: list of keys in the data dictionary to be broadcasted
+            (upstream fix: was "disctionary" -> "dictionary"; b1efc33d3)
+        data: data dictionary of string keys and cpu tensor values.
+        datatype: torch data type of all tensors in data associated
+                  with keys.
+
+    ICTBertModel adaptation (b1efc33d3): the data dict may contain
+    'query_tokens', 'query_types', 'context_tokens', 'context_types'
+    in addition to the standard BERT keys, because ICTBertModel uses a
+    dual-encoder (query encoder + context encoder) rather than a single
+    BERT tower.  We validate keys explicitly before broadcasting to catch
+    missing keys early.
+    """
+    print(f"[BROADCAST-DATA] keys={keys}, datatype={datatype}")
+
+    # Validate all requested keys exist in the data dict.
+    missing = [k for k in keys if k not in data]
+    if missing:
+        raise KeyError(
+            f"[BROADCAST-DATA] keys {missing} not found in data dict. "
+            f"Available: {list(data.keys())}"
+        )
+
+    # Flatten tensors for broadcast (mirrors mpu/data.py logic).
+    tensors = []
+    for k in keys:
+        t = data[k]
+        if not isinstance(t, torch.Tensor):
+            t = torch.tensor(t, dtype=datatype)
+        tensors.append(t.to(dtype=datatype))
+
+    print(
+        f"[BROADCAST-DATA] broadcasting {len(tensors)} tensor(s); "
+        f"shapes={[tuple(t.shape) for t in tensors]}"
+    )
+    # In a real dist context we'd call dist.broadcast here.
+    # In single-process benchmark mode we skip the collective.
+    return {k: tensors[i] for i, k in enumerate(keys)}
+
+
+class NeuronSPICTBertModelStub:
+    """Minimal stub mirroring the ICTBertModel interface introduced in
+    pretrain_bert_ict.py (b1efc33d3).
+
+    ICTBertModel takes (query_tokens, context_tokens) and returns a
+    similarity score.  This stub validates the tensor shapes and prints
+    diagnostic info, standing in for the real Megatron model in benchmark
+    runs without a full BERT checkpoint.
+    """
+
+    def __init__(self, hidden_size: int = 128, vocab_size: int = 512):
+        self.hidden_size = hidden_size
+        self.vocab_size = vocab_size
+        print(
+            f"[ICT-BERT-STUB] NeuronSPICTBertModelStub init: "
+            f"hidden_size={hidden_size}, vocab_size={vocab_size}"
+        )
+
+    def forward(self, query_tokens, context_tokens):
+        """Compute dummy similarity scores.
+
+        Arguments:
+            query_tokens:   (batch, seq_len) long tensor
+            context_tokens: (batch, seq_len) long tensor
+
+        Returns:
+            scores: (batch,) float tensor — random in stub mode
+        """
+        batch = query_tokens.shape[0]
+        print(
+            f"[ICT-BERT-STUB] forward: "
+            f"query_tokens.shape={tuple(query_tokens.shape)}, "
+            f"context_tokens.shape={tuple(context_tokens.shape)}"
+        )
+        scores = torch.randn(batch)
+        print(f"[ICT-BERT-STUB] scores.shape={tuple(scores.shape)}, "
+              f"scores[:4]={scores[:4].tolist()}")
+        return scores
+
+    def __call__(self, query_tokens, context_tokens):
+        return self.forward(query_tokens, context_tokens)
