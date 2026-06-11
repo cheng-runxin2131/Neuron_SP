@@ -250,7 +250,8 @@ def desloc_tp_report(alloc, profiles, sl, ms):
 
 # ---------------------------------------------------------------------------
 # M36: Megatron f6a6811fd — fixed padding issue
-# Ported from megatron/data/dataset_utils.py and megatron/data/albert_dataset.py
+# Ported from megatron/data/dataset_utils.py and megatron/data/bert_dataset.py
+#   (formerly albert_dataset.py; renamed in Megatron 09e05c6f7 — moved albert to bert)
 #
 # Key changes carried over:
 #   1. pad_and_convert_to_numpy: renamed local vars to <name>_np so that
@@ -258,7 +259,7 @@ def desloc_tp_report(alloc, profiles, sl, ms):
 #   2. build_training_sample: downstream callers now receive padding_mask_np /
 #      loss_mask_np consistently; old code returned bare `labels` / `padding_mask`
 #      which caused silent dtype bugs when consumed as torch tensors.
-#   3. Refactored AlbertDataset helpers into module-level functions
+#   3. Refactored BertDataset helpers into module-level functions
 #      (get_indexed_dataset_ / get_samples_mapping_) so they can be reused
 #      without instantiating the dataset class.
 #   4. Fixed tokenizer reference: self.tokenizer.inv_vocab instead of bare
@@ -334,10 +335,10 @@ def _m36_build_training_sample(sample, target_seq_length, max_seq_length,
 
 def _m36_get_indexed_dataset(data_prefix, data_impl, skip_warmup,
                               make_indexed_dataset_fn, print_rank_0_fn):
-    """Megatron f6a6811fd — module-level replacement for AlbertDataset._get_indexed_dataset.
+    """Megatron f6a6811fd — module-level replacement for BertDataset._get_indexed_dataset.
 
-    Refactored out of the class so it can be shared with BertDataset and
-    other dataset classes without inheritance.
+    Refactored out of the class (formerly AlbertDataset, renamed BertDataset in
+    Megatron 09e05c6f7) so it can be shared without inheritance.
     """
     import time
     print_rank_0_fn('> Reading dataset index ...')
@@ -351,7 +352,7 @@ def _m36_get_indexed_dataset(data_prefix, data_impl, skip_warmup,
 def _m36_get_samples_mapping(indexed_dataset, data_prefix, num_epochs,
                               max_num_samples, max_seq_length, short_seq_prob,
                               seed, helpers_mod, print_rank_0_fn):
-    """Megatron f6a6811fd — module-level replacement for AlbertDataset._get_samples_mapping.
+    """Megatron f6a6811fd — module-level replacement for BertDataset._get_samples_mapping.
 
     Critical fix: max_seq_length-3 to account for [CLS], [SEP], [SEP] tokens
     that will be added later.  The old instance method had the same logic but
@@ -432,15 +433,15 @@ print('[M40] dataloader: split_dataset removed (mirrors Megatron 8179ebd31 — S
 # ---------------------------------------------------------------------------
 # M37: Megatron 0601702a6 — zero worker seems to be working
 # Ported from:
-#   megatron/data/albert_dataset.py
+#   megatron/data/bert_dataset.py  (formerly albert_dataset.py; renamed in 09e05c6f7)
 #   megatron/data/indexed_dataset.py
 #   megatron/data/split_dataset.py
 #
 # Key changes carried over:
-#   1. albert_dataset: build_train_valid_test_datasets() factory introduced —
+#   1. bert_dataset: build_train_valid_test_datasets() factory introduced —
 #      tokenizer and indexed_dataset are constructed once and shared across
-#      train/valid/test split AlbertDataset instances (avoids triple re-read).
-#   2. AlbertDataset.__init__ signature refactored: name, indexed_dataset,
+#      train/valid/test split BertDataset instances (avoids triple re-read).
+#   2. BertDataset.__init__ signature refactored: name, indexed_dataset,
 #      tokenizer passed in instead of vocab_file/data_prefix/data_impl/skip_warmup.
 #      Removed debug exit() call.  get_samples_mapping_ receives name param.
 #   3. Indexmap filename gains name prefix and skips epoch/sample-count suffix
@@ -454,7 +455,7 @@ print('[M40] dataloader: split_dataset removed (mirrors Megatron 8179ebd31 — S
 #      views without copying data.
 #   6. split_dataset: get_split/should_split removed; replaced by
 #      get_train_valid_test_split(splits_string, size) that returns a 4-element
-#      index list directly — identical logic now lives in albert_dataset too.
+#      index list directly — identical logic now lives in bert_dataset too.
 #   7. helpers.cpp: C++ binary not carried here; logging indentation changes
 #      ("> " → "    ") recorded in comment only.
 # ---------------------------------------------------------------------------

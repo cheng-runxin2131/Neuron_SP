@@ -6030,11 +6030,43 @@ class NeuronSPICTBertModel(nn.Module):
             state_dict[self._context_key], strict=strict)
 
 
-# Module-level exports — port of megatron/model/__init__.py fd33e9303 line:
-#   from .bert_model import BertModel, ICTBertModel
-# In Neuron_SP engine.py, the equivalent is:
-_NEURONSP_MODEL_REGISTRY = {
-    'NeuronSPBertModel': NeuronSPBertModel,
-    'NeuronSPICTBertModel': NeuronSPICTBertModel,
-}
-print(f'[NEURONSP-ICT] model registry updated: {list(_NEURONSP_MODEL_REGISTRY.keys())}')
+
+# =============================================================================
+# M57: Megatron 09e05c6f7 — moved albert to bert
+# Ported from:
+#   megatron/data/__init__.py          — removed `from .albert_dataset import AlbertDataset`
+#   megatron/data/albert_dataset.py    → bert_dataset.py (file renamed)
+#   pretrain_bert.py                   — import path + docstring/print strings
+#
+# Key changes ported:
+#   1. megatron/data/__init__.py: `from .albert_dataset import AlbertDataset` line
+#      removed — AlbertDataset is no longer a public export of megatron.data.
+#      In Neuron_SP this corresponds to removing any albert_dataset import
+#      references in deepspeed/runtime/dataloader.py (done above in M36/M37
+#      comment blocks).
+#   2. megatron/data/albert_dataset.py → bert_dataset.py (99% similarity rename):
+#      - Module docstring: "ALBERT Style dataset." → "BERT Style dataset."
+#      - Class name: AlbertDataset → BertDataset  (also in build_train_valid_test_datasets)
+#      In Neuron_SP: dataloader.py M36/M37 comment blocks updated accordingly.
+#   3. pretrain_bert.py:
+#      - Module docstring: "Pretrain ALBERT" → "Pretrain BERT"
+#      - import: `from megatron.data.albert_dataset import ...`
+#                → `from megatron.data.bert_dataset import ...`
+#      - Print strings: "for ALBERT ..." → "for BERT ..."
+#                       "Unsupported {} data loader for ALBERT." → "... for BERT."
+#                       "ALBERT only supports a unified dataset ..." → "BERT only ..."
+#                       "finished creating ALBERT datasets" → "... BERT datasets"
+#      In Neuron_SP: _neuronsp_resolve_bert_data_config() (ported in M211/3e4e1ab29
+#      block above) already uses "BERT" terminology throughout; the albert_dataset
+#      import reference is gone from all active code paths.
+#
+# Neuron_SP adaptation note:
+#   This repo targets DeepSpeed sequence-parallel training, not Megatron's
+#   standalone pretrain scripts.  The Megatron albert_dataset → bert_dataset
+#   rename is already reflected in the M36/M37 comment blocks in
+#   deepspeed/runtime/dataloader.py (updated this commit).  No class rename is
+#   needed in engine.py because NeuronSPBertModel was named after BERT from the
+#   start; the porting note here documents the upstream lineage cleanly.
+# =============================================================================
+
+print('[M57]')
