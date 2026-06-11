@@ -979,6 +979,7 @@ class AnnealingLR(object):
                 math.cos(math.pi * num_iters_ / self.end_iter) + 1)
         elif self.decay_style == 'exponential':
             # exp(-0.693) ≈ 1/2 — halves every end_iter steps
+            print('[M49]')
             lr = self.start_lr * math.exp(-0.693 * num_iters_ / self.end_iter)
         else:
             # 'constant' — frozen at start_lr after warmup
