@@ -3564,7 +3564,13 @@ class Trainer:
 
         for step in range(1, self.config.max_steps + 1):
             step_start = time.time()
-            accumulated_loss = 0.0
+            # M505: Megatron 664cd28b2 — use tensor accumulator so that
+            # zero-valued micro-steps (masked / skipped) don't pollute the
+            # running average.  Mirrors Megatron training_log() fix:
+            #   total_loss_dict[key] = get(key, FloatTensor([0.0])) + loss
+            accumulated_loss = torch.zeros(1, dtype=torch.float32,
+                                           device=self.device if hasattr(self, 'device') else 'cpu')
+            print(f"[M505-LOSS-INIT] step={step} accumulated_loss reset to tensor(0.)")
             _SP_CTX['step'] = step
 
             # M366: begin step recording
@@ -3652,7 +3658,15 @@ class Trainer:
                     loss = loss / self.config.gradient_accumulation
 
                 self.scaler.scale(loss).backward() if self.scaler else loss.backward()
-                accumulated_loss += loss.item()
+                # M505: Megatron 664cd28b2 — tensor add (not float +=) so dtype
+                # is preserved; skip micro-step if loss is zero (masked / NaN-guarded).
+                _micro_loss_val = loss.detach().float()
+                if _micro_loss_val.item() > 0.0:
+                    accumulated_loss = accumulated_loss + _micro_loss_val.cpu()
+                print(f"[M505-MICRO] step={step} micro={micro_step} "
+                      f"micro_loss={_micro_loss_val.item():.6f} "
+                      f"accum={accumulated_loss.item():.6f} "
+                      f"skipped={_micro_loss_val.item() == 0.0}")
 
             # M365 DIAG: post-backward gradient statistics
             if _diag and step % 50 == 1:
@@ -3663,15 +3677,15 @@ class Trainer:
             fwd_end = time.time()
             if step % self._recorder.summary_interval == 0 or step <= 10 or step % self._recorder.detail_interval == 1:
                 self._recorder.record_grad_stats(self.model, self.rank)
-                self._recorder.record('loss', round(accumulated_loss, 6))
+                self._recorder.record('loss', round(accumulated_loss.item(), 6))
 
             # M364 DIAG
             if step % 100 == 1:
                 gnorm = sum(p.grad.float().norm().item()**2 for p in self.model.parameters() if p.grad is not None)**0.5
                 _r = dist.get_rank() if dist.is_initialized() else 0
-                print(f"[GRAD] rank={_r} step={step} grad_norm={gnorm:.4f} loss={accumulated_loss:.6f}")
+                print(f"[GRAD] rank={_r} step={step} grad_norm={gnorm:.4f} loss={accumulated_loss.item():.6f}")
                 if self.world_size > 1:
-                    lt = torch.tensor([accumulated_loss], device=self.device)
+                    lt = accumulated_loss.to(self.device)
                     al = [torch.zeros(1, device=self.device) for _ in range(self.world_size)]
                     dist.all_gather(al, lt)
                     print(f"[GRAD] rank={_r} all_rank_losses={[round(x.item(),6) for x in al]}")
@@ -3797,7 +3811,7 @@ class Trainer:
 
                 # M447: feed current loss into adaptive Kx window
                 if hasattr(self.optimizer, '_adaptive_loss_window'):
-                    self.optimizer._adaptive_loss_window.append(accumulated_loss)
+                    self.optimizer._adaptive_loss_window.append(accumulated_loss.item())
                     if len(self.optimizer._adaptive_loss_window) > 200:
                         self.optimizer._adaptive_loss_window = self.optimizer._adaptive_loss_window[-200:]
 
@@ -3809,7 +3823,7 @@ class Trainer:
                     _sd_kx = getattr(self.optimizer, '_last_effective_Kx', self.config.Kx)
                     _sd_oas = getattr(self.optimizer, '_oas_scale', 'N/A')
                     print(f"[STEP-DUMP] rank={self.rank} step={step} "
-                          f"loss={accumulated_loss:.6f} "
+                          f"loss={accumulated_loss.item():.6f} "
                           f"lr={self.optimizer.param_groups[0]['lr']:.2e} "
                           f"grad_norm={_sd_gnorm:.4f} "
                           f"param_norm={_sd_pnorm:.4f} "
@@ -3910,7 +3924,7 @@ class Trainer:
             step_tokens = self.config.batch_size * self.config.gradient_accumulation * self.config.max_seq_len
             total_tokens += step_tokens
 
-            self.metrics['losses'].append(accumulated_loss)
+            self.metrics['losses'].append(accumulated_loss.item())
             self.metrics['step_times'].append(step_time)
             cur_mem = torch.cuda.max_memory_allocated(self.device) / 1e9
             self.metrics['memory_usage'].append(cur_mem)
@@ -3949,7 +3963,7 @@ class Trainer:
                 per_gpu_tps = total_tokens / elapsed
                 cluster_tps = per_gpu_tps * self.world_size
                 print(f"[{self.method}] Step {step}/{self.config.max_steps} | "
-                      f"Loss: {accumulated_loss:.4f} | "
+                      f"Loss: {accumulated_loss.item():.4f} | "
                       f"Time: {step_time*1000:.1f}ms | "
                       f"Tok/s(gpu): {per_gpu_tps:.0f} | "
                       f"Tok/s(all): {cluster_tps:.0f} | "
