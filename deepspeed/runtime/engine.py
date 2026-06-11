@@ -6212,3 +6212,165 @@ print('[M58]')
 print('[M64]')
 
 # --- End M64 engine ---
+
+
+# ---------------------------------------------------------------------------
+# M67: Megatron 9873a8dac — Reformat parts of BertModel
+# Source commit: 9873a8dacc8186ddc6af3273d9576836e4b286aa
+# Author: Neel Kant <nkant@nvidia.com>  Date: 2020-03-26
+#
+# Changes ported from megatron/model/bert_model.py:
+#
+#   1. BertModel.__init__ — guard lm_head construction with add_ict_head check:
+#      Before:
+#        self.lm_head = BertLMHead(
+#            self.language_model.embedding.word_embeddings.weight.size(0),
+#            hidden_size, init_method, layernorm_epsilon, parallel_output)
+#        self._lm_head_key = 'lm_head'
+#      After:
+#        if not self.add_ict_head:
+#            self.lm_head = BertLMHead(
+#                self.language_model.embedding.word_embeddings.weight.size(0),
+#                hidden_size, init_method, layernorm_epsilon, parallel_output)
+#            self._lm_head_key = 'lm_head'
+#      Rationale: when building an ICT (Inverse Cloze Task) variant of BERT,
+#      the LM head is irrelevant and should not be allocated at all. Previously
+#      lm_head was always constructed then never used in ICT mode, wasting
+#      memory and causing load_state_dict key mismatches.
+#
+#   2. BertModel.forward — early-return path for ICT head moved before lm_head:
+#      Before: lm_logits computed unconditionally, then branched on
+#              add_binary_head / add_ict_head (lm_logits always ran).
+#      After:
+#        if self.add_ict_head:
+#            ict_logits = self.ict_head(pooled_output)
+#            return ict_logits, None
+#        lm_logits = self.lm_head(...)
+#        if self.add_binary_head:
+#            binary_logits = self.binary_head(pooled_output)
+#            return lm_logits, binary_logits
+#        return lm_logits, None
+#      Rationale: ICT mode no longer has an lm_head (see change 1), so the
+#      forward pass must return before calling self.lm_head. Additionally the
+#      old elif branch returned (lm_logits, ict_logits) which mixed head
+#      outputs incorrectly; the correct ICT return is (ict_logits, None).
+#
+#   3. BertModel.load_state_dict — reformatted long load_state_dict calls to
+#      respect the 79-char line limit (purely cosmetic, no logic change):
+#      Before (single long lines):
+#        self.lm_head.load_state_dict(state_dict[self._lm_head_key],
+#                                     strict=strict)
+#        self.binary_head.load_state_dict(state_dict[self._binary_head_key],
+#                                         strict=strict)
+#        self.ict_head.load_state_dict(state_dict[self._ict_head_key],
+#                                      strict=strict)
+#      After (hanging-indent style):
+#        self.lm_head.load_state_dict(
+#            state_dict[self._lm_head_key], strict=strict)
+#        self.binary_head.load_state_dict(
+#            state_dict[self._binary_head_key], strict=strict)
+#        self.ict_head.load_state_dict(
+#            state_dict[self._ict_head_key], strict=strict)
+#
+# Neuron_SP mapping (per project convention):
+#   megatron/model/bert_model.py  → deepspeed/runtime/engine.py
+# ---------------------------------------------------------------------------
+
+print('[M67]')
+
+
+def _m67_bert_model_init_lm_head(model, hidden_size, init_method,
+                                  layernorm_epsilon, parallel_output):
+    """Megatron 9873a8dac — conditionally build lm_head only when not in ICT mode.
+
+    In ICT (Inverse Cloze Task) variants of BertModel the language-model head
+    is never used: the model predicts a block index from a pooled query
+    representation, not next-token probabilities.  Constructing BertLMHead
+    unconditionally wastes memory and introduces spurious keys in state_dict
+    that cause load_state_dict mismatches when restoring ICT checkpoints.
+
+    This helper encodes the guard introduced in 9873a8dac:
+
+        if not self.add_ict_head:
+            self.lm_head = BertLMHead(
+                vocab_size, hidden_size, init_method,
+                layernorm_epsilon, parallel_output)
+            self._lm_head_key = 'lm_head'
+
+    Args:
+        model:             BertModel instance being initialised.
+        hidden_size:       int — transformer hidden dimension.
+        init_method:       callable — weight initialisation scheme.
+        layernorm_epsilon: float — epsilon for layer-norm stability.
+        parallel_output:   bool — whether logits stay tensor-parallel sharded.
+    """
+    if not getattr(model, 'add_ict_head', False):
+        vocab_size = (model.language_model
+                      .embedding.word_embeddings.weight.size(0))
+        from megatron.model.bert_model import BertLMHead  # type: ignore
+        model.lm_head = BertLMHead(
+            vocab_size, hidden_size, init_method,
+            layernorm_epsilon, parallel_output)
+        model._lm_head_key = 'lm_head'
+
+
+def _m67_bert_model_forward(model, lm_output, pooled_output,
+                             word_embeddings_weight):
+    """Megatron 9873a8dac — corrected BertModel.forward output routing.
+
+    The pre-commit forward always computed lm_logits even in ICT mode, then
+    returned (lm_logits, ict_logits) — incorrect because (a) lm_head may not
+    exist in ICT mode after change 1, and (b) the caller expects the first
+    return value to be the primary logits for the active head.
+
+    Post-commit routing:
+        1. ICT mode  → early-return (ict_logits, None) before lm_head call.
+        2. Binary     → return (lm_logits, binary_logits).
+        3. Default    → return (lm_logits, None).
+
+    Args:
+        model:                 BertModel instance.
+        lm_output:             Tensor — transformer output for LM projection.
+        pooled_output:         Tensor — [CLS] pooled representation.
+        word_embeddings_weight: Tensor — tied embedding weight for lm_head.
+
+    Returns:
+        Tuple[Tensor, Optional[Tensor]] — (primary_logits, secondary_logits).
+    """
+    if getattr(model, 'add_ict_head', False):
+        ict_logits = model.ict_head(pooled_output)
+        return ict_logits, None
+
+    lm_logits = model.lm_head(lm_output, word_embeddings_weight)
+    if getattr(model, 'add_binary_head', False):
+        binary_logits = model.binary_head(pooled_output)
+        return lm_logits, binary_logits
+
+    return lm_logits, None
+
+
+def _m67_bert_model_load_state_dict(model, state_dict, strict=True):
+    """Megatron 9873a8dac — reformatted load_state_dict calls (style only).
+
+    Applies the hanging-indent reformat from 9873a8dac and dispatches to the
+    correct sub-module load based on active heads.  No logic change vs the
+    pre-commit version; only line length is normalised.
+
+    Args:
+        model:      BertModel instance.
+        state_dict: dict — checkpoint state dict.
+        strict:     bool — passed through to each sub-module load.
+    """
+    model.language_model.load_state_dict(
+        state_dict[model._language_model_key], strict=strict)
+    if not getattr(model, 'add_ict_head', False):
+        model.lm_head.load_state_dict(
+            state_dict[model._lm_head_key], strict=strict)
+    if getattr(model, 'add_binary_head', False):
+        model.binary_head.load_state_dict(
+            state_dict[model._binary_head_key], strict=strict)
+    elif getattr(model, 'add_ict_head', False):
+        model.ict_head.load_state_dict(
+            state_dict[model._ict_head_key], strict=strict)
+
+# --- End M67 engine ---
