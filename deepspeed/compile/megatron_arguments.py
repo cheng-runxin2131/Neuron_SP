@@ -381,3 +381,63 @@ def add_biencoder_args(parser):
 
     print('[M544] add_biencoder_args: biencoder arguments registered')
     return parser
+# M559: Megatron e3e5ea892 — Compute tensor chunk size more cleanly, and add
+#       assertion for global batch size
+# Source: megatron/arguments.py (NVIDIA/Megatron-LM commit e3e5ea892)
+# Author: Deepak Narayanan <dnarayanan@nvidia.com>  Date: 2021-01-20
+#
+# Mapping: megatron/arguments.py → deepspeed/compile/megatron_arguments.py
+#          megatron/p2p_communication.py → deepspeed/runtime/pipe/p2p.py
+#            (p2p.py already uses ring-exchange via M464; scatter_gather
+#             tensor_chunk_shape path is absent — no porting needed there)
+#
+# Changes ported from arguments.py:
+#   1. Typo fix in world_size assertion message:
+#        'pipeline paralle ' → 'pipeline parallel '
+#   2. After `assert args.global_batch_size > 0`, add:
+#        if args.virtual_pipeline_model_parallel_size is not None:
+#            assert args.global_batch_size % args.pipeline_model_parallel_size == 0, \
+#                'global batch size is not divisible by pipeline parallel size when ' \
+#                'using interleaved schedule'
+#
+# Changes NOT ported (p2p_communication.py):
+#   - `from functools import reduce` / `import operator` additions and the
+#     rewrite of tensor_chunk_shape from explicit multiply to
+#     reduce(operator.mul, tensor_shape, 1) — deepspeed/runtime/pipe/p2p.py
+#     was restructured by M464 and no longer contains a scatter_gather
+#     tensor_chunk_shape code path.
+# ---------------------------------------------------------------------------
+
+print('[M559]')
+
+
+def validate_global_batch_size_interleaved(args):
+    """Assert global_batch_size divisible by pipeline_model_parallel_size for interleaved schedule.
+
+    Megatron e3e5ea892 arguments.py parse_args():
+      assert args.global_batch_size > 0
+      if args.virtual_pipeline_model_parallel_size is not None:
+          assert args.global_batch_size % args.pipeline_model_parallel_size == 0, \
+              'global batch size is not divisible by pipeline parallel size when '\
+              'using interleaved schedule'
+
+    Only enforced when virtual_pipeline_model_parallel_size is set (i.e.,
+    the interleaved schedule is active).  Safe to call when the attribute
+    is absent (treated as None).
+    """
+    global_batch_size = getattr(args, 'global_batch_size', None)
+    virtual_pp_size = getattr(args, 'virtual_pipeline_model_parallel_size', None)
+    pp_size = getattr(args, 'pipeline_model_parallel_size', 1)
+
+    assert global_batch_size is not None and global_batch_size > 0, \
+        'global_batch_size must be a positive integer'
+
+    if virtual_pp_size is not None:
+        assert global_batch_size % pp_size == 0, \
+            'global batch size is not divisible by pipeline parallel size when ' \
+            'using interleaved schedule'
+
+    print(f'[M559] validate_global_batch_size_interleaved: '
+          f'global_batch_size={global_batch_size}, '
+          f'pipeline_model_parallel_size={pp_size}, '
+          f'virtual_pipeline_model_parallel_size={virtual_pp_size}')
