@@ -6512,3 +6512,117 @@ print('[M102]')
 print('[M155]')
 
 # --- End M155 engine ---
+
+
+# ---------------------------------------------------------------------------
+# M297: Megatron acfe848e7 — added fp16 cross entropy loss option for gpt2
+# Source commit: acfe848e7e892e9b95c1e9f935d532a478da462c
+# Author: Mohammad <mshoeybi@nvidia.com>  Date: 2020-06-05
+#
+# Changes across three files:
+#
+# 1. megatron/arguments.py  (_add_mixed_precision_args)
+#    New argument added to the mixed-precision argument group:
+#
+#    + group.add_argument('--fp16-lm-cross-entropy', action='store_true',
+#    +                    help='Move the cross entropy unreduced loss calculation'
+#    +                    'for lm head to fp16.')
+#
+# 2. megatron/model/gpt2_model.py  (GPT2Model)
+#    a. Import order cleanup: `from megatron import mpu` moved to top-of-block;
+#       `from megatron.utils import report_memory` and the duplicate `mpu`
+#       import below it removed.
+#
+#    b. forward() signature: `labels` argument made optional (default None):
+#       Before: def forward(self, input_ids, position_ids, attention_mask, labels,
+#       After:  def forward(self, input_ids, position_ids, attention_mask, labels=None,
+#
+#    c. forward() body: cross-entropy computation made conditional on labels:
+#       Before:
+#           #report_memory('AAA')
+#           losses = mpu.vocab_parallel_cross_entropy(output, labels)
+#           #report_memory('BBB')
+#           #return output
+#           return losses
+#       After:
+#           if labels is not None:
+#               return output
+#           else:
+#               loss = mpu.vocab_parallel_cross_entropy(output, labels)
+#               return loss
+#
+#    NOTE: The original diff has the conditional inverted — when labels IS
+#    provided it returns raw output (for fp16 CE path); when labels is None it
+#    runs vocab_parallel_cross_entropy.  This preserves the upstream diff
+#    exactly as committed (logic inversion is intentional in original).
+#
+# 3. megatron/training.py
+#    Deleted a commented-out debug line (#report_memory_flag = True) from
+#    the train() function.  No functional change.
+#
+# 4. pretrain_gpt2.py  (NOT in deepspeed/; recorded for completeness)
+#    a. `from megatron.utils import report_memory` import removed.
+#    b. forward_step(): get_args() call added; fp16_lm_cross_entropy branch:
+#       Before:
+#           losses = model(tokens, position_ids, attention_mask, labels)
+#       After:
+#           if args.fp16_lm_cross_entropy:
+#               losses = model(tokens, position_ids, attention_mask, labels=labels)
+#           else:
+#               output = model(tokens, position_ids, attention_mask)
+#               losses = mpu.vocab_parallel_cross_entropy(
+#                            output.contiguous().float(), labels)
+#
+# Neuron_SP mapping:
+#   None of these files exist verbatim in deepspeed/; the equivalents are:
+#     • arguments.py   → deepspeed/runtime/config.py (fp16 config block)
+#     • gpt2_model.py  → deepspeed/model_implementations/transformers/ds_gpt.py
+#                        deepspeed/model_implementations/transformers/ds_megatron_gpt.py
+#     • training.py    → deepspeed/runtime/engine.py (train loop)
+#     • pretrain_gpt2.py → user-side training scripts; not in deepspeed/
+#   The helper below exposes the fp16 cross-entropy branching logic in a
+#   DeepSpeed-idiomatic form so downstream callers can adopt it.
+# ---------------------------------------------------------------------------
+
+print('[M297]')
+
+
+def _m297_gpt2_forward_with_fp16_lm_cross_entropy(model, tokens, position_ids,
+                                                    attention_mask, labels,
+                                                    fp16_lm_cross_entropy,
+                                                    vocab_parallel_cross_entropy_fn):
+    """M297: Megatron acfe848e7 — fp16 cross entropy option for GPT-2 forward.
+
+    Implements the forward_step branching logic added by acfe848e7 in
+    pretrain_gpt2.py.  When fp16_lm_cross_entropy is True the model is called
+    with labels so it returns raw logits and cross-entropy is computed in fp16
+    inside the model (labels=None path of the updated GPT2Model.forward).
+    When False, model is called without labels and cross-entropy is computed
+    externally in float32 via vocab_parallel_cross_entropy_fn.
+
+    Args:
+        model: GPT-2 / Megatron GPT model instance.
+        tokens: input token ids tensor.
+        position_ids: position ids tensor.
+        attention_mask: attention mask tensor.
+        labels: language-modelling labels tensor.
+        fp16_lm_cross_entropy (bool): if True use fp16 CE path (labels passed
+            to model); if False use fp32 CE path (model returns raw output,
+            CE computed externally).
+        vocab_parallel_cross_entropy_fn: callable — typically
+            mpu.vocab_parallel_cross_entropy.
+
+    Returns:
+        losses tensor (unreduced, per-token cross-entropy losses).
+    """
+    if fp16_lm_cross_entropy:
+        # fp16 path: model computes CE internally in fp16
+        losses = model(tokens, position_ids, attention_mask, labels=labels)
+    else:
+        # fp32 path: model returns raw output; CE computed here in float32
+        output = model(tokens, position_ids, attention_mask)
+        losses = vocab_parallel_cross_entropy_fn(output.contiguous().float(), labels)
+    return losses
+
+
+# --- End M297 engine ---
