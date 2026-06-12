@@ -402,9 +402,8 @@ def add_biencoder_args(parser):
                        help='Whether to scale retriever scores by inverse '
                        'square root of hidden size')
 
-    # faiss index
-    group.add_argument('--faiss-use-gpu', action='store_true',
-                       help='Whether create the FaissMIPSIndex on GPU')
+    # faiss index  (--faiss-use-gpu / --faiss-match / --faiss-topk-retrievals
+    #               moved to add_tasks_retriever_args per M611)
     group.add_argument('--block-data-path', type=str, default=None,
                        help='Where to save/load BlockData to/from')
 
@@ -591,3 +590,85 @@ def add_virtual_pipeline_arg(parser):
 # ---------------------------------------------------------------------------
 
 print('[M610]')
+
+# ---------------------------------------------------------------------------
+# M611: Megatron 43c9137b9 — Fixed based on review recommendation
+# Source commit: 43c9137b94edcbaa2a9d1e3c671e938bac4cc937
+# Author: Mostofa Patwary <mostofa.patwary@gmail.com>  Date: 2021-03-18
+#
+# Mapping:
+#   megatron/arguments.py _add_data_args()      → deepspeed/compile/megatron_arguments.py
+#   megatron/arguments.py _add_biencoder_args() → deepspeed/compile/megatron_arguments.py
+#   tasks/main.py get_tasks_args()              → add_tasks_retriever_args() (new, below)
+#   tasks/orqa/evaluate_orqa.py                 → no equivalent (skip)
+#   tasks/orqa/natural_questions/qa_utils.py    → license comment only (skip)
+#   tasks/orqa/natural_questions/tokenizers.py  → license comment only (skip)
+#
+# Changes ported:
+#   1. megatron/arguments.py _add_data_args(): remove --qa-data-dev / --qa-data-test
+#      (those args belong to task evaluation, not core data loading).
+#
+#   2. megatron/arguments.py _add_biencoder_args(): remove --faiss-use-gpu,
+#      --faiss-match, --faiss-topk-retrievals from the biencoder group.
+#      In Neuron_SP only --faiss-use-gpu was present (--faiss-match and
+#      --faiss-topk-retrievals were not yet ported); --faiss-use-gpu is now
+#      removed from add_biencoder_args() above.
+#
+#   3. tasks/main.py get_tasks_args(): receive the moved args under a new
+#      "Retriever args" and "Faiss arguments for retriever" comment block.
+#      Surfaced here as add_tasks_retriever_args() for callers that need
+#      task-specific retriever/faiss CLI flags.
+#
+# DeepSpeed adaptation:
+#   - add_biencoder_args() already had only --faiss-use-gpu in its faiss
+#     section; the comment line is updated and the add_argument removed.
+#   - add_tasks_retriever_args() consolidates qa-data + faiss flags the same
+#     way upstream tasks/main.py.get_tasks_args() does.
+# ---------------------------------------------------------------------------
+
+def add_tasks_retriever_args(parser):
+    """Register task-level QA / faiss retriever arguments.
+
+    Megatron 43c9137b9 tasks/main.py get_tasks_args() addition:
+
+      # Retriever args
+      group.add_argument('--qa-data-dev', type=str, default=None,
+                         help='Path to the QA dataset dev file.')
+      group.add_argument('--qa-data-test', type=str, default=None,
+                         help='Path to the QA dataset test file.')
+
+      # Faiss arguments for retriever
+      group.add_argument('--faiss-use-gpu', action='store_true',
+                         help='Whether create the FaissMIPSIndex on GPU')
+      group.add_argument('--faiss-match', type=str, default='string',
+                          choices=['regex', 'string'],
+                          help="Answer matching logic type")
+      group.add_argument('--faiss-topk-retrievals', type=int, default=100,
+                         help='Number of blocks to use as top-k during retrieval')
+
+    These args were previously scattered across _add_data_args() and
+    _add_biencoder_args(); the review recommendation moved them to the
+    task-evaluation level where they are actually consumed.
+    """
+    group = parser.add_argument_group(title='M611 task retriever / faiss arguments')
+
+    # Retriever args
+    group.add_argument('--qa-data-dev', type=str, default=None,
+                       help='Path to the QA dataset dev file.')
+    group.add_argument('--qa-data-test', type=str, default=None,
+                       help='Path to the QA dataset test file.')
+
+    # Faiss arguments for retriever
+    group.add_argument('--faiss-use-gpu', action='store_true',
+                       help='Whether create the FaissMIPSIndex on GPU')
+    group.add_argument('--faiss-match', type=str, default='string',
+                       choices=['regex', 'string'],
+                       help='Answer matching logic type')
+    group.add_argument('--faiss-topk-retrievals', type=int, default=100,
+                       help='Number of blocks to use as top-k during retrieval')
+
+    print('[M611] add_tasks_retriever_args: qa-data + faiss args registered')
+    return parser
+
+
+print('[M611]')
