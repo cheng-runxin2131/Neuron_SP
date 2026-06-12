@@ -353,6 +353,7 @@ def bert_input_constructor(batch_size, seq_len, tokenizer):
     return inputs
 
 
+print('[M181]')
 with get_accelerator().device(0):
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
     model = BertForSequenceClassification.from_pretrained('bert-base-uncased')
