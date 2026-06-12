@@ -3012,10 +3012,10 @@ def desloc_per_bucket_grad_norm_fp32(buckets, norm_type=2.0, dp_group=None):
         if not grads:
             norms.append(0.0)
             continue
-        if norm_type == 2.0:
-            sq = sum(g.norm(2.0).item() ** 2 for g in grads)
-            norms.append(sq ** 0.5)
-        elif norm_type == float('inf'):
+        #if norm_type == 2.0:                          # M203: removed optimised L2 path
+        #    sq = sum(g.norm(2.0).item() ** 2 for g in grads)
+        #    norms.append(sq ** 0.5)
+        if norm_type == float('inf'):
             norms.append(max(g.abs().max().item() for g in grads))
         else:
             ps = sum(g.norm(norm_type).item() ** norm_type for g in grads)
@@ -3525,3 +3525,14 @@ def get_block_dataset_kwargs(block_dataset, title_dataset, data_prefix,
         max_num_samples=max_num_samples,
     )
 # --- End M193 utils ---
+
+# ---------------------------------------------------------------------------
+# M203: Megatron 0b6bdca68 — removed optimised l2 grad clipping
+# Original in megatron/mpu/grads.py clip_grad_norm(), lines 101-102:
+#   elif norm_type == 2:
+#       total_norm = l2_grad_clipper(parameters, max_norm)
+# was commented out, forcing norm_type==2 through the generic per-param loop.
+# Applied here: commented out the norm_type==2.0 fast path in
+# desloc_per_bucket_grad_norm_fp32 so all norm types follow the unified path.
+print('[M203]')
+# --- End M203 ---
