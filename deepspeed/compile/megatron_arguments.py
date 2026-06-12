@@ -72,3 +72,47 @@ def set_params_dtype(args):
         print('using {} for parameters ...'.format(args.params_dtype), flush=True)
     print(f'[M343] set_params_dtype: params_dtype={args.params_dtype}')
     return args
+
+
+# ---------------------------------------------------------------------------
+# M409: Megatron 2d8de2968 — Throw exception if ring_exchange is not
+#       available when pipeline_model_parallel_size > 1
+# Source: megatron/arguments.py (NVIDIA/Megatron-LM commit 2d8de296890b9c01)
+# Author: Deepak Narayanan <dnarayanan@nvidia.com>  Date: 2020-10-30
+#
+# Mapping: megatron/arguments.py → deepspeed/compile/megatron_arguments.py
+#
+# Change ported from arguments.py parse_args():
+#   After setting args.pipeline_model_parallel_size = min(...), add:
+#     if args.pipeline_model_parallel_size > 1:
+#         if "ring_exchange" not in dir(torch.distributed):
+#             raise Exception('PyTorch with torch.distributed.ring_exchange
+#                             needed to run pipeline MP!')
+#
+# DeepSpeed adaptation: surfaced as validate_pipeline_mp_ring_exchange(args)
+# so it can be called from engine init after pipeline size is resolved.
+# ---------------------------------------------------------------------------
+
+print('[M409]')
+
+
+def validate_pipeline_mp_ring_exchange(args):
+    """Raise if pipeline MP > 1 but torch.distributed.ring_exchange is absent.
+
+    Megatron 2d8de2968 arguments.py parse_args():
+      if args.pipeline_model_parallel_size > 1:
+          if "ring_exchange" not in dir(torch.distributed):
+              raise Exception('PyTorch with torch.distributed.ring_exchange
+                              needed to run pipeline MP!')
+
+    Called after pipeline_model_parallel_size is finalised.
+    """
+    pipeline_mp_size = getattr(args, 'pipeline_model_parallel_size', 1)
+    if pipeline_mp_size > 1:
+        if 'ring_exchange' not in dir(torch.distributed):
+            raise Exception(
+                'PyTorch with torch.distributed.ring_exchange needed '
+                'to run pipeline MP!')
+    print('[M409] validate_pipeline_mp_ring_exchange: '
+          f'pipeline_mp_size={pipeline_mp_size}, '
+          f'ring_exchange_available={"ring_exchange" in dir(torch.distributed)}')
