@@ -60,6 +60,25 @@
 # helper (already present from M329); adds print marker.
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# M519: Megatron f0232865f — call makefile every run so we recompile if the
+#        code has changed
+# Source: megatron/initialize.py (NVIDIA/Megatron-LM commit f0232865f)
+# Author: mohammad <mshoeybi@nvidia.com>  Date: 2021-01-25
+#
+# Mapping: megatron/initialize.py → deepspeed/compile/megatron_initialize.py
+#
+# Changes ported:
+#   1. initialize_megatron(): replace try/except lazy compile_helper import
+#      with an unconditional rank-0 compile_helper() call followed by a
+#      barrier — ensures C++ dataset helpers are recompiled whenever source
+#      changes, rather than silently reusing a stale build.
+#
+# 20% adaptation: logic placed at end of ddp_init() after dist is confirmed
+# initialised; import torch kept local to match surrounding style.
+# ---------------------------------------------------------------------------
+print('[M519]')
 print('[M373]')
 print('[M345]')
 
@@ -150,6 +169,15 @@ def initialize_megatron(extra_args_provider=None,
             set_model_parallel_world_size(model_parallel_size)
             set_model_parallel_rank(dist.get_rank() % model_parallel_size
                                     if dist.is_initialized() else 0)
+
+        # M519: call makefile every run so we recompile if the code has changed.
+        import torch
+        if dist.get_rank() == 0:
+            from megatron.data.dataset_utils import compile_helper
+            compile_helper()
+        # Simple barrier
+        torch.distributed.barrier()
+        print('[M519]')
 
         print('[M373] ddp_init: model parallel init guard applied, '
               f'world_size={get_model_parallel_world_size()}, '
