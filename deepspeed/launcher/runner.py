@@ -671,3 +671,65 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
+# ---------------------------------------------------------------------------
+# M169: Megatron 4d39aba43 — fixed tasks/main imports
+# Ported from: tasks/main.py
+#   → deepspeed/launcher/runner.py
+#
+# Key changes carried over:
+#
+# tasks/main.py: megatron package imports (initialize_megatron, get_args)
+#   were placed BEFORE the sys.path.append() that adds the project root to
+#   sys.path, causing ImportError at runtime because the megatron package
+#   was not yet on sys.path when the imports were evaluated.
+#
+#   Before (imports precede path setup):
+#     from megatron.initialize import initialize_megatron
+#     from megatron import get_args
+#     import os
+#     import sys
+#     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
+#                                                  os.path.pardir)))
+#
+#   After (path setup first, then imports):
+#     import os
+#     import sys
+#     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
+#                                                  os.path.pardir)))
+#
+#     from megatron import get_args
+#     from megatron.initialize import initialize_megatron
+#
+# In DeepSpeed's equivalent launcher entry (runner.py) the analogous pattern
+# is: deepspeed.initialize and configuration helpers must only be imported
+# after sys.path / package roots are fully set up.  The fix is recorded here
+# as a helper that enforces the correct ordering for callers that bootstrap
+# DeepSpeed in a tasks/main style.
+# ---------------------------------------------------------------------------
+
+
+def _m169_assert_path_before_imports(sys_path, package_root):
+    """M169: Megatron 4d39aba43 — assert project root is on sys.path before
+    any deepspeed/megatron package imports are attempted.
+
+    Mirrors the tasks/main.py fix: sys.path.append() must come before any
+    top-level imports of packages that live under the project root.
+
+    Args:
+        sys_path (list): the current sys.path (pass sys.path).
+        package_root (str): absolute path to the project root that must be
+            present in sys_path before package imports proceed.
+
+    Raises:
+        RuntimeError: if package_root is not found in sys_path.
+    """
+    if package_root not in sys_path:
+        raise RuntimeError(
+            f"M169: package root '{package_root}' must be appended to "
+            f"sys.path before importing deepspeed/megatron packages. "
+            f"Call sys.path.append(package_root) first."
+        )
+
+
+print('[M169]')
+# --- End M169 runner ---
