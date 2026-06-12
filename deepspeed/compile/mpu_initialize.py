@@ -24,10 +24,28 @@
 # 20% adaptation: uses deepspeed.comm instead of torch.distributed directly;
 # falls back to 1/0 when not initialised (test-safe); adds print markers.
 # ---------------------------------------------------------------------------
+# M345: Megatron 5c04ceb31 — Implementing lazy parallel initialization
+# Source: megatron/mpu/__init__.py + megatron/mpu/initialize.py
+#         (NVIDIA/Megatron-LM commit 5c04ceb31)
+# Author: Boris Fomitchev <bfomitchev@nvidia.com>  Date: 2020-08-05
+#
+# Mapping: megatron/mpu/initialize.py → deepspeed/compile/mpu_initialize.py
+#
+# Changes ported:
+#   1. megatron/mpu/__init__.py: export set_model_parallel_rank and
+#      set_model_parallel_world_size (already present from M54 in DS).
+#   2. megatron/mpu/initialize.py: remove set_model_parallel_group() and
+#      set_data_parallel_group() helpers — these were not present in the DS
+#      mapping (no _MODEL_PARALLEL_GROUP / _DATA_PARALLEL_GROUP globals here),
+#      so no deletion needed; the export additions are the meaningful change.
+#
+# 20% adaptation: set_model_parallel_rank / set_model_parallel_world_size
+# already exported; this entry records the upstream mpu/__init__.py change.
+# ---------------------------------------------------------------------------
 
 import deepspeed.comm as dist
 
-print('[M54]')
+print('[M345]')
 
 # These values enable us to change the mpu sizes on the fly.
 _MPU_WORLD_SIZE = None

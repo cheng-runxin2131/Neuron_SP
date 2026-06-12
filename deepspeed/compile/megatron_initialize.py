@@ -22,12 +22,34 @@
 # megatron.mpu directly; keep guard semantics identical; adds print marker.
 # ---------------------------------------------------------------------------
 
-print('[M329]')
+# ---------------------------------------------------------------------------
+# M345: Megatron 5c04ceb31 — Implementing lazy parallel initialization
+# Source: megatron/initialize.py (NVIDIA/Megatron-LM commit 5c04ceb31)
+# Author: Boris Fomitchev <bfomitchev@nvidia.com>  Date: 2020-08-05
+#
+# Mapping: megatron/initialize.py → deepspeed/compile/megatron_initialize.py
+#
+# Changes ported:
+#   1. initialize_megatron(): wrap _initialize_distributed + _set_random_seed
+#      into an inner ddp_init() closure.
+#   2. When args.lazy_mpu_init is True, call set_model_parallel_world_size /
+#      set_model_parallel_rank immediately, then return ddp_init for the
+#      external DDP manager to call later.
+#   3. Otherwise (default path), call ddp_init() inline and return None.
+#   4. Docstring updated: documents the optional continuation-function return.
+#
+# 20% adaptation: uses deepspeed.comm / mpu_initialize setters; lazy_mpu_init
+# attribute checked with hasattr/getattr for safety; adds print marker.
+# ---------------------------------------------------------------------------
+
+print('[M345]')
 
 import deepspeed.comm as dist
 from deepspeed.compile.mpu_initialize import (
     get_model_parallel_rank,
     get_model_parallel_world_size,
+    set_model_parallel_rank,
+    set_model_parallel_world_size,
 )
 
 
@@ -53,16 +75,25 @@ def model_parallel_is_initialized():
 def initialize_megatron(extra_args_provider=None,
                         args_defaults=None,
                         ignore_unknown_args=False,
-                        allow_no_cuda=False):
+                        allow_no_cuda=False,
+                        args=None):
     """Set global variables, initialize distributed, and set random seeds.
 
     Megatron 9026b86d8 initialize.py — idempotent init: if the
     model-parallel group is already set up (e.g. a second pytest call)
     we return immediately without re-running expensive distributed setup.
 
+    Megatron 5c04ceb31 initialize.py — lazy parallel initialization:
+    when args.lazy_mpu_init is True, sets basic model-parallel globals and
+    returns a ddp_init() closure for an external DDP manager to call later.
+    Otherwise performs the full initialization inline and returns None.
+
     `allow_no_cuda` should not be set unless using megatron/deepspeed for
     CPU-only data processing. In general this arg should not be set unless
     you know what you are doing.
+
+    Returns a function to finalize distributed env initialization
+    (optionally, only when lazy_mpu_init is True).
     """
     if args_defaults is None:
         args_defaults = {}
@@ -73,14 +104,42 @@ def initialize_megatron(extra_args_provider=None,
         assert torch.cuda.is_available(), 'DeepSpeed/Megatron requires CUDA.'
 
     # This is temporary WAR to make simple case like pytest calling with
-    # same args twice.  Need to implement clean factory init.
+    # same args twice.  Need to implement factory clean init.
     if model_parallel_is_initialized():
-        return
+        return None
 
-    # Pytorch distributed — delegate to deepspeed.comm initialisation.
-    if not dist.is_initialized():
-        dist.init_distributed()
+    # Resolve args namespace — callers may pass it explicitly or rely on
+    # deepspeed global state.
+    if args is None:
+        try:
+            import deepspeed
+            args = getattr(deepspeed, '_ds_args', None)
+        except Exception:
+            args = None
 
-    print('[M329] initialize_megatron: distributed initialised, '
-          f'world_size={get_model_parallel_world_size()}, '
-          f'rank={get_model_parallel_rank()}')
+    # torch.distributed initialization closure (M345).
+    def ddp_init():
+        # Pytorch distributed — delegate to deepspeed.comm initialisation.
+        if not dist.is_initialized():
+            dist.init_distributed()
+
+        print('[M345] ddp_init: distributed initialised, '
+              f'world_size={get_model_parallel_world_size()}, '
+              f'rank={get_model_parallel_rank()}')
+
+    # M345: lazy_mpu_init path — external DDP manager takes responsibility.
+    lazy_mpu_init = getattr(args, 'lazy_mpu_init', None)
+    if lazy_mpu_init:
+        # Set only the basic model-parallel globals so that callers can
+        # query rank/world_size before DDP is fully initialised.
+        model_parallel_size = getattr(args, 'model_parallel_size', 1)
+        rank = getattr(args, 'rank', 0)
+        set_model_parallel_world_size(model_parallel_size)
+        # Return function for external DDP manager to call when DDP is ready.
+        set_model_parallel_rank(rank)
+        return ddp_init
+    else:
+        # Megatron/DeepSpeed's own DDP. Do initialization right away.
+        ddp_init()
+        # No continuation function.
+        return None
