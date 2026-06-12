@@ -3243,6 +3243,8 @@ class DeepSpeedEngine(Module):
         elif self.zero_optimization() or self.fp16_enabled() or self.amp_enabled():
             self.optimizer.zero_grad()
         else:
+            # M393: fp32 path — zero_grad without set_grads_to_None (Megatron 28cd66e1a)
+            print('[M393]')
             self.zero_grad()
 
         # Check overflow here since in DS fp16 optimizer, the overflow is updated in above step() function.
