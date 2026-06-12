@@ -6638,3 +6638,105 @@ def _m297_gpt2_forward_with_fp16_lm_cross_entropy(model, tokens, position_ids,
 
 
 # --- End M297 engine ---
+
+# ---------------------------------------------------------------------------
+# M467: Megatron 13bde16f7 — Checkpoint should be saved only after evaluation
+#       pass is run to make sure validation losses are identical after loading
+#       checkpoint.
+#
+# Upstream diff (megatron/training.py, train()):
+#   The "Checkpointing" block (save_checkpoint_and_time + saved_checkpoint=True)
+#   was moved from BEFORE the "Evaluation" block to AFTER it.  This guarantees
+#   that whenever a checkpoint is saved, the model has already completed an
+#   evaluation pass at that iteration, so reloading the checkpoint and running
+#   evaluation again yields the same validation loss.
+#
+#   Before (buggy order):
+#       1. Checkpointing  ← saved before eval ran
+#       2. Evaluation
+#
+#   After (correct order):
+#       1. Evaluation     ← eval always runs first
+#       2. Checkpointing  ← saved after eval completed
+#
+# Neuron_SP mapping:
+#   megatron/training.py → deepspeed/runtime/engine.py (train-loop logic).
+#   The helper below documents the correct ordering contract and provides a
+#   reference implementation for any Neuron_SP training loop that interleaves
+#   checkpoint saving with periodic evaluation.
+# ---------------------------------------------------------------------------
+
+print('[M467]')
+
+
+def _m467_train_loop_step_order(
+    iteration,
+    args,
+    forward_step_func,
+    model,
+    optimizer,
+    lr_scheduler,
+    train_data_iterator,
+    valid_data_iterator,
+    evaluate_fn,
+    save_checkpoint_and_time_fn,
+    prefix='validation',
+):
+    """M467: Megatron 13bde16f7 — eval-before-checkpoint ordering in train loop.
+
+    Runs one iteration's end-of-step logic in the correct order:
+      1. Evaluation (if eval_interval hits)
+      2. Checkpointing (if save_interval hits)
+
+    This ensures that a checkpoint always captures a model state that has
+    been evaluated at the same iteration, so that loading the checkpoint and
+    re-running evaluation produces identical validation losses.
+
+    Args:
+        iteration (int): current training iteration (1-indexed).
+        args: argument namespace with at least the following attributes:
+            eval_interval (int | None): run eval every N iterations.
+            do_valid (bool): whether to run validation.
+            save (str | None): checkpoint save directory (None → no saving).
+            save_interval (int | None): save checkpoint every N iterations.
+        forward_step_func: forward step callable passed to evaluate_fn.
+        model: model instance(s).
+        optimizer: optimizer instance.
+        lr_scheduler: learning-rate scheduler instance.
+        train_data_iterator: iterator over training data.
+        valid_data_iterator: iterator over validation data.
+        evaluate_fn: callable with signature
+            evaluate_fn(forward_step_func, data_iterator, model,
+                        iteration, write_to_tensorboard) → loss_dict.
+        save_checkpoint_and_time_fn: callable with signature
+            save_checkpoint_and_time_fn(iteration, model, optimizer,
+                                        lr_scheduler).
+        prefix (str): label passed to evaluate_fn (default 'validation').
+
+    Returns:
+        saved_checkpoint (bool): True if a checkpoint was saved this iteration.
+    """
+    # Step 1 — Evaluation (must run before checkpointing per M467 fix).
+    if args.eval_interval and iteration % args.eval_interval == 0 and \
+            args.do_valid:
+        prefix_iter = f'iteration {iteration}'
+        evaluate_fn(
+            forward_step_func,
+            valid_data_iterator,
+            model,
+            iteration,
+            False,
+        )
+
+    # Step 2 — Checkpointing (runs after eval so the saved state is consistent
+    #           with the validation loss reported at this iteration).
+    saved_checkpoint = False
+    if args.save and args.save_interval and \
+            iteration % args.save_interval == 0:
+        save_checkpoint_and_time_fn(iteration, model, optimizer, lr_scheduler)
+        saved_checkpoint = True
+
+    return saved_checkpoint
+
+
+# --- End M467 engine ---
