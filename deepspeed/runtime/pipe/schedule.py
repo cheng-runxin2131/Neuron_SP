@@ -347,11 +347,17 @@ class InterleavedTrainSchedule(PipeSchedule):
 
         self._num_remaining = num_mb_total - self._num_warmup
 
+        # Measure pipeline stall only if there are enough microbatches
+        # to have every worker in a warmup and steady state phase.
+        self.measure_pipeline_stall = self.micro_batches >= self.stages
+
+        print('[M592]')
         print(
             f"[InterleavedTrainSchedule] stage={stage_id}/{stages} "
             f"chunks={num_model_chunks} mb_total={num_mb_total} "
             f"warmup={self._num_warmup} steady_pairs={self._num_remaining} "
-            f"all_warmup={self._all_warmup}"
+            f"all_warmup={self._all_warmup} "
+            f"measure_stall={self.measure_pipeline_stall}"
         )
 
     # ------------------------------------------------------------------
