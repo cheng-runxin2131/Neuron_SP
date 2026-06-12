@@ -1,4 +1,4 @@
-print('[M276]')
+print('[M302]')
 import itertools
 import os
 import random
