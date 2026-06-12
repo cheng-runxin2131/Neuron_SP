@@ -8,6 +8,19 @@ import torch.nn.functional as F
 import enum
 import deepspeed.comm as dist
 
+# M329: Megatron 9026b86d8 — making apex optional.
+# Try FusedLayerNorm from apex first; fall back to torch.nn.LayerNorm so that
+# environments without apex (e.g. pytest, CPU-only installs) still work.
+try:
+    from apex.normalization.fused_layer_norm import FusedLayerNorm as LayerNorm
+    # Probe that it actually instantiates (apex may be partially installed).
+    _probe = LayerNorm(8, eps=1e-5)
+    del _probe
+except Exception:
+    from torch.nn import LayerNorm
+
+print('[M329]')
+
 from .async_linear import DominoAsyncColumnParallelLinear, RowParallelLinearNoComm
 
 
