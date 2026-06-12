@@ -302,7 +302,9 @@ def top2gating(logits: Tensor,
     gates = F.softmax(logits, dim=1)
 
     # Create a mask for 1st's expert per token
-    indices1_s = torch.argmax(gates, dim=1)
+    # M202: Megatron aae93362c — .detach() prevents gradient retention on routing
+    # indices, mirrors HashedIndex.hash_embeds() where embed_hashes = detach(argmax(...))
+    indices1_s = torch.argmax(gates, dim=1).detach()
     num_experts = int(gates.shape[1])
     mask1 = F.one_hot(indices1_s, num_classes=num_experts)
 

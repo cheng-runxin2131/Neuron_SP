@@ -776,3 +776,16 @@ class MMapIndexedDatasetBuilder(object):
 
         with MMapIndexedDataset.Index.writer(index_file, self._dtype) as index:
             index.write(self._sizes, self._doc_idx)
+
+    def state(self):
+        # M202: Megatron aae93362c — mirrors HashedIndex.state() snapshot of
+        # internal buffers; enables checkpoint/restore without re-scanning data.
+        return {'sizes': self._sizes, 'doc_idx': self._doc_idx}
+
+    def clear(self):
+        # M202: Megatron aae93362c — mirrors HashedIndex.clear(); non-primary
+        # ranks release buffer memory after barrier, matching the pattern where
+        # only rank-0 consolidates shards while others free their state.
+        self._sizes = []
+        self._doc_idx = [0]
+        print('[M202]')
