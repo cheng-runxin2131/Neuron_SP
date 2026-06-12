@@ -306,8 +306,7 @@ class InverseClozeDataset(Dataset):
             start_time = time.time()
             print_rank_0(' > building samples index mapping for {} ...'.format(
                 self.name))
-            from megatron.data.dataset_utils import compile_helper
-            compile_helper()
+            print('[M562]')
             from megatron.data import helpers
             samples_mapping = helpers.build_blocks_mapping(
                 self.block_dataset.doc_idx,
