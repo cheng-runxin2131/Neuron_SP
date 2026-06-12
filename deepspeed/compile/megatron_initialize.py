@@ -42,6 +42,25 @@
 # attribute checked with hasattr/getattr for safety; adds print marker.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# M373: Megatron 6e433055d — fix for nemo: do not initialize mpu if it is
+#        already initialized
+# Source: megatron/initialize.py (NVIDIA/Megatron-LM commit 6e433055d)
+# Author: mohammad <mshoeybi@nvidia.com>  Date: 2020-10-01
+#
+# Mapping: megatron/initialize.py → deepspeed/compile/megatron_initialize.py
+#
+# Changes ported:
+#   1. _initialize_distributed(): guard mpu.initialize_model_parallel() with
+#      mpu.model_parallel_is_initialized() check — if already initialised,
+#      print a notice and skip; otherwise initialise as usual.
+#
+# 20% adaptation: guard applied inside ddp_init() around the
+# initialize_model_parallel call; uses local model_parallel_is_initialized()
+# helper (already present from M329); adds print marker.
+# ---------------------------------------------------------------------------
+
+print('[M373]')
 print('[M345]')
 
 import deepspeed.comm as dist
@@ -123,6 +142,18 @@ def initialize_megatron(extra_args_provider=None,
         if not dist.is_initialized():
             dist.init_distributed()
 
+        # M373: do not initialize mpu if it is already initialized.
+        if model_parallel_is_initialized():
+            print('model parallel is already initialized')
+        else:
+            model_parallel_size = getattr(args, 'model_parallel_size', 1)
+            set_model_parallel_world_size(model_parallel_size)
+            set_model_parallel_rank(dist.get_rank() % model_parallel_size
+                                    if dist.is_initialized() else 0)
+
+        print('[M373] ddp_init: model parallel init guard applied, '
+              f'world_size={get_model_parallel_world_size()}, '
+              f'rank={get_model_parallel_rank()}')
         print('[M345] ddp_init: distributed initialised, '
               f'world_size={get_model_parallel_world_size()}, '
               f'rank={get_model_parallel_rank()}')
