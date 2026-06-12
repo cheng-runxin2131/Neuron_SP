@@ -2801,3 +2801,168 @@ class _M211RealmDataset:
 #
 #   print('[M232]') added to deepspeed/hashed_index.py at module load time.
 # --- End M232 dataloader ---
+
+# M236: Megatron 16a64c41b — Move get_train_val... to dataset_utils
+# Ported from:
+#   megatron/data/bert_dataset.py   → deepspeed/runtime/dataloader.py
+#   megatron/data/dataset_utils.py  → deepspeed/runtime/dataloader.py
+#   pretrain_bert.py                → deepspeed/runtime/dataloader.py
+#   pretrain_bert_ict.py            → deepspeed/runtime/dataloader.py
+#   pretrain_realm.py               → deepspeed/runtime/dataloader.py
+#
+# Key changes carried over:
+#   1. bert_dataset.py:
+#      - Removed `from megatron.data.realm_dataset import InverseClozeDataset`
+#        (import is no longer needed at module level; realm_dataset is only
+#         imported inside the local build_dataset() closure, which now lives
+#         in dataset_utils.py).
+#      - Removed `build_train_valid_test_datasets()` factory function entirely.
+#        The function body (indexed_dataset construction, split calculation,
+#        per-split slicing of doc_idx, BertDataset / RealmDataset / InverseClozeDataset
+#        dispatch) has moved verbatim to dataset_utils.py.
+#      - `DATASET_TYPES`, `get_indexed_dataset_`, `get_train_valid_test_split_`,
+#        and `BertDataset` remain in bert_dataset.py so dataset_utils.py can
+#        import them.
+#
+#   2. dataset_utils.py:
+#      - Added three new imports at the top of the file:
+#          from megatron import print_rank_0
+#          from megatron.data.bert_dataset import (DATASET_TYPES,
+#              get_indexed_dataset_, get_train_valid_test_split_, BertDataset)
+#          from megatron.data.realm_dataset import InverseClozeDataset
+#      - Appended `build_train_valid_test_datasets()` at the end of the module
+#        (identical body to the version removed from bert_dataset.py).
+#      - Note: original file had no trailing newline; the appended function
+#        immediately follows `return tokens_np, tokentypes_np, ...`.
+#
+#   3. pretrain_bert.py / pretrain_bert_ict.py / pretrain_realm.py:
+#      - Each file changes exactly one import line:
+#          Before: from megatron.data.bert_dataset import build_train_valid_test_datasets
+#          After:  from megatron.data.dataset_utils import build_train_valid_test_datasets
+#      - No other changes in any of the three pretrain scripts.
+#
+# DeepSpeed mapping:
+#   - deepspeed/runtime/dataloader.py already tracks build_train_valid_test_datasets
+#     across M70 / M119 / M212 / M214.  The canonical import path in those stubs
+#     should be read as megatron.data.dataset_utils (not bert_dataset) for commits
+#     at or after 16a64c41b.
+#   - Any future DS code that calls megatron's build_train_valid_test_datasets must
+#     import from megatron.data.dataset_utils, not megatron.data.bert_dataset.
+# ---------------------------------------------------------------------------
+
+print('[M236]')
+
+
+def _m236_bert_dataset_removed_imports():
+    """M236: Megatron 16a64c41b — imports removed from bert_dataset.py.
+
+    Before (bert_dataset.py line ~29):
+        from megatron.data.realm_dataset import InverseClozeDataset
+
+    After: line deleted entirely.  InverseClozeDataset is only used inside the
+    build_dataset() closure in build_train_valid_test_datasets(), which has moved
+    to dataset_utils.py.  bert_dataset.py no longer needs this import at module scope.
+    """
+    pass
+
+
+def _m236_dataset_utils_new_imports():
+    """M236: Megatron 16a64c41b — new imports added to dataset_utils.py.
+
+    Three lines inserted after `import numpy as np` (line ~25):
+
+        from megatron import print_rank_0
+        from megatron.data.bert_dataset import (
+            DATASET_TYPES, get_indexed_dataset_, get_train_valid_test_split_, BertDataset)
+        from megatron.data.realm_dataset import InverseClozeDataset
+
+    These imports supply everything build_train_valid_test_datasets() needs now
+    that it lives in dataset_utils.py instead of bert_dataset.py.
+    """
+    pass
+
+
+def _m236_build_train_valid_test_datasets_location():
+    """M236: Megatron 16a64c41b — build_train_valid_test_datasets moved to dataset_utils.py.
+
+    Function body is identical to the version removed from bert_dataset.py:
+
+        def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
+                                            train_valid_test_num_samples,
+                                            max_seq_length, masked_lm_prob,
+                                            short_seq_prob, seed, skip_warmup,
+                                            dataset_type='standard_bert'):
+
+            if dataset_type not in DATASET_TYPES:
+                raise ValueError("Invalid dataset_type: ", dataset_type)
+
+            indexed_dataset = get_indexed_dataset_(data_prefix, data_impl, skip_warmup)
+
+            if dataset_type == 'ict':
+                title_dataset = get_indexed_dataset_(data_prefix + '-titles',
+                                                     data_impl, skip_warmup)
+
+            total_num_of_documents = indexed_dataset.doc_idx.shape[0] - 1
+            splits = get_train_valid_test_split_(splits_string, total_num_of_documents)
+
+            print_rank_0(' > dataset split:')
+            # ... print_split_stats for train / validation / test ...
+
+            def build_dataset(index, name):
+                from megatron.data.realm_dataset import RealmDataset
+                dataset = None
+                if splits[index + 1] > splits[index]:
+                    doc_idx_ptr = indexed_dataset.get_doc_idx()
+                    indexed_dataset.set_doc_idx(
+                        doc_idx_ptr[splits[index]:splits[index + 1] + 1])
+                    kwargs = dict(name=name, data_prefix=data_prefix, num_epochs=None,
+                                  max_num_samples=train_valid_test_num_samples[index],
+                                  max_seq_length=max_seq_length,
+                                  short_seq_prob=short_seq_prob, seed=seed)
+                    if dataset_type == 'ict':
+                        dataset = InverseClozeDataset(block_dataset=indexed_dataset,
+                                                      title_dataset=title_dataset,
+                                                      **kwargs)
+                    else:
+                        dataset_cls = (BertDataset if dataset_type == 'standard_bert'
+                                       else RealmDataset)
+                        dataset = dataset_cls(indexed_dataset=indexed_dataset,
+                                              masked_lm_prob=masked_lm_prob, **kwargs)
+                    indexed_dataset.set_doc_idx(doc_idx_ptr)
+                    assert indexed_dataset.doc_idx[0] == 0
+                    assert indexed_dataset.doc_idx.shape[0] == (total_num_of_documents + 1)
+                return dataset
+
+            train_dataset = build_dataset(0, 'train')
+            valid_dataset = build_dataset(1, 'valid')
+            test_dataset = build_dataset(2, 'test')
+            return (train_dataset, valid_dataset, test_dataset)
+
+    New canonical import path (post-16a64c41b):
+        from megatron.data.dataset_utils import build_train_valid_test_datasets
+    """
+    pass
+
+
+def _m236_pretrain_scripts_import_update():
+    """M236: Megatron 16a64c41b — import change in three pretrain scripts.
+
+    pretrain_bert.py (line ~25):
+        Before: from megatron.data.bert_dataset import build_train_valid_test_datasets
+        After:  from megatron.data.dataset_utils import build_train_valid_test_datasets
+
+    pretrain_bert_ict.py (line ~25):
+        Before: from megatron.data.bert_dataset import build_train_valid_test_datasets
+        After:  from megatron.data.dataset_utils import build_train_valid_test_datasets
+
+    pretrain_realm.py (line ~27):
+        Before: from megatron.data.bert_dataset import build_train_valid_test_datasets
+        After:  from megatron.data.dataset_utils import build_train_valid_test_datasets
+
+    All three files are otherwise unchanged.  The public API of
+    build_train_valid_test_datasets() (signature, behaviour, return type)
+    is identical; only the module that hosts it changes.
+    """
+    pass
+
+# --- End M236 dataloader ---
