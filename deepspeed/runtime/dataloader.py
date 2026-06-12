@@ -1564,3 +1564,324 @@ def m120_preprocess_data(args):
 
 
 # --- End M120 dataloader ---
+
+# ---------------------------------------------------------------------------
+# M119: Megatron f66c58a9b — added build sample index to c++
+# Ported from:
+#   megatron/data/helpers.cpp      → deepspeed/runtime/dataloader.py
+#   megatron/data/new_gpt2_dataset.py → deepspeed/runtime/dataloader.py
+#
+# Key changes carried over:
+#   1. helpers.cpp: new C++ function build_sample_idx() added and registered
+#      via pybind11 as helpers.build_sample_idx.
+#      Signature: build_sample_idx(sizes, doc_idx, seq_length, num_epochs,
+#                                  tokens_per_epoch) -> np.ndarray shape [N+1, 2]
+#      The output is a 2D array where column 0 is the index into doc_idx and
+#      column 1 is the starting offset within that document.
+#      Memory is allocated as int32_t[2*(num_samples+1)] and freed via a
+#      py::capsule destructor; returned as a strided numpy array with
+#      C-contiguous layout [{2*sizeof(int32), sizeof(int32)}].
+#
+#   2. new_gpt2_dataset.py: _build_sample_idx (pure-Python) replaced by
+#      helpers.build_sample_idx (C++ extension) in _build_index_mappings.
+#      The old Python call is commented out in the diff for reference.
+#      import helpers moved to module level (was inside _build_index_mappings).
+#
+#   3. new_gpt2_dataset.py: _build_doc_idx: doc_idx converted to np.int32
+#      (was float64 from np.mgrid) before the shuffle so the array passed
+#      to helpers.build_sample_idx already has the expected dtype.
+#
+#   4. new_gpt2_dataset.py: build_train_valid_test_datasets() and
+#      get_indexed_dataset_() factory functions added at module level,
+#      enabling the split-build-return pattern used by GPT-2 pretraining.
+#
+#   5. new_gpt2_dataset.py: test loop upper bound widened 1234..1240 →
+#      1234..1245 (covers 5 additional random seeds in __main__ block).
+#
+# Neuron_SP adaptation:
+#   The C++ build_sample_idx function is documented and its pure-Python
+#   equivalent is provided below as _m119_build_sample_idx_py() for
+#   environments where the helpers C extension is unavailable (e.g., CPU-
+#   only nodes, unit tests).  Production code should prefer the C++ path.
+#   The new GPT-2 dataset factory helpers are ported as module-level
+#   functions following the same _mNNN_ naming convention.
+# ---------------------------------------------------------------------------
+
+print('[M119]')
+
+
+def _m119_build_sample_idx_py(sizes, doc_idx, seq_length, num_epochs,
+                               tokens_per_epoch):
+    """M119: Megatron f66c58a9b — pure-Python fallback for build_sample_idx.
+
+    Production code should use helpers.build_sample_idx (C++ via pybind11).
+    This fallback mirrors the C++ logic exactly so it can be used for testing
+    and on platforms where the helpers extension has not been compiled.
+
+    The returned array has shape [num_samples + 1, 2] with dtype int32.
+    Column 0: index into doc_idx.
+    Column 1: byte/token offset within that document.
+
+    The extra trailing row (index num_samples) marks the end of the last
+    sample so callers can compute sample length as:
+        end_doc, end_offset = sample_idx[i + 1]
+        start_doc, start_offset = sample_idx[i]
+
+    Args:
+        sizes (np.ndarray int32): token count per document (full corpus).
+        doc_idx (np.ndarray int32): shuffled document order across epochs.
+        seq_length (int): target sequence length (must be > 1).
+        num_epochs (int): number of training epochs (must be > 0).
+        tokens_per_epoch (int): total tokens in one epoch (must be > 1).
+
+    Returns:
+        np.ndarray: shape [num_samples + 1, 2], dtype int32.
+    """
+    import numpy as np
+
+    assert seq_length > 1
+    assert num_epochs > 0
+    assert tokens_per_epoch > 1
+
+    num_samples = (num_epochs * tokens_per_epoch - 1) // seq_length
+
+    print('    using:')
+    print('     number of documents:       {}'.format(
+        doc_idx.shape[0] // num_epochs))
+    print('     number of epochs:          {}'.format(num_epochs))
+    print('     sequence length:           {}'.format(seq_length))
+    print('     total number of samples:   {}'.format(num_samples))
+
+    sample_idx = np.zeros([num_samples + 1, 2], dtype=np.int32)
+
+    sample_index = 0
+    doc_idx_index = 0
+    doc_offset = 0
+
+    sample_idx[sample_index, 0] = doc_idx_index
+    sample_idx[sample_index, 1] = doc_offset
+    sample_index += 1
+
+    while sample_index <= num_samples:
+        remaining_seq_length = seq_length + 1
+        while remaining_seq_length != 0:
+            doc_id = doc_idx[doc_idx_index]
+            doc_length = sizes[doc_id] - doc_offset
+            remaining_seq_length -= doc_length
+            if remaining_seq_length <= 0:
+                # Current document is long enough — record offset within it.
+                # -1 accounts for the same reason num_epochs uses -1 in
+                # tokens_per_epoch calculations.
+                doc_offset += (remaining_seq_length + doc_length - 1)
+                remaining_seq_length = 0
+            else:
+                # Move to the next document.
+                doc_idx_index += 1
+                doc_offset = 0
+        sample_idx[sample_index, 0] = doc_idx_index
+        sample_idx[sample_index, 1] = doc_offset
+        sample_index += 1
+
+    return sample_idx
+
+
+def _m119_build_doc_idx_int32(documents, num_epochs, np_rng):
+    """M119: Megatron f66c58a9b — _build_doc_idx with explicit int32 cast.
+
+    Before this commit doc_idx was the result of np.mgrid which returns
+    float64 on some numpy versions.  helpers.build_sample_idx expects int32;
+    the fix adds doc_idx = doc_idx.astype(np.int32) before the shuffle.
+
+    Args:
+        documents (np.ndarray): array of document indices for one epoch.
+        num_epochs (int): number of epochs to tile documents over.
+        np_rng: numpy RandomState used for shuffling.
+
+    Returns:
+        np.ndarray int32: flattened, shuffled document index array of length
+        num_epochs * len(documents).
+    """
+    import numpy as np
+
+    doc_idx = np.mgrid[0:num_epochs, 0:len(documents)][1]
+    doc_idx[:] = documents
+    doc_idx = doc_idx.reshape(-1)
+    # M119: explicit int32 cast — helpers.build_sample_idx requires int32.
+    doc_idx = doc_idx.astype(np.int32)
+    np_rng.shuffle(doc_idx)
+    return doc_idx
+
+
+def _m119_build_index_mappings_use_cpp(name, data_prefix, documents, sizes,
+                                       num_samples, seq_length, seed,
+                                       helpers_mod, print_rank_0_fn):
+    """M119: Megatron f66c58a9b — _build_index_mappings using C++ build_sample_idx.
+
+    Replaces the inner sample-idx call from the pure-Python _build_sample_idx
+    with helpers.build_sample_idx (C++ via pybind11).  The doc_idx array is
+    cast to int32 before being passed (see _m119_build_doc_idx_int32).
+
+    The function mirrors the structure of new_gpt2_dataset._build_index_mappings
+    and is provided here as a callable stub for Neuron_SP callers that manage
+    their own index-mapping build loop.
+
+    Args:
+        name (str): dataset name used as a filename prefix.
+        data_prefix (str): path prefix for .npy cache files.
+        documents (np.ndarray): document indices for this split.
+        sizes (np.ndarray int32): token count per document.
+        num_samples (int): total number of training samples required.
+        seq_length (int): target sequence length.
+        seed (int): random seed for document shuffling.
+        helpers_mod: the compiled helpers extension module exposing
+            build_sample_idx and build_mapping.
+        print_rank_0_fn (callable): print function (no-op on rank > 0).
+
+    Returns:
+        tuple: (doc_idx, sample_idx, shuffle_idx) as numpy arrays.
+    """
+    import os
+    import numpy as np
+    import torch
+
+    _NUM_EPOCHS_DEFAULT_MULTIPLIER = 20  # same heuristic as Megatron upstream
+
+    def _num_tokens(doc_list, sz):
+        """Total token count for the given document list."""
+        return np.sum(sz[doc_list])
+
+    def _num_epochs(tokens_per_epoch, seq_length, n_samples):
+        num_epochs_ = 0
+        total_tokens = 0
+        while True:
+            num_epochs_ += 1
+            total_tokens += tokens_per_epoch
+            if ((total_tokens - 1) // seq_length) >= n_samples:
+                return num_epochs_
+
+    tokens_per_epoch = _num_tokens(documents, sizes)
+    num_epochs = _num_epochs(tokens_per_epoch, seq_length, num_samples)
+
+    np_rng = np.random.RandomState(seed=seed)
+
+    # doc-idx
+    doc_idx = _m119_build_doc_idx_int32(documents, num_epochs, np_rng)
+
+    # sample-idx: use C++ helper (M119 change)
+    sample_idx = helpers_mod.build_sample_idx(sizes, doc_idx, seq_length,
+                                              num_epochs, tokens_per_epoch)
+    # shuffle-idx
+    num_samples_ = sample_idx.shape[0] - 1
+    shuffle_idx = np.arange(start=0, stop=num_samples_, step=1, dtype=np.int64)
+    np_rng.shuffle(shuffle_idx)
+
+    print_rank_0_fn(' > size of doc-idx:     {}'.format(doc_idx.shape[0]))
+    print_rank_0_fn(' > size of sample-idx:  {}'.format(sample_idx.shape[0]))
+    print_rank_0_fn(' > size of shuffle-idx: {}'.format(shuffle_idx.shape[0]))
+
+    return doc_idx, sample_idx, shuffle_idx
+
+
+def _m119_get_indexed_dataset(data_prefix, data_impl, skip_warmup,
+                               make_indexed_dataset_fn, print_rank_0_fn):
+    """M119: Megatron f66c58a9b — get_indexed_dataset_ for GPT-2 datasets.
+
+    New module-level factory added in new_gpt2_dataset.py alongside
+    build_train_valid_test_datasets.  Mirrors the BertDataset equivalent
+    from M36/M37 but without the doc_idx[-1] assertion (GPT-2 indexed
+    datasets do not guarantee contiguity in the same way).
+
+    Args:
+        data_prefix (str): path prefix passed to make_indexed_dataset_fn.
+        data_impl (str): dataset implementation type ('mmap', 'lazy', etc.).
+        skip_warmup (bool): whether to skip mmap warmup.
+        make_indexed_dataset_fn: callable(data_prefix, data_impl, skip_warmup).
+        print_rank_0_fn (callable): print function (no-op on rank > 0).
+
+    Returns:
+        indexed dataset object with .sizes attribute.
+    """
+    import time
+
+    print_rank_0_fn(' > building dataset index ...')
+    start_time = time.time()
+    indexed_dataset = make_indexed_dataset_fn(data_prefix, data_impl, skip_warmup)
+    print_rank_0_fn(' > finished creating indexed dataset in {:4f} '
+                    'seconds'.format(time.time() - start_time))
+    print_rank_0_fn(' > indexed dataset stats:')
+    print_rank_0_fn('    number of documents: {}'.format(
+        indexed_dataset.sizes.shape[0]))
+    return indexed_dataset
+
+
+def _m119_build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
+                                          train_valid_test_num_samples,
+                                          seq_length, seed, skip_warmup,
+                                          make_indexed_dataset_fn,
+                                          gpt2_dataset_cls,
+                                          get_train_valid_test_split_fn,
+                                          print_rank_0_fn):
+    """M119: Megatron f66c58a9b — build_train_valid_test_datasets for GPT-2.
+
+    New top-level factory added in new_gpt2_dataset.py in this commit.
+    Constructs train/valid/test GPT2Dataset instances from a single indexed
+    dataset, splitting by document count according to splits_string.
+
+    Args:
+        data_prefix (str): path prefix for the dataset.
+        data_impl (str): dataset implementation ('mmap', 'lazy', etc.).
+        splits_string (str): comma/slash-separated split ratios e.g. '90,5,5'.
+        train_valid_test_num_samples (list[int]): [train_n, valid_n, test_n].
+        seq_length (int): target sequence length.
+        seed (int): random seed for document shuffling.
+        skip_warmup (bool): whether to skip mmap warmup.
+        make_indexed_dataset_fn: callable(prefix, impl, warmup).
+        gpt2_dataset_cls: GPT2Dataset-compatible class constructor.
+        get_train_valid_test_split_fn: callable(splits_string, total_docs) ->
+            4-element list of boundary indices.
+        print_rank_0_fn (callable): rank-0 print.
+
+    Returns:
+        tuple: (train_dataset, valid_dataset, test_dataset); any may be None
+        if its split contains zero documents.
+    """
+    import numpy as np
+
+    indexed_dataset = _m119_get_indexed_dataset(
+        data_prefix, data_impl, skip_warmup,
+        make_indexed_dataset_fn, print_rank_0_fn)
+
+    total_num_of_documents = indexed_dataset.sizes.shape[0]
+    splits = get_train_valid_test_split_fn(splits_string, total_num_of_documents)
+
+    print_rank_0_fn(' > dataset split:')
+
+    def print_split_stats(name, index):
+        print_rank_0_fn('    {}:'.format(name))
+        print_rank_0_fn(
+            '     document indices in [{}, {}) total of {} '
+            'documents'.format(splits[index], splits[index + 1],
+                               splits[index + 1] - splits[index]))
+
+    print_split_stats('train', 0)
+    print_split_stats('validation', 1)
+    print_split_stats('test', 2)
+
+    def build_dataset(index, name):
+        dataset = None
+        if splits[index + 1] > splits[index]:
+            documents = np.arange(start=splits[index], end=splits[index + 1],
+                                  step=1, dtype=np.int32)
+            dataset = gpt2_dataset_cls(
+                name, data_prefix, documents, indexed_dataset,
+                train_valid_test_num_samples[index],
+                seq_length, seed)
+        return dataset
+
+    train_dataset = build_dataset(0, 'train')
+    valid_dataset = build_dataset(1, 'valid')
+    test_dataset = build_dataset(2, 'test')
+
+    return train_dataset, valid_dataset, test_dataset
+
+# --- End M119 dataloader ---
