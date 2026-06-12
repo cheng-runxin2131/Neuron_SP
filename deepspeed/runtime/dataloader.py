@@ -1404,3 +1404,163 @@ def _m102_valid_data_path(args_valid_data):
 
 print('[M102]')
 # --- End M102 dataloader ---
+
+# ---------------------------------------------------------------------------
+# M120: Megatron da0562fcf — Updates to preprocess_data.py and indexed_dataset.
+# preprocess_data: adds ability to not split sentences (for GPT-2 datasets),
+# adds ability to create multiple datasets from different JSON keys.
+# indexed_dataset: adds new "get" function to retrieve a portion of an entry.
+# ---------------------------------------------------------------------------
+
+import json
+import multiprocessing
+import sys
+import time
+
+
+try:
+    import nltk as _nltk
+    _nltk_available = True
+except ImportError:
+    _nltk_available = False
+
+
+class _CustomLanguageVars(_nltk.tokenize.punkt.PunktLanguageVars if _nltk_available else object):
+    """M120: preserves empty lines with NLTK's Punkt tokenizer."""
+
+    _period_context_fmt = r"""
+        \S*                          # some word material
+        %(SentEndChars)s             # a potential sentence ending
+        \s*                       #  <-- changed from \s+ to allow empty lines
+        (?=(?P<after_tok>
+            %(NonWord)s              # either other punctuation
+            |
+            (?P<next_tok>\S+)     #  <-- Normally you would have \s+ here
+        ))"""
+
+
+class _IdentitySplitter(object):
+    """M120: no-op splitter — returns text as a single 'sentence'."""
+
+    def tokenize(self, *text):
+        return text
+
+
+class _M120Encoder(object):
+    """M120: multiprocessing encoder for indexed-dataset preprocessing.
+
+    Mirrors Megatron da0562fcf scripts/preprocess_data.py::Encoder.
+    Supports multiple JSON keys and optional sentence splitting.
+    """
+
+    def __init__(self, args):
+        self.args = args
+
+    def initializer(self):
+        """Called once per worker process."""
+        from deepspeed.runtime.data_pipeline.data_sampling.indexed_dataset import MMapIndexedDataset  # noqa
+        # build tokenizer — caller must supply a build_tokenizer(args) compatible callable
+        if hasattr(self.args, 'build_tokenizer'):
+            _M120Encoder.tokenizer = self.args.build_tokenizer(self.args)
+        else:
+            _M120Encoder.tokenizer = None
+
+        if getattr(self.args, 'split_sentences', False):
+            if not _nltk_available:
+                print('[M120] NLTK is not available to split sentences.')
+                raise RuntimeError('NLTK required for sentence splitting')
+            splitter = _nltk.load('tokenizers/punkt/english.pickle')
+            if getattr(self.args, 'keep_newlines', False):
+                _M120Encoder.splitter = _nltk.tokenize.punkt.PunktSentenceTokenizer(
+                    train_text=splitter._params,
+                    lang_vars=_CustomLanguageVars())
+            else:
+                _M120Encoder.splitter = splitter
+        else:
+            _M120Encoder.splitter = _IdentitySplitter()
+
+    def encode(self, json_line):
+        """Encode one JSON line → {key: [[token_ids, ...], ...], ...}."""
+        data = json.loads(json_line)
+        ids = {}
+        for key in self.args.json_keys:
+            text = data[key]
+            doc_ids = []
+            for sentence in _M120Encoder.splitter.tokenize(text):
+                if _M120Encoder.tokenizer is not None:
+                    sentence_ids = _M120Encoder.tokenizer.tokenize(sentence)
+                else:
+                    sentence_ids = sentence.split()
+                if len(sentence_ids) > 0:
+                    doc_ids.append(sentence_ids)
+            if getattr(self.args, 'append_eod', False) and doc_ids:
+                if _M120Encoder.tokenizer is not None:
+                    doc_ids[-1].append(_M120Encoder.tokenizer.eod)
+            ids[key] = doc_ids
+        return ids, len(json_line)
+
+
+def m120_preprocess_data(args):
+    """M120: top-level preprocessing entry point.
+
+    Mirrors Megatron da0562fcf scripts/preprocess_data.py::main().
+    args must expose: input, json_keys, output_prefix, dataset_impl,
+    workers, log_interval, vocab_size (optional), build_tokenizer (optional).
+    """
+    print('[M120]')
+    from deepspeed.runtime.data_pipeline.data_sampling.indexed_dataset import (
+        make_builder as _make_builder,
+    )
+    import torch as _torch
+
+    startup_start = time.time()
+    print('[M120] Opening', args.input)
+    fin = open(args.input, 'r', encoding='utf-8')
+
+    if _nltk_available and getattr(args, 'split_sentences', False):
+        _nltk.download('punkt', quiet=True)
+
+    encoder = _M120Encoder(args)
+    pool = multiprocessing.Pool(getattr(args, 'workers', 1),
+                                initializer=encoder.initializer)
+    encoded_docs = pool.imap(encoder.encode, fin, 25)
+
+    vocab_size = getattr(args, 'vocab_size', None)
+    print(f'[M120] Output prefix: {args.output_prefix}')
+    output_bin_files = {}
+    output_idx_files = {}
+    builders = {}
+    for key in args.json_keys:
+        output_bin_files[key] = '{}_{}.bin'.format(args.output_prefix, key)
+        output_idx_files[key] = '{}_{}.idx'.format(args.output_prefix, key)
+        builders[key] = _make_builder(output_bin_files[key],
+                                      impl=getattr(args, 'dataset_impl', 'mmap'),
+                                      vocab_size=vocab_size)
+
+    startup_end = time.time()
+    proc_start = time.time()
+    total_bytes_processed = 0
+    print('[M120] Time to startup:', startup_end - startup_start)
+
+    log_interval = getattr(args, 'log_interval', 100)
+    for i, (doc, bytes_processed) in enumerate(encoded_docs, start=1):
+        total_bytes_processed += bytes_processed
+        for key, sentences in doc.items():
+            for sentence in sentences:
+                builders[key].add_item(_torch.IntTensor(sentence))
+            builders[key].end_document()
+        if i % log_interval == 0:
+            current = time.time()
+            elapsed = current - proc_start
+            mbs = total_bytes_processed / elapsed / 1024 / 1024
+            print(f'[M120] Processed {i} documents '
+                  f'({i/elapsed:.2f} docs/s, {mbs:.2f} MB/s).',
+                  file=sys.stderr)
+
+    for key in args.json_keys:
+        builders[key].finalize(output_idx_files[key])
+
+    print('[M120] Preprocessing complete.')
+
+
+# --- End M120 dataloader ---
