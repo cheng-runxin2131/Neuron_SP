@@ -28,6 +28,36 @@ import contextlib
 from deepspeed import comm as dist
 import weakref
 
+# ---------------------------------------------------------------------------
+# M762: Megatron e923ec521 — removed contiguous buffer for checkpointed activation
+# Source: megatron/mpu/random.py, megatron/initialize.py,
+#         megatron/model/transformer.py, megatron/mpu/__init__.py
+#         (NVIDIA/Megatron-LM commit e923ec521)
+# Author: mshoeybi <mshoeybi@nvidia.com>  Date: 2021-08-19
+#
+# Mapping: megatron/mpu/random.py → deepspeed/runtime/activation_checkpointing/checkpointing.py
+#
+# Changes ported:
+#   1. Remove _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER global, init/reset helpers,
+#      and all allocation logic — replaced by a boolean flag
+#      DISTRIBUTE_CHECKPOINTED_ACTIVATIONS already present in this file.
+#   2. split_tensor_into_1d_equal_chunks(): add new_buffer=False param;
+#      when True, allocate a fresh contiguous buffer and copy instead of
+#      returning a view — avoids memory aliasing with the activation buffer.
+#   3. CheckpointFunction.forward/backward: switch guard from
+#      _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER to DISTRIBUTE_CHECKPOINTED_ACTIVATIONS.
+#      forward: pass new_buffer=True to split_tensor_into_1d_equal_chunks.
+#      forward: remove _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER.add() call.
+#      backward: remove reset_checkpointed_activations_memory_buffer() call
+#                from checkpoint().
+#   4. checkpoint(): remove reset_checkpointed_activations_memory_buffer() call.
+#
+# 20% adaptation: init_checkpointed_activations_memory_buffer and
+# reset_checkpointed_activations_memory_buffer are removed (dead code);
+# DISTRIBUTE_CHECKPOINTED_ACTIVATIONS boolean (already in file) drives the
+# split/gather path; adds print('[M762]') marker.
+# ---------------------------------------------------------------------------
+
 import mmap
 from torch import _C
 
@@ -36,7 +66,6 @@ from deepspeed.utils import logger
 from deepspeed.runtime.utils import copy_to_device, move_to_device, see_memory_usage
 from deepspeed.utils.timer import SynchronizedWallClockTimer as Timers, FORWARD_GLOBAL_TIMER
 from deepspeed.utils.bwc import bwc_tensor_model_parallel_rank
-from deepspeed.runtime.activation_checkpointing.memory import allocate_mem_buff
 from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime import compiler
 
@@ -73,36 +102,30 @@ PROFILE_TIME = False
 # Default name for the model parallel rng tracker.
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 
-# M358: Whether apply model parallelism to checkpointed hidden states.
-# Megatron commit d6c4248b7 — added splitting checkpointed activations
-_CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER = None
+# M762: Whether to distribute checkpointed activations across model parallel group.
+# (Replaces the contiguous memory buffer approach removed in Megatron e923ec521.)
 DISTRIBUTE_CHECKPOINTED_ACTIVATIONS = False
 
 
-def init_checkpointed_activations_memory_buffer(numel, dtype):
-    """Initialize the memory buffer for the checkpointed activations.
-    Ported from Megatron-LM mpu/random.py (M358)."""
-    print('[M358]')
-    global _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER
-    _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER = allocate_mem_buff(
-        'checkpointed activations', numel, dtype, track_usage=False)
-
-
-def reset_checkpointed_activations_memory_buffer():
-    """Reset the memory used for checkpointing.
-    Ported from Megatron-LM mpu/random.py (M358)."""
-    if _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER is not None:
-        _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER.reset()
-
-
-def split_tensor_into_1d_equal_chunks(tensor):
+def split_tensor_into_1d_equal_chunks(tensor, new_buffer=False):
     """Break a tensor into equal 1D chunks across model parallel group.
-    Ported from Megatron-LM mpu/random.py (M358)."""
-    data = tensor.view(-1)
-    partition_size = torch.numel(data) // mp_size
+    Ported from Megatron-LM mpu/random.py (M358).
+
+    M762: add new_buffer param — when True, allocate a fresh contiguous
+    buffer instead of returning a view, avoiding aliasing with the activation
+    tensor that the caller is about to discard.
+    """
+    partition_size = torch.numel(tensor) // mp_size
     start_index = partition_size * mp_rank
     end_index = start_index + partition_size
-    return data[start_index:end_index]
+    if new_buffer:
+        data = torch.empty(partition_size, dtype=tensor.dtype,
+                           device=get_accelerator().current_device_name(),
+                           requires_grad=False)
+        data.copy_(tensor.view(-1)[start_index:end_index])
+    else:
+        data = tensor.view(-1)[start_index:end_index]
+    return data
 
 
 def gather_split_1d_tensor(tensor):
@@ -710,14 +733,13 @@ class CheckpointFunction(torch.autograd.Function):
         with torch.no_grad():
             outputs = run_function(*inputs_cuda)
 
-        # M358: Divide hidden states across model parallel group and only keep
-        # the chunk corresponding to the current rank.
-        # Ported from Megatron-LM CheckpointFunction.forward (d6c4248b7).
-        if _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER is not None:
+        # M762 (was M358): Divide hidden states across model parallel group and only
+        # keep the chunk corresponding to the current rank.  Use new_buffer=True so
+        # the split does not alias the activation tensor we are about to checkpoint.
+        if DISTRIBUTE_CHECKPOINTED_ACTIVATIONS:
             ctx.input_0_shape = args[0].data.shape
-            args[0].data = split_tensor_into_1d_equal_chunks(args[0].data)
-            args[0].data = _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER.add(
-                args[0].data)
+            args[0].data = split_tensor_into_1d_equal_chunks(args[0].data,
+                                                             new_buffer=True)
 
         see_memory_usage("After running forward on the layer", force=False)
         del inputs_cuda
@@ -797,13 +819,11 @@ class CheckpointFunction(torch.autograd.Function):
                 t.data = t.saved_data.to(t.device)
                 t.saved_data = None
 
-        # M358: Gather split checkpointed activations back across model parallel group.
-        # Ported from Megatron-LM CheckpointFunction.backward (d6c4248b7).
-        if _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER is not None:
+        # M762 (was M358): Gather split checkpointed activations back across model parallel group.
+        if DISTRIBUTE_CHECKPOINTED_ACTIVATIONS:
             ctx.deepspeed_saved_tensors[0].data = gather_split_1d_tensor(
                 ctx.deepspeed_saved_tensors[0].data)
-            ctx.deepspeed_saved_tensors[0].data = \
-                ctx.deepspeed_saved_tensors[0].data.view(ctx.input_0_shape)
+            ctx.deepspeed_saved_tensors[0].data =                 ctx.deepspeed_saved_tensors[0].data.view(ctx.input_0_shape)
 
         if PARTITION_ACTIVATIONS:
             # with get_accelerator().stream(transport_stream):
@@ -1143,10 +1163,8 @@ def checkpoint(function, *args):
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint. """
 
-    # M358: Make sure memory is freed before running checkpointed forward.
-    # Mirrors Megatron-LM ParallelTransformer.forward (d6c4248b7).
-    reset_checkpointed_activations_memory_buffer()
-
+    print('[M762]')
+    # M762: contiguous buffer removed; no reset needed before checkpointed forward.
     all_outputs = []
     CheckpointFunction.apply(function, all_outputs, *args)
     if len(all_outputs) == 1:
