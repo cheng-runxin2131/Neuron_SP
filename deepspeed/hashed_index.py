@@ -102,7 +102,7 @@ class HashedIndex(object):
             self.whiten_block_embeds()
 
         args = get_args()
-        with open(args.hash_data_path, 'wb') as final_file:
+        with open(args.block_data_path, 'wb') as final_file:
             pickle.dump(self.state(), final_file)
         shutil.rmtree(dir_name, ignore_errors=True)
 
@@ -229,7 +229,7 @@ def test_retriever():
     model = load_ict_checkpoint(only_block_model=True)
     model.eval()
     dataset = get_ict_dataset()
-    hashed_index = HashedIndex.load_from_file(args.hash_data_path)
+    hashed_index = HashedIndex.load_from_file(args.block_data_path)
     retriever = REALMRetriever(model, dataset, hashed_index)
 
     strs = [
@@ -244,7 +244,7 @@ def test_retriever():
 
 
 def main():
-    print('[M228]')
+    print('[M234]')
 
     # TODO
     # consider broadcasting/all-reducing all in memory rather than using the filesystem
