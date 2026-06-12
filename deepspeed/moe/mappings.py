@@ -29,6 +29,11 @@ from deepspeed.utils.bwc import (bwc_tensor_model_parallel_world_size, bwc_tenso
 
 def _gather_tokens(input_, dim=0):
     """Gather tensors and concatenate them along a dimension"""
+    # M374: Megatron 057a1fab2 — Fixed uninit communication group.
+    # Original Megatron bug: all_gather called with undefined `group` variable;
+    # fix replaced it with get_model_parallel_group().  DeepSpeed equivalent
+    # already uses bwc_tensor_model_parallel_group(mpu) — confirmed correct.
+    print('[M374]')
     mpu = deepspeed.utils.groups.mpu
 
     input_ = input_.contiguous()
