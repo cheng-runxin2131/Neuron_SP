@@ -430,3 +430,159 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
         counter += 1
         if done:
             break
+
+
+# ===========================================================================
+# M729: Megatron 7a9c4a03f — Removing bug possibilities and adding timing info
+# ===========================================================================
+#
+# Upstream source:
+#   megatron/text_generation_utils.py
+#   (NVIDIA/Megatron-LM commit 7a9c4a03fdbc5a235e47feac29839a733101c0c5)
+#   Author: rprenger <rprenger@nvidia.com>  Date: 2021-07-19
+#
+# Mapping: megatron/text_generation_utils.py
+#          → deepspeed/compile/text_generation_utils.py
+#
+# Changes ported from upstream:
+#   generate():
+#     - Added timing variables c, b, start before send_generate_info() call.
+#     - Added end = time.time() and print timing CSV after detokenize loop.
+#       Format: batch_size,context_len,decode_len,elapsed_seconds (flush=True)
+#   api_server.py:
+#     - Added threaded=False to self.app.run() to remove threading bug.
+#   tools/run_cli.py:
+#     - Added import sys.
+#     - Replaced hardcoded URL string with url = sys.argv[1].
+#
+# DeepSpeed adaptation notes:
+#   - tokenize_batch / send_generate_info / receive_generate_info /
+#     synced_generate are the non-pipeline-parallel generation path;
+#     they co-exist with the pipeline-parallel path above (M447).
+#   - torch.distributed calls kept as-is (not replaced with deepspeed.comm)
+#     because this path is rank-0-centric and mirrors upstream exactly.
+# ===========================================================================
+
+print('[M729]')
+
+
+def tokenize_batch(sentences, get_args_fn=None, get_tokenizer_fn=None):
+    """Tokenize a list of sentences and pad to the longest.
+
+    Megatron 7a9c4a03f text_generation_utils.py — unchanged helper used by
+    generate().  get_args_fn and get_tokenizer_fn are injected by the caller
+    (defaults raise NotImplementedError so the stubs below can be replaced).
+    """
+    args = get_args_fn() if get_args_fn else _get_args()
+    tokenizer = get_tokenizer_fn() if get_tokenizer_fn else _get_tokenizer()
+    context_tokens = [tokenizer.tokenize(s) for s in sentences]
+    context_tokens, context_lengths = pad_batch(context_tokens,
+                                                tokenizer.eod, args)
+    context_tokens_tensor = torch.cuda.LongTensor(context_tokens)
+    context_length_tensor = torch.cuda.LongTensor(context_lengths)
+    return context_tokens_tensor, context_length_tensor
+
+
+def send_generate_info(context_tokens_tensor, context_length_tensor, max_len):
+    """Broadcast generation input tensors from rank 0 to all ranks.
+
+    Megatron 7a9c4a03f text_generation_utils.py — synced with
+    receive_generate_info().
+    """
+    input_info = [context_tokens_tensor.size(0),
+                  context_tokens_tensor.size(1),
+                  max_len]
+    input_info_tensor = torch.cuda.LongTensor(input_info)
+    torch.distributed.broadcast(input_info_tensor, 0)
+    torch.distributed.broadcast(context_length_tensor, 0)
+    torch.distributed.broadcast(context_tokens_tensor, 0)
+
+
+def receive_generate_info():
+    """Receive generation input tensors broadcast from rank 0.
+
+    Megatron 7a9c4a03f text_generation_utils.py — synced with
+    send_generate_info().
+    """
+    input_info_tensor = torch.empty(3, dtype=torch.int64,
+                                    device=torch.device("cuda"))
+    torch.distributed.broadcast(input_info_tensor, 0)
+    batch_size = input_info_tensor[0].item()
+    seq_len = input_info_tensor[1].item()
+    max_len = input_info_tensor[2].item()
+
+    context_length_tensor = torch.empty(batch_size, dtype=torch.int64,
+                                        device=torch.device("cuda"))
+    context_tokens_tensor = torch.empty(batch_size, seq_len,
+                                        dtype=torch.int64,
+                                        device=torch.device("cuda"))
+    torch.distributed.broadcast(context_length_tensor, 0)
+    torch.distributed.broadcast(context_tokens_tensor, 0)
+    return context_length_tensor, context_tokens_tensor, max_len
+
+
+def synced_generate(model, context_length_tensor, context_tokens_tensor,
+                    max_len, get_args_fn=None, get_tokenizer_fn=None,
+                    mpu_mod=None, communicate_fn=None,
+                    get_ltor_masks_fn=None):
+    """Run the token-stream loop and return the last decode tokens.
+
+    Megatron 7a9c4a03f text_generation_utils.py — unchanged wrapper around
+    get_token_stream().  Injected dependencies mirror tokenize_batch().
+    """
+    token_stream = get_token_stream(
+        model, context_tokens_tensor, context_length_tensor,
+        args=get_args_fn() if get_args_fn else _get_args(),
+        tokenizer=get_tokenizer_fn() if get_tokenizer_fn else _get_tokenizer(),
+        mpu=mpu_mod if mpu_mod else _mpu(),
+        communicate=communicate_fn if communicate_fn else _communicate,
+        get_ltor_masks_and_position_ids=(get_ltor_masks_fn
+                                          if get_ltor_masks_fn
+                                          else _get_ltor_masks_and_position_ids))
+    for i, decode_tokens in enumerate(token_stream):
+        if i == max_len - 1:
+            break
+    return decode_tokens
+
+
+def generate(model, sentences=None, max_len=0,
+             get_args_fn=None, get_tokenizer_fn=None,
+             mpu_mod=None, communicate_fn=None, get_ltor_masks_fn=None):
+    """Top-level generation entry point used by api_server.py.
+
+    Megatron 7a9c4a03f text_generation_utils.py — key changes vs prior:
+      - Added timing variables c, b, start before send_generate_info() so
+        the full roundtrip (tokenise + broadcast + decode) is measured.
+      - Added end = time.time() after the detokenise loop and print the
+        CSV line: batch_size,context_len,output_len,elapsed (flush=True).
+        This surfaces latency data without touching the public interface.
+    """
+    if torch.distributed.get_rank() == 0:
+        context_tokens_tensor, context_length_tensor = tokenize_batch(
+            sentences, get_args_fn=get_args_fn, get_tokenizer_fn=get_tokenizer_fn)
+        # M729: capture timing info before broadcasting to other ranks
+        c = context_length_tensor[0]
+        b = context_tokens_tensor.size(0)
+        start = time.time()
+        send_generate_info(context_tokens_tensor, context_length_tensor, max_len)
+    else:
+        context_length_tensor, context_tokens_tensor, max_len = receive_generate_info()
+
+    decode_tokens = synced_generate(
+        model, context_length_tensor, context_tokens_tensor, max_len,
+        get_args_fn=get_args_fn, get_tokenizer_fn=get_tokenizer_fn,
+        mpu_mod=mpu_mod, communicate_fn=communicate_fn,
+        get_ltor_masks_fn=get_ltor_masks_fn)
+
+    if torch.distributed.get_rank() == 0:
+        tokenizer = get_tokenizer_fn() if get_tokenizer_fn else _get_tokenizer()
+        decode_tokens, _ = decode_tokens
+        resp_sentences = []
+        for i in range(decode_tokens.size(0)):
+            decode_token = decode_tokens[i, :].cpu().numpy().tolist()
+            resp_sentences.append(tokenizer.detokenize(decode_token))
+        # M729: print timing CSV — batch_size,context_len,output_len,elapsed_s
+        end = time.time()
+        print(str(b) + "," + str(c) + "," + str(decode_tokens.size(1)) + ","
+              + str(end - start), flush=True)
+        return resp_sentences
