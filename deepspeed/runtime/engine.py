@@ -6374,3 +6374,42 @@ def _m67_bert_model_load_state_dict(model, state_dict, strict=True):
             state_dict[model._ict_head_key], strict=strict)
 
 # --- End M67 engine ---
+
+
+# ---------------------------------------------------------------------------
+# M76: Megatron 11220df86 — tokenizer moved to its own directory
+# Ported from: megatron/global_vars.py → deepspeed/runtime/engine.py
+#
+# Key change carried over:
+#   megatron/global_vars.py — import of build_tokenizer updated:
+#     Before: `from megatron.data.tokenizer import build_tokenizer`
+#     After:  `from megatron.tokenizer import build_tokenizer`
+#
+#   DeepSpeed mapping: build_tokenizer is now accessed via:
+#     `from deepspeed.tokenizer import build_tokenizer`
+#   instead of any legacy data-pipeline path.
+#
+#   The global_vars.py file manages the Megatron global state singleton;
+#   its engine.py analogue in DeepSpeed is DeepSpeedEngine._configure_*
+#   methods.  The tokenizer accessor pattern (_set_tokenizer / get_tokenizer)
+#   in global_vars.py maps to DeepSpeedEngine's runtime configuration path.
+# ---------------------------------------------------------------------------
+
+print('[M76]')
+
+
+def _m76_get_build_tokenizer_from_engine():
+    """M76: Megatron 11220df86 — build_tokenizer import in engine context.
+
+    Mirrors the global_vars.py change:
+        Before: from megatron.data.tokenizer import build_tokenizer
+        After:  from megatron.tokenizer import build_tokenizer
+
+    DeepSpeed engine callers that need to build a tokenizer should use:
+        from deepspeed.tokenizer import build_tokenizer
+
+    Returns the build_tokenizer callable.
+    """
+    from deepspeed.tokenizer import build_tokenizer
+    return build_tokenizer
+# --- End M76 engine ---

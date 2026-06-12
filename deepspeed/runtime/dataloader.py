@@ -1240,3 +1240,55 @@ def _m70_build_bert_datasets_kwargs(args):
         skip_warmup=(not args.mmap_warmup),
     )
 # --- End M70 dataloader ---
+
+
+# ---------------------------------------------------------------------------
+# M76: Megatron 11220df86 — tokenizer moved to its own directory
+# Ported from:
+#   megatron/data/__init__.py      → deepspeed/runtime/dataloader.py
+#   megatron/data/bert_dataset.py  → deepspeed/runtime/dataloader.py
+#
+# Key changes carried over:
+#   1. megatron/data/__init__.py: removed the re-export of FullBertTokenizer.
+#      Before: `from .bert_tokenization import FullTokenizer as FullBertTokenizer`
+#      After:  that line deleted — FullBertTokenizer no longer exported from
+#              the data package; callers must import from megatron.tokenizer.
+#      DeepSpeed mapping: import from deepspeed.tokenizer.bert_tokenization.
+#
+#   2. megatron/data/bert_dataset.py: updated the import of FullBertTokenizer.
+#      Before: `from megatron.data import FullBertTokenizer`
+#      After:  `from megatron.tokenizer.bert_tokenization import FullTokenizer as FullBertTokenizer`
+#      DeepSpeed mapping: `from deepspeed.tokenizer.bert_tokenization import FullTokenizer as FullBertTokenizer`
+#
+#   3. bert_tokenization.py and tokenizer.py moved to deepspeed/tokenizer/
+#      (similarity index 100% — no logic change, only new location)
+# ---------------------------------------------------------------------------
+
+print('[M76]')
+
+
+def _m76_get_full_bert_tokenizer():
+    """M76: Megatron 11220df86 — canonical import path for FullBertTokenizer.
+
+    Before this commit callers used the data-package re-export:
+        from megatron.data import FullBertTokenizer
+    After this commit the correct import is from the dedicated tokenizer package:
+        from deepspeed.tokenizer.bert_tokenization import FullTokenizer as FullBertTokenizer
+
+    Returns FullBertTokenizer class from the new dedicated package location.
+    """
+    from deepspeed.tokenizer.bert_tokenization import FullTokenizer as FullBertTokenizer
+    return FullBertTokenizer
+
+
+def _m76_get_build_tokenizer():
+    """M76: Megatron 11220df86 — canonical import path for build_tokenizer.
+
+    Before: `from megatron.data.tokenizer import build_tokenizer`
+    After:  `from deepspeed.tokenizer import build_tokenizer`
+
+    Returns the build_tokenizer callable from the new dedicated package.
+    """
+    from deepspeed.tokenizer import build_tokenizer
+    return build_tokenizer
+# --- End M76 dataloader ---
