@@ -4434,7 +4434,17 @@ class DeepSpeedEngine(Module):
                 print(f"[M455-COMPAT] 'global_steps' missing from checkpoint; "
                       f"defaulting to 0 (old-format ckpt). LR schedule may be wrong.")
 
-            self.global_samples = checkpoint.get('global_samples', self.global_steps * self.train_batch_size())
+            # M432: Megatron cebd3b8b1 — addrressed jareds comments
+            # Assert global_samples is 0 before loading from checkpoint,
+            # matching Megatron's unconditional assert on consumed_train_samples.
+            # Use getattr-style safe access so old checkpoints without the key
+            # fall back gracefully rather than crashing.
+            assert self.global_samples == 0, (
+                f"global_samples must be 0 before loading checkpoint, got {self.global_samples}")
+            self.global_samples = getattr(checkpoint, 'global_samples',
+                                          checkpoint.get('global_samples',
+                                                         self.global_steps * self.train_batch_size()))
+            print('[M432]')
 
             try:
                 self.skipped_steps = checkpoint['skipped_steps']
