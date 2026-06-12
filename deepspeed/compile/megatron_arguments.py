@@ -116,3 +116,105 @@ def validate_pipeline_mp_ring_exchange(args):
     print('[M409] validate_pipeline_mp_ring_exchange: '
           f'pipeline_mp_size={pipeline_mp_size}, '
           f'ring_exchange_available={"ring_exchange" in dir(torch.distributed)}')
+
+# ---------------------------------------------------------------------------
+# M451: Megatron 2623551d7 — Nicer error messages for deprecated arguments
+# Source: megatron/arguments.py (NVIDIA/Megatron-LM commit 2623551d7712a3b9)
+# Author: Jared Casper <jcasper@nvidia.com>  Date: 2020-12-10
+#
+# Mapping: megatron/arguments.py → deepspeed/compile/megatron_arguments.py
+#
+# Changes ported from arguments.py:
+#   1. parse_args(): add deprecated-args assertion block after TP/PP print:
+#        assert args.batch_size is None, '--batch-size argument is no longer
+#            valid, use --micro-batch-size instead'
+#        del args.batch_size
+#        assert args.warmup is None, '--warmup argument is no longer valid,
+#            use --lr-warmup-fraction instead'
+#        del args.warmup
+#        assert args.model_parallel_size is None, '--model-parallel-size is
+#            no longer valid, use --tensor-model-parallel-size instead'
+#        del args.model_parallel_size
+#   2. _add_training_args(): add --batch-size deprecated stub arg.
+#   3. _add_learning_rate_args(): add --warmup deprecated stub arg.
+#   4. _add_distributed_args(): add --model-parallel-size deprecated stub arg.
+#
+# DeepSpeed adaptation: surfaced as validate_deprecated_args(args) +
+# add_deprecated_args(parser) helpers callable from compile/initialize.
+# ---------------------------------------------------------------------------
+
+print('[M451]')
+
+
+def validate_deprecated_args(args):
+    """Assert deprecated CLI args are not set; delete them from namespace.
+
+    Megatron 2623551d7 arguments.py parse_args() — nicer error messages:
+      assert args.batch_size is None, '--batch-size argument is no longer
+          valid, use --micro-batch-size instead'
+      del args.batch_size
+      assert args.warmup is None, '--warmup argument is no longer valid,
+          use --lr-warmup-fraction instead'
+      del args.warmup
+      assert args.model_parallel_size is None, '--model-parallel-size is no
+          longer valid, use --tensor-model-parallel-size instead'
+      del args.model_parallel_size
+
+    Only acts on attributes that exist in the namespace (i.e., were
+    registered via add_deprecated_args); safe to call when the deprecated
+    stubs were not registered.
+    """
+    if hasattr(args, 'batch_size'):
+        assert args.batch_size is None, \
+            '--batch-size argument is no longer valid, use --micro-batch-size instead'
+        del args.batch_size
+
+    if hasattr(args, 'warmup'):
+        assert args.warmup is None, \
+            '--warmup argument is no longer valid, use --lr-warmup-fraction instead'
+        del args.warmup
+
+    if hasattr(args, 'model_parallel_size'):
+        assert args.model_parallel_size is None, \
+            '--model-parallel-size is no longer valid, use --tensor-model-parallel-size instead'
+        del args.model_parallel_size
+
+    print('[M451] validate_deprecated_args: deprecated args validated and removed')
+
+
+def add_deprecated_args(parser):
+    """Register deprecated argument stubs so users get a clear error message.
+
+    Megatron 2623551d7 — three deprecated args added across helpers:
+
+    _add_training_args():
+      group.add_argument('--batch-size', type=int, default=None,
+                         help='Old batch size parameter, do not use. '
+                         'Use --micro-batch-size instead')
+
+    _add_learning_rate_args():
+      group.add_argument('--warmup', type=int, default=None,
+                         help='Old lr warmup argument, do not use. Use one of
+                         the --lr-warmup-* arguments above')
+
+    _add_distributed_args():
+      group.add_argument('--model-parallel-size', type=int, default=None,
+                         help='Old model parallel argument, do not use. Use
+                         --tensor-model-parallel-size instead.')
+
+    Adds all three to a single 'Deprecated Arguments' group on parser.
+    Call before parser.parse_args() so that validate_deprecated_args() can
+    catch and reject any usage with a clear message.
+    """
+    group = parser.add_argument_group(title='deprecated arguments')
+    group.add_argument('--batch-size', type=int, default=None,
+                       help='Old batch size parameter, do not use. '
+                       'Use --micro-batch-size instead')
+    group.add_argument('--warmup', type=int, default=None,
+                       help='Old lr warmup argument, do not use. Use one of the '
+                       '--lr-warmup-* arguments above')
+    group.add_argument('--model-parallel-size', type=int, default=None,
+                       help='Old model parallel argument, do not use. Use '
+                       '--tensor-model-parallel-size instead.')
+    print('[M451] add_deprecated_args: deprecated argument stubs registered')
+    return parser
