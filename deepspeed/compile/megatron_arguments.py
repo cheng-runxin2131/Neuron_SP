@@ -850,3 +850,61 @@ def add_dialog_ctrl_args(parser):
 
 
 print('[M702]')
+
+
+# ---------------------------------------------------------------------------
+# M749: Megatron 3bd2e9738 — added flag/logic for emptying unused memory
+#
+# Source: megatron/arguments.py  _add_distributed_args()
+#
+# Change summary:
+#   Replaced the commented-out boolean --empty-unused-memory-each-iter flag
+#   with a 3-choice integer argument (0/1/2):
+#     0 = off (default)
+#     1 = moderate  → torch.cuda.empty_cache() called each iteration
+#     2 = aggressive → empty_cache() called + raises Exception (debug probe)
+#
+# Megatron diff (verbatim):
+#   - # group.add_argument('--empty-unused-memory-each-iter', action='store_true',
+#   - #                    help='Call torch.cuda.empty_cache() each iteration '
+#   - #                    '(training and eval), to reduce fragmentation',
+#   - #                    default=False)
+#   + group.add_argument('--empty-unused-memory-each-iter', default=0, type=int,
+#   +                    choices=[0, 1, 2],
+#   +                    help='Call torch.cuda.empty_cache() each iteration '
+#   +                    '(training and eval), to reduce fragmentation.'
+#   +                    '0=off, 1=moderate, 2=aggressive.')
+#
+# DeepSpeed adaptation:
+#   DeepSpeed does not replicate Megatron's _add_distributed_args() parser
+#   verbatim.  The flag is registered here as a standalone patch function
+#   add_empty_unused_memory_arg() that can be called after the base parser
+#   is constructed, mirroring the pattern used for prior distributed-args
+#   patches (M512, M598, M616, etc.).
+# ---------------------------------------------------------------------------
+
+
+def add_empty_unused_memory_arg(parser):
+    """Register --empty-unused-memory-each-iter (M749).
+
+    Megatron 3bd2e9738 replaced the old commented-out boolean flag with a
+    3-choice integer:
+      0 = off (default)
+      1 = moderate  — torch.cuda.empty_cache() called each train/eval iter
+      2 = aggressive — same as 1 but also raises an Exception (debug probe)
+    """
+    group = parser.add_argument_group(title='M749 memory management')
+    group.add_argument(
+        '--empty-unused-memory-each-iter',
+        default=0,
+        type=int,
+        choices=[0, 1, 2],
+        help='Call torch.cuda.empty_cache() each iteration '
+             '(training and eval), to reduce fragmentation. '
+             '0=off, 1=moderate, 2=aggressive.',
+    )
+    print('[M749] add_empty_unused_memory_arg: --empty-unused-memory-each-iter registered')
+    return parser
+
+
+print('[M749]')

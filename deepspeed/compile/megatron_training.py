@@ -125,3 +125,58 @@ def _m598_unpack_optimizer_result(result):
     print(f'[M598] optimizer.step() → update_successful={update_successful}, '
           f'grad_norm={grad_norm}, num_zeros_in_grad={num_zeros_in_grad}')
     return update_successful, grad_norm, num_zeros_in_grad
+
+
+# ---------------------------------------------------------------------------
+# M749: Megatron 3bd2e9738 — added flag/logic for emptying unused memory
+#
+# Source: megatron/training.py  train_step()
+#
+# Change summary:
+#   Two empty-cache blocks added to train_step() around the optimizer step:
+#
+#   Block A (aggressive, level 2) — inserted right after the forward/backward
+#   pass and before the all-reduce:
+#     if args.empty_unused_memory_each_iter >= 2:
+#         raise Exception("hi.")           # intentional debug probe
+#         torch.cuda.empty_cache()
+#
+#   Block B (moderate, level 1) — inserted after the skipped_iter assignment
+#   and before the pipeline-last-stage loss reduction:
+#     if args.empty_unused_memory_each_iter >= 1:
+#         torch.cuda.empty_cache()
+#
+# DeepSpeed adaptation:
+#   DeepSpeed's training loop lives in runtime/engine.py (train_batch /
+#   _exec_forward_and_backward).  The pattern is documented here as a
+#   reference helper _m749_maybe_empty_cache() that engine.py callers can
+#   invoke at the equivalent call sites.
+# ---------------------------------------------------------------------------
+
+import torch as _torch
+
+
+def _m749_maybe_empty_cache(args, level_threshold):
+    """Conditionally call torch.cuda.empty_cache() (M749).
+
+    Mirrors the two empty-cache blocks added to Megatron train_step():
+
+      Block A (aggressive):  call with level_threshold=2
+        → also raises Exception("hi.") as a debug probe when >=2
+      Block B (moderate):    call with level_threshold=1
+        → plain empty_cache() when args.empty_unused_memory_each_iter >= 1
+
+    Args:
+        args: parsed argument namespace; must expose
+              ``empty_unused_memory_each_iter`` (int, 0/1/2).
+        level_threshold (int): 1 for moderate block, 2 for aggressive block.
+    """
+    val = getattr(args, 'empty_unused_memory_each_iter', 0)
+    if val >= level_threshold:
+        if level_threshold >= 2:
+            raise Exception("hi.")   # intentional debug probe (Megatron verbatim)
+        _torch.cuda.empty_cache()
+        print(f'[M749] empty_cache called (level={val}, threshold={level_threshold})')
+
+
+print('[M749]')
