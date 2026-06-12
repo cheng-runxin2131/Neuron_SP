@@ -24,6 +24,25 @@
 # 20% adaptation: imports use deepspeed.compile.mpu_initialize instead of
 # the original megatron.mpu.initialize; model/checkpoint helpers reference
 # deepspeed utilities; adds print('[M54]') marker.
+#
+# M180: Megatron 2e0b3fca7 — Fixed minor inconsistencies in scripts, added
+# distributed comment.
+# Source: README.md (NVIDIA/Megatron-LM commit 2e0b3fca7)
+# Author: Steven Steinke <ststeinke@nvidia.com>  Date: 2020-04-16
+#
+# Downstream evaluation tasks (WikiText perplexity, LAMBADA cloze accuracy,
+# RACE, MNLI) can be run in distributed and model parallel modes with the
+# same changes used in the training scripts.
+#
+# Corrected eval defaults mirrored here from Megatron 2e0b3fca7:
+#   SEQ_LENGTH_GPT2          : 512  → 1024   (WikiText / LAMBADA evaluation)
+#   MAX_POSITION_EMBEDDINGS  : 512  → 1024
+#   VALID_DATA_SUFFIX_WIKI   : ''   → '.txt'  (wikitext path must include .txt)
+#   VALID_DATA_SUFFIX_LAMBADA: ''   → '.json' (lambada path must include .json)
+#   EVAL_LOG_INTERVAL        : 10   → 100
+#   EVAL_INTERVAL            : 100  → 1000
+#   EVAL_ITERS               : 50   → 10
+#   SAVE_INTERVAL            : 500000 → 10000
 # ---------------------------------------------------------------------------
 
 import os
@@ -37,6 +56,31 @@ from .mpu_initialize import (
 )
 
 print('[M54]')
+print('[M180]')
+
+# ---------------------------------------------------------------------------
+# M180: Corrected evaluation defaults (Megatron 2e0b3fca7)
+#
+# Downstream tasks can be run in distributed and model parallel modes with
+# the same changes used in the training scripts.
+#
+# WikiText-103 / LAMBADA evaluation for GPT-2 345M:
+#   seq-length and max-position-embeddings should be 1024, not 512.
+#   Paths: wikitext path must end in .txt; lambada path must end in .json.
+# RACE fine-tuning intervals:
+#   save-interval  500000 → 10000  (checkpoint more frequently)
+#   log-interval   10     → 100
+#   eval-interval  100    → 1000
+#   eval-iters     50     → 10
+# ---------------------------------------------------------------------------
+SEQ_LENGTH_GPT2 = 1024           # was 512 before 2e0b3fca7
+MAX_POSITION_EMBEDDINGS = 1024   # was 512 before 2e0b3fca7
+VALID_DATA_SUFFIX_WIKI = '.txt'  # wikitext path must include .txt
+VALID_DATA_SUFFIX_LAMBADA = '.json'  # lambada path must include .json
+EVAL_LOG_INTERVAL = 100          # was 10 before 2e0b3fca7
+EVAL_INTERVAL = 1000             # was 100 before 2e0b3fca7
+EVAL_ITERS = 10                  # was 50 before 2e0b3fca7
+SAVE_INTERVAL = 10000            # was 500000 before 2e0b3fca7
 
 
 # ---------------------------------------------------------------------------
