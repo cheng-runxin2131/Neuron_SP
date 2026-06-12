@@ -84,3 +84,123 @@ def maybe_mark_bias_parallel(bias: nn.Parameter,
     print(f'[M54-LAYERS] maybe_mark_bias_parallel: '
           f'shape={list(bias.shape)} '
           f'partition_dim={partition_dim} stride={stride}')
+
+# ---------------------------------------------------------------------------
+# M342: Megatron 35bea7285 — Code review comments - changing parallel test condition
+# Source: megatron/mpu/layers.py (NVIDIA/Megatron-LM commit 35bea7285)
+# Author: Boris Fomitchev <bfomitchev@nvidia.com>  Date: 2020-07-30
+#
+# Mapping: mpu/layers.py → deepspeed/compile/mpu_layers.py (project convention)
+#
+# Changes ported from mpu/layers.py:
+#   1. VocabParallelEmbedding.__init__: cache get_model_parallel_world_size()
+#      as self.model_parallel_size at the top of __init__, then pass it to
+#      VocabUtility.vocab_range_from_global_vocab_size instead of calling
+#      get_model_parallel_world_size() a second time inline.
+#
+#   2. VocabParallelEmbedding.forward: replace both occurrences of
+#        if self.num_embeddings_per_partition < self.num_embeddings:
+#      with
+#        if self.model_parallel_size > 1:
+#      This is semantically equivalent but more direct: the per-partition
+#      slice is smaller than the full vocab iff more than one model-parallel
+#      rank exists.  The new condition also avoids recomputing partition size.
+#
+# 20% adaptation: imports from deepspeed.compile.mpu_initialize; print marker.
+# ---------------------------------------------------------------------------
+
+import torch.nn.functional as F
+from torch.nn.parameter import Parameter
+import torch.nn.init as init
+from .mpu_initialize import get_model_parallel_rank
+
+print('[M342]')
+
+
+def _initialize_affine_weight_m342(weight, output_size, input_size,
+                                    per_partition_size, partition_dim,
+                                    init_method, stride=1,
+                                    return_master_weight=False):
+    """Thin wrapper: mark weight then delegate to per-rank init.
+
+    Reuses mark_weight_parallel from M54 to tag the shard metadata.
+    """
+    mark_weight_parallel(weight, partition_dim, stride)
+    # Initialise the full weight on rank-0 then scatter (simplified: just
+    # initialise in-place since DeepSpeed handles redistribution elsewhere).
+    with torch.no_grad():
+        init_method(weight)
+
+
+class VocabParallelEmbedding(torch.nn.Module):
+    """Embedding parallelized in the vocabulary dimension.
+
+    Ported from Megatron-LM megatron/mpu/layers.py @ 35bea7285.
+    M342 changes vs the previous revision (parent commit):
+      - __init__: self.model_parallel_size stored once, reused for range calc.
+      - forward: condition changed from
+            num_embeddings_per_partition < num_embeddings
+          to
+            model_parallel_size > 1
+        in both the input-mask and output-mask branches.
+
+    Arguments:
+        num_embeddings: vocabulary size.
+        embedding_dim:  size of hidden state.
+        init_method:    weight initialisation callable.
+    """
+
+    def __init__(self, num_embeddings, embedding_dim,
+                 init_method=init.xavier_normal_):
+        super(VocabParallelEmbedding, self).__init__()
+        # Keep the input dimensions.
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        # Defaults for compatibility with torch.nn.Embedding.
+        self.padding_idx = None
+        self.max_norm = None
+        self.norm_type = 2.
+        self.scale_grad_by_freq = False
+        self.sparse = False
+        self._weight = None
+        # M342: cache world-size once; avoids a second call inside vocab_range.
+        self.model_parallel_size = get_model_parallel_world_size()
+        # Divide the weight matrix along the vocabulary dimension.
+        from .mpu_initialize import VocabUtility  # local import for clarity
+        self.vocab_start_index, self.vocab_end_index = \
+            VocabUtility.vocab_range_from_global_vocab_size(
+                self.num_embeddings, get_model_parallel_rank(),
+                self.model_parallel_size)          # M342: use cached value
+        self.num_embeddings_per_partition = (self.vocab_end_index
+                                             - self.vocab_start_index)
+        # Allocate and initialise weights.
+        self.weight = Parameter(torch.Tensor(self.num_embeddings_per_partition,
+                                             self.embedding_dim))
+        _initialize_affine_weight_m342(
+            self.weight, self.num_embeddings, self.embedding_dim,
+            self.num_embeddings_per_partition, 0, init_method)
+
+    def forward(self, input_):
+        # M342: use model_parallel_size > 1 instead of
+        #       num_embeddings_per_partition < num_embeddings.
+        if self.model_parallel_size > 1:
+            # Build the mask.
+            input_mask = ((input_ < self.vocab_start_index) |
+                          (input_ >= self.vocab_end_index))
+            # Mask the input.
+            masked_input = input_.clone() - self.vocab_start_index
+            masked_input[input_mask] = 0
+        else:
+            masked_input = input_
+        # Get the embeddings.
+        output_parallel = F.embedding(masked_input, self.weight,
+                                      self.padding_idx, self.max_norm,
+                                      self.norm_type, self.scale_grad_by_freq,
+                                      self.sparse)
+        # Mask the output embedding.
+        if self.model_parallel_size > 1:   # M342: same condition change
+            output_parallel[input_mask, :] = 0.0
+        # Reduce across all the model parallel GPUs.
+        from .mpu_initialize import reduce_from_model_parallel_region
+        output = reduce_from_model_parallel_region(output_parallel)
+        return output
