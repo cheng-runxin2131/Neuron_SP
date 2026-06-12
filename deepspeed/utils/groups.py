@@ -52,6 +52,8 @@ _ALL_TO_ALL_GROUP = {}
 
 mesh_device = None
 
+print('[M340]')
+
 
 # Deprecated groups initialize function.
 def initialize(ep_size=1, mpu=None):
@@ -122,12 +124,21 @@ def get_model_parallel_group():
         'model parallel group is not initialized'
     return _MODEL_PARALLEL_GROUP
 
+def set_model_parallel_group(group):
+    """Set model parallel group."""
+    global _MODEL_PARALLEL_GROUP
+    _MODEL_PARALLEL_GROUP = group
 
 def get_data_parallel_group():
     """Get the data parallel group the caller rank belongs to."""
     assert _DATA_PARALLEL_GROUP is not None, \
         'data parallel group is not initialized'
     return _DATA_PARALLEL_GROUP
+
+def set_data_parallel_group(group):
+    """Set data parallel group."""
+    global _DATA_PARALLEL_GROUP
+    _DATA_PARALLEL_GROUP = group
 
 
 def set_tensor_model_parallel_world_size(world_size):
