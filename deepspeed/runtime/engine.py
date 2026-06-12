@@ -3,6 +3,17 @@
 
 # DeepSpeed Team
 
+# M171: Megatron 78cb17812 — moved steves branch
+# Migrated Megatron-LM commit 78cb1781250676cae9c05fd5e222034d515bcf16
+# Changes: updated README and examples scripts to reflect new Megatron
+#          codebase structure (examples/, tools/, tasks/ layout), revised
+#          BERT/GPT-2 pretraining args (removed legacy --lazy-loader,
+#          --resume-dataloader, --cache-dir; added --data-path, --vocab-file,
+#          --merge-file, --data-impl mmap, --min-lr, logging/eval intervals),
+#          new distributed finetune scripts for RACE/MNLI, updated
+#          generate_text.sh to use tools/generate_samples_gpt2.py.
+print('[M171]')
+
 import os
 import re
 import stat
