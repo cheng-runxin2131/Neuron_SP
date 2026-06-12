@@ -11,7 +11,8 @@ from megatron import get_args
 from megatron import mpu
 from megatron.checkpointing import get_checkpoint_tracker_filename, get_checkpoint_name
 from megatron.data.bert_dataset import get_indexed_dataset_
-from megatron.data.ict_dataset import InverseClozeDataset
+from megatron.data.realm_dataset import InverseClozeDataset  # M232: moved from ict_dataset (Megatron 0104f910b)
+print('[M232]')
 from megatron.data.samplers import DistributedBatchSampler
 from megatron.initialize import initialize_megatron
 from megatron.model import REALMRetriever

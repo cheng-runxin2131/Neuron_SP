@@ -2779,3 +2779,25 @@ class _M211RealmDataset:
         bert_dataset_instance.build_sample_fn = _m211_build_simple_training_sample
 
 # --- End M211 dataloader ---
+
+# M232: Megatron 0104f910b — Move InverseClozeDataset to bert_dataset
+#
+#   Upstream files touched:
+#   megatron/data/bert_dataset.py   → deepspeed/hashed_index.py (import updated)
+#   megatron/data/ict_dataset.py    → deleted upstream (class moved to realm_dataset)
+#
+#   Changes ported to Neuron_SP:
+#   1. deepspeed/hashed_index.py line 14:
+#        from megatron.data.ict_dataset import InverseClozeDataset
+#      ->
+#        from megatron.data.realm_dataset import InverseClozeDataset
+#      This mirrors bert_dataset.py's import redirect in the upstream commit.
+#
+#   2. megatron/data/ict_dataset.py was deleted upstream — in Neuron_SP the
+#      InverseClozeDataset logic lives inline in REAL_GPU_BENCHMARK.py
+#      (NeuronSPInverseClozeDataset / NeuronSPInverseClozeDatasetV2) and in
+#      deepspeed/runtime/dataloader.py (see M62, M189 blocks above).  No file
+#      deletion is needed here; the import source is simply updated.
+#
+#   print('[M232]') added to deepspeed/hashed_index.py at module load time.
+# --- End M232 dataloader ---
