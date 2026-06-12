@@ -1310,3 +1310,53 @@ def _m76_get_build_tokenizer():
 
 print('[M93]')
 # --- End M93 dataloader ---
+
+
+# ---------------------------------------------------------------------------
+# M97: Megatron 423c51b02 — Bugfix and remove unneeded script
+# Ported from: megatron/data_utils/datasets.py (now megatron/deprecated_data_utils/datasets.py)
+#   → deepspeed/runtime/dataloader.py
+#
+# Key changes carried over:
+#   1. InverseClozeDataset.__getitem__: input sentence selection bugfix.
+#      Before: input_sentence_idx = rng.randint(num_sentences)
+#      After:  input_sentence_idx = rng.randint(0, num_sentences - 1)
+#      numpy's randint(n) is equivalent to randint(0, n) which is exclusive of
+#      n — so the last sentence could never be selected.  The fix uses the
+#      explicit two-argument form randint(0, num_sentences - 1) which is also
+#      exclusive of the upper bound, meaning the intent is to select from
+#      [0, num_sentences - 2] inclusive and avoid the final sentence
+#      (which is reserved as the context boundary).
+#   2. run_bert_ict.sh deleted upstream (unneeded launch script).
+#      Not mirrored here — no shell script counterpart exists in Neuron_SP.
+#
+# Neuron_SP adaptation:
+#   The corrected selection logic is captured in _m97_select_input_sentence_idx()
+#   below.  Callers of _m62_getitem_inverse_cloze that implement get_input_and_context
+#   should use this helper when choosing the input sentence index from a document.
+# ---------------------------------------------------------------------------
+
+print('[M97]')
+
+
+def _m97_select_input_sentence_idx(rng, num_sentences):
+    """Megatron 423c51b02 — corrected input sentence index selection for ICT.
+
+    Bug: rng.randint(num_sentences) with numpy rng returns values in
+         [0, num_sentences) i.e. 0 .. num_sentences-1 inclusive — the last
+         sentence CAN be selected.
+
+    Fix: rng.randint(0, num_sentences - 1) explicitly excludes the last
+         sentence, reserving it as the context boundary for the ICT objective.
+         With numpy randint the upper bound is exclusive so this returns values
+         in [0, num_sentences - 2] inclusive.
+
+    Args:
+        rng: numpy RandomState (used in InverseClozeDataset.__getitem__)
+        num_sentences (int): number of sentences in the current document.
+
+    Returns:
+        int: selected input sentence index in [0, num_sentences - 2].
+    """
+    return rng.randint(0, num_sentences - 1)
+# --- End M97 dataloader ---
