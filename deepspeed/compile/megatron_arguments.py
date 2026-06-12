@@ -441,3 +441,89 @@ def validate_global_batch_size_interleaved(args):
           f'global_batch_size={global_batch_size}, '
           f'pipeline_model_parallel_size={pp_size}, '
           f'virtual_pipeline_model_parallel_size={virtual_pp_size}')
+
+# ---------------------------------------------------------------------------
+# M565: Megatron dcef90697 — Change argument to control the number of model
+#       chunks in a stage
+# Source: megatron/arguments.py (NVIDIA/Megatron-LM commit dcef906978d28d73)
+# Author: Deepak Narayanan <dnarayanan@nvidia.com>  Date: 2021-02-13
+#
+# Mapping: megatron/arguments.py → deepspeed/compile/megatron_arguments.py
+#
+# Changes ported from arguments.py:
+#   1. parse_args(): replace direct --virtual-pipeline-model-parallel-size
+#      check with --num-layers-per-virtual-pipeline-stage derivation:
+#        if args.num_layers_per_virtual_pipeline_stage is not None:
+#            assert args.num_layers % args.num_layers_per_virtual_pipeline_stage == 0
+#            args.virtual_pipeline_model_parallel_size = (
+#                (args.num_layers // args.pipeline_model_parallel_size)
+#                // args.num_layers_per_virtual_pipeline_stage)
+#            assert args.global_batch_size % args.pipeline_model_parallel_size == 0
+#        else:
+#            args.virtual_pipeline_model_parallel_size = None
+#   2. _add_distributed_args(): replace --virtual-pipeline-model-parallel-size
+#      with --num-layers-per-virtual-pipeline-stage.
+#
+# DeepSpeed adaptation: surfaced as resolve_virtual_pipeline_size(args) +
+# add_virtual_pipeline_arg(parser) helpers callable from compile/initialize.
+# ---------------------------------------------------------------------------
+
+print('[M565]')
+
+
+def resolve_virtual_pipeline_size(args):
+    """Compute virtual_pipeline_model_parallel_size from num_layers_per_virtual_pipeline_stage.
+
+    Megatron dcef90697 arguments.py parse_args():
+      if args.num_layers_per_virtual_pipeline_stage is not None:
+          assert args.num_layers % args.num_layers_per_virtual_pipeline_stage == 0, \
+              'number of layers is not divisible by number of layers per virtual ' \
+              'pipeline stage'
+          args.virtual_pipeline_model_parallel_size = \
+              (args.num_layers // args.pipeline_model_parallel_size) // \
+              args.num_layers_per_virtual_pipeline_stage
+          assert args.global_batch_size % args.pipeline_model_parallel_size == 0, \
+              'global batch size is not divisible by pipeline parallel size when ' \
+              'using interleaved schedule'
+      else:
+          args.virtual_pipeline_model_parallel_size = None
+
+    Call after pipeline_model_parallel_size and global_batch_size are resolved.
+    """
+    num_layers_per_stage = getattr(args, 'num_layers_per_virtual_pipeline_stage', None)
+    if num_layers_per_stage is not None:
+        num_layers = getattr(args, 'num_layers', None)
+        pipeline_mp_size = getattr(args, 'pipeline_model_parallel_size', 1)
+        assert num_layers % num_layers_per_stage == 0, \
+            'number of layers is not divisible by number of layers per virtual ' \
+            'pipeline stage'
+        args.virtual_pipeline_model_parallel_size = (
+            (num_layers // pipeline_mp_size) // num_layers_per_stage)
+        global_batch_size = getattr(args, 'global_batch_size', None)
+        assert global_batch_size % pipeline_mp_size == 0, \
+            'global batch size is not divisible by pipeline parallel size when ' \
+            'using interleaved schedule'
+    else:
+        args.virtual_pipeline_model_parallel_size = None
+    print('[M565] resolve_virtual_pipeline_size: '
+          f'virtual_pipeline_model_parallel_size='
+          f'{args.virtual_pipeline_model_parallel_size}')
+    return args
+
+
+def add_virtual_pipeline_arg(parser):
+    """Register --num-layers-per-virtual-pipeline-stage (replaces --virtual-pipeline-model-parallel-size).
+
+    Megatron dcef90697 _add_distributed_args():
+      group.add_argument('--num-layers-per-virtual-pipeline-stage', type=int, default=None,
+                         help='Number of layers per virtual pipeline stage')
+
+    Replaces the old --virtual-pipeline-model-parallel-size argument; the
+    virtual_pipeline_model_parallel_size value is now derived by
+    resolve_virtual_pipeline_size() rather than passed directly.
+    """
+    group = parser.add_argument_group(title='M565 virtual pipeline arguments')
+    group.add_argument('--num-layers-per-virtual-pipeline-stage', type=int, default=None,
+                       help='Number of layers per virtual pipeline stage')
+    print('[M565] add_virtual_pipeline_arg: --num-layers-per-virtual-pipeline-stage registered')
+    return parser
