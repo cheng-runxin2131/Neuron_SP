@@ -875,10 +875,11 @@ class WarmupDecayLR(WarmupLR):
 
 
 class AnnealingLR(object):
-    """Anneals the learning rate from start_lr through a warmup phase then decays.
+    """Anneals the learning rate from max_lr through a warmup phase then decays.
 
-    Ported from Megatron-LM commit b6e0377b (refactored learning-rate) and fused
-    with the checkpoint-resume contract established by WarmupDecayLR in this file.
+    Ported from Megatron-LM commit ff12df6bf (refactored learning-rate scheduler so
+    addition of variable batch size is easier) and fused with the checkpoint-resume
+    contract established by WarmupDecayLR in this file.
 
     Key differences from the Megatron original (20% adaptation):
       - Backed by DeepSpeed's update_lr / get_torch_optimizer helpers so it plugs
@@ -889,22 +890,22 @@ class AnnealingLR(object):
         all schedule events appear in a consistent log stream.
 
     Knuth double critique of the Megatron original:
-      (1) The class stored `num_iters = last_iter` and immediately called
-          `self.step(self.num_iters)`, meaning iteration 0 produced a non-zero LR
+      (1) The class stored `num_steps = num_steps` and immediately called
+          `self.step(step_num=self.num_steps)`, meaning step 0 produced a non-zero LR
           on the very first forward pass — a subtle off-by-one whose effect on the
           first gradient update was never documented or intended.
-      (2) `state_dict` persisted only `num_iters`; resuming a run with a different
-          `decay_style` or `end_iter` silently continued with stale schedule config,
+      (2) `state_dict` persisted only `num_steps`; resuming a run with a different
+          `decay_style` or `decay_steps` silently continued with stale schedule config,
           making "change the schedule at resume time" invisibly broken.
 
     Args:
         optimizer: Wrapped optimizer (may be a DeepSpeed wrapper).
-        start_lr (float): Peak learning rate after warmup.
-        warmup_iter (int): Number of warmup steps (linear ramp from 0 to start_lr).
-        total_iters (int): Total training iterations; must be > 0.
-        decay_style (str): One of 'linear', 'cosine', 'constant'.
-        last_iter (int): Step count to initialise from (0 for a fresh run).
-        min_lr (float): Absolute LR floor applied during decay. Default: 0.0.
+        max_lr (float): Peak learning rate after warmup.
+        min_lr (float): Absolute LR floor applied during decay.
+        warmup_steps (int): Number of warmup steps (linear ramp from 0 to max_lr).
+        decay_steps (int): Total decay steps; must be > 0.
+        decay_style (str): One of 'linear', 'cosine', 'exponential', 'constant'.
+        num_steps (int): Step count to initialise from (0 for a fresh run).
         use_checkpoint_lr_scheduler (bool): Load hyper-params from checkpoint on
             resume; log a warning on mismatch. Default: True.
         override_lr_scheduler (bool): Class-init values win over the checkpoint's
@@ -912,26 +913,30 @@ class AnnealingLR(object):
             Default: False.
     """
 
-    DECAY_STYLES = ('linear', 'cosine', 'constant')
+    DECAY_STYLES = ('linear', 'cosine', 'exponential', 'constant')
     print('[M434]')
 
     def __init__(self,
                  optimizer,
-                 start_lr: float,
-                 warmup_iter: int,
-                 total_iters: int,
+                 max_lr: float,
+                 min_lr: float,
+                 warmup_steps: int,
+                 decay_steps: int,
                  decay_style: str,
-                 last_iter: int,
-                 min_lr: float = 0.0,
+                 num_steps: int,
                  use_checkpoint_lr_scheduler: bool = True,
                  override_lr_scheduler: bool = False):
 
         self.optimizer = get_torch_optimizer(optimizer)
-        self.start_lr = start_lr
+        self.max_lr = float(max_lr)
         self.min_lr = min_lr
-        self.warmup_iter = warmup_iter
-        self.end_iter = total_iters
-        assert self.end_iter > 0, 'AnnealingLR: total_iters must be > 0'
+        assert self.min_lr >= 0.0
+        assert self.max_lr >= self.min_lr
+        self.warmup_steps = warmup_steps
+        self.num_steps = num_steps
+        self.decay_steps = decay_steps
+        assert self.decay_steps > 0, 'AnnealingLR: decay_steps must be > 0'
+        assert self.warmup_steps < self.decay_steps
         # Normalise decay_style to lower-case; keep original for error messages.
         raw_style = decay_style.lower() if isinstance(decay_style, str) else 'constant'
         if raw_style not in self.DECAY_STYLES:
@@ -947,14 +952,14 @@ class AnnealingLR(object):
                 'AnnealingLR: override_lr_scheduler and use_checkpoint_lr_scheduler '
                 'are mutually exclusive — set at most one.')
 
-        # Initialise iteration counter then snap LR to the formula (Megatron pattern).
-        self.num_iters = last_iter
-        self.step(self.num_iters)
+        # Initialise step counter then snap LR to the formula (Megatron pattern).
+        self.step(step_num=self.num_steps)
 
+        print('[M431]')
         print(
             f'[AnnealingLR] init: decay_style={self.decay_style} '
-            f'start_lr={start_lr} warmup_iter={warmup_iter} total_iters={total_iters} '
-            f'min_lr={min_lr} last_iter={last_iter} '
+            f'max_lr={max_lr} warmup_steps={warmup_steps} decay_steps={decay_steps} '
+            f'min_lr={min_lr} num_steps={num_steps} '
             f'use_ckpt_lr={use_checkpoint_lr_scheduler} override_lr={override_lr_scheduler}'
         )
 
@@ -967,35 +972,48 @@ class AnnealingLR(object):
 
         Ref: https://openreview.net/pdf?id=BJYwwY9ll pg. 4
         """
-        num_iters_ = min(self.num_iters, self.end_iter - self.warmup_iter)
-        # Warmup ramp: linear from 0 → start_lr over warmup_iter steps.
-        if self.warmup_iter > 0 and self.num_iters <= self.warmup_iter:
-            return float(self.start_lr) * num_iters_ / self.warmup_iter
+        # Use linear warmup for the initial part.
+        if self.warmup_steps > 0 and self.num_steps <= self.warmup_steps:
+            return self.max_lr * float(self.num_steps) / \
+                float(self.warmup_steps)
 
-        num_iters_ = num_iters_ - self.warmup_iter
+        # If the learning rate is constant, just return the initial value.
+        if self.decay_style == 'constant':
+            return self.max_lr
+
+        # For any steps larger than `self.decay_steps`, use `self.min_lr`.
+        if self.num_steps > self.decay_steps:
+            return self.min_lr
+
+        # If we are done with the warmup period, use the decay style.
+        num_steps_ = self.num_steps - self.warmup_steps
+        decay_steps_ = self.decay_steps - self.warmup_steps
+        decay_ratio = float(num_steps_) / float(decay_steps_)
+        assert decay_ratio >= 0.0
+        assert decay_ratio <= 1.0
+        delta_lr = self.max_lr - self.min_lr
+
         if self.decay_style == 'linear':
-            lr = self.start_lr * (self.end_iter - num_iters_) / self.end_iter
+            coeff = (1.0 - decay_ratio)
         elif self.decay_style == 'cosine':
-            lr = self.start_lr / 2.0 * (
-                math.cos(math.pi * num_iters_ / self.end_iter) + 1)
+            coeff = 0.5 * (math.cos(math.pi * decay_ratio) + 1)
         elif self.decay_style == 'exponential':
-            # exp(-0.693) ≈ 1/2 — halves every end_iter steps
+            # exp(-0.693) ≈ 1/2 — halves every decay_steps steps
             print('[M49]')
-            lr = self.start_lr * math.exp(-0.693 * num_iters_ / self.end_iter)
+            coeff = math.exp(-0.693 * decay_ratio)
         else:
-            # 'constant' — frozen at start_lr after warmup
-            lr = self.start_lr
-        return max(lr, self.min_lr)
+            coeff = 1.0
+        return self.min_lr + coeff * delta_lr
 
     # ------------------------------------------------------------------
     # Step / optimizer update
     # ------------------------------------------------------------------
 
-    def step(self, step_num=None):
+    def step(self, increment=1, step_num=None):
         """Advance the schedule and push the new LR into all optimizer param groups."""
         if step_num is None:
-            step_num = self.num_iters + 1
-        self.num_iters = step_num
+            step_num = self.num_steps + increment
+        self.num_steps = step_num
         new_lr = self.get_lr()
         # Reuse DeepSpeed's update_lr helper so Tensor-LR param groups work correctly.
         self._last_lr = update_lr(self.optimizer.param_groups, [new_lr] * len(self.optimizer.param_groups))
@@ -1011,21 +1029,21 @@ class AnnealingLR(object):
     # ------------------------------------------------------------------
 
     def state_dict(self):
-        """Persist both the iteration counter and the schedule hyper-params.
+        """Persist both the step counter and the schedule hyper-params.
 
-        Rationale: the Megatron original saved only num_iters, so resuming with a
-        different decay_style or end_iter was silently broken — the schedule would
+        Rationale: the Megatron original saved only num_steps, so resuming with a
+        different decay_style or decay_steps was silently broken — the schedule would
         continue with the class-init values while load_state_dict quietly ignored
         the mismatch.  Saving hyper-params here enables _check_and_resume_ to
         surface that confusion.
         """
         return {
-            'num_iters': self.num_iters,
-            'start_lr': self.start_lr,
-            'min_lr': self.min_lr,
-            'warmup_iter': self.warmup_iter,
-            'end_iter': self.end_iter,
+            'max_lr': self.max_lr,
+            'warmup_steps': self.warmup_steps,
+            'num_steps': self.num_steps,
             'decay_style': self.decay_style,
+            'decay_steps': self.decay_steps,
+            'min_lr': self.min_lr,
         }
 
     def _check_and_resume_(self, cls_value, sd_value, name):
@@ -1050,23 +1068,49 @@ class AnnealingLR(object):
     def load_state_dict(self, sd):
         """Restore schedule state from a checkpoint.
 
-        Hyper-params (start_lr, min_lr, warmup_iter, end_iter, decay_style) are
+        Backward-compatible: accepts both old key names (start_lr, warmup_iter,
+        end_iter, num_iters) from pre-ff12df6bf checkpoints and new names
+        (max_lr, warmup_steps, decay_steps, num_steps).  Hyper-params are
         cross-validated through _check_and_resume_ before being applied; the
-        iteration counter is always taken from the checkpoint.  After restoring
-        all fields, step() is called to snap the LR into the optimizer — matching
-        the Megatron __init__ pattern and ensuring the first training step after
-        resume uses a formula-derived LR rather than a potentially stale float.
+        step counter is always taken from the checkpoint.  After restoring all
+        fields, step() is called to snap the LR into the optimizer.
         """
-        for attr in ('start_lr', 'min_lr', 'warmup_iter', 'end_iter', 'decay_style'):
-            if attr in sd:
-                setattr(self, attr,
-                        self._check_and_resume_(getattr(self, attr), sd[attr], attr))
-        # Always trust the checkpoint's iteration counter.
-        self.num_iters = sd['num_iters']
-        # Re-snap LR to formula at the restored iteration (Megatron b6e0377b discipline).
-        self.step(self.num_iters)
+        if 'start_lr' in sd:
+            max_lr_ = sd['start_lr']
+        else:
+            max_lr_ = sd['max_lr']
+        self.max_lr = self._check_and_resume_(self.max_lr, max_lr_,
+                                              'learning rate')
+
+        self.min_lr = self._check_and_resume_(self.min_lr, sd['min_lr'],
+                                              'minimum learning rate')
+
+        if 'warmup_iter' in sd:
+            warmup_steps_ = sd['warmup_iter']
+        else:
+            warmup_steps_ = sd['warmup_steps']
+        self.warmup_steps = self._check_and_resume_(self.warmup_steps,
+                                                    warmup_steps_,
+                                                    'warmup iterations')
+
+        if 'end_iter' in sd:
+            decay_steps_ = sd['end_iter']
+        else:
+            decay_steps_ = sd['decay_steps']
+        self.decay_steps = self._check_and_resume_(self.decay_steps, decay_steps_,
+                                                   'total number of iterations')
+
+        self.decay_style = self._check_and_resume_(self.decay_style,
+                                                   sd['decay_style'],
+                                                   'decay style')
+
+        if 'num_iters' in sd:
+            self.num_steps = sd['num_iters']
+        else:
+            self.num_steps = sd['num_steps']
+        self.step(step_num=self.num_steps)
         print(
-            f'[AnnealingLR] load_state_dict: resumed at iter={self.num_iters} '
+            f'[AnnealingLR] load_state_dict: resumed at step={self.num_steps} '
             f'lr={self.get_lr():.6e} decay_style={self.decay_style}'
         )
 
