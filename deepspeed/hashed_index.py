@@ -1,3 +1,4 @@
+print('[M284]')
 print('[M233]')
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
@@ -41,6 +42,59 @@ def test_retriever():
         retriever.retrieve_evidence_blocks_text(s)
 
 
+# M284: Restructure Indexer classes — IndexBuilder base class (from Megatron e59496bf7)
+class IndexBuilder(object):
+    def __init__(self):
+        args = get_args()
+        self.rank = args.rank
+
+        self.model = None
+        self.dataloader = None
+        self.block_data = None
+        self.load_attributes()
+        self.is_main_builder = args.rank == 0
+
+    def load_attributes(self):
+        self.model = load_ict_checkpoint(only_block_model=True, no_grad=True, from_realm_chkpt=False)
+        self.model.eval()
+        self.dataloader = iter(get_one_epoch_dataloader(get_ict_dataset()))
+        self.block_data = BlockData()
+
+    def build_and_save_index(self):
+        i = 1
+        total = 0
+        while True:
+            with torch.no_grad():
+                try:
+                    query_tokens, query_pad_mask, \
+                    block_tokens, block_pad_mask, block_index_data = get_batch(self.dataloader)
+                except:
+                    break
+
+                block_index_data = detach(block_index_data)
+                block_indices = block_index_data[:, 3]
+                block_meta = block_index_data[:, :3]
+
+                block_logits = self.model(None, None, block_tokens, block_pad_mask, only_block=True)
+                self.block_data.add_block_data(block_indices, block_logits, block_meta)
+
+                total += block_indices.size
+                i += 1
+                if i % 1000 == 0:
+                    print('Batch {:10d} | Total {:10d}'.format(i, total), flush=True)
+                    if args.debug:
+                        break
+
+        self.block_data.save_shard(self.rank)
+        torch.distributed.barrier()
+        del self.model
+
+        if self.rank == 0:
+            self.block_data.consolidate_shards_and_save()
+        else:
+            self.block_data.clear()
+
+
 def main():
     print('[M228]')
 
@@ -53,7 +107,6 @@ def main():
     # use indexing process group for the shard-combining
     # communication group between process "8" and process "0" which tells training group that there's a new index
     # also, process 0 sends process 8 the new model
-
     # if i want to launch a separate process for indexing, may have to work with environment variables to
     # allocate the resources well. Have to subsequently assign the correct gpus to the indexing job
     # consider initializing everything in a single group and break off processes based on the ranks
@@ -63,47 +116,8 @@ def main():
 
     initialize_megatron(extra_args_provider=None,
                         args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
-    args = get_args()
-    model = load_ict_checkpoint(only_block_model=True, no_grad=True)
-    model.eval()
-    dataset = get_ict_dataset()
-    data_iter = iter(get_one_epoch_dataloader(dataset))
-    all_block_data = BlockData()
-    hashed_index = RandProjectionLSHIndex(embed_size=128, num_buckets=32, whiten=True)
-
-    i = 1
-    total = 0
-    while True:
-        try:
-            query_tokens, query_pad_mask, \
-            block_tokens, block_pad_mask, block_index_data = get_batch(data_iter)
-        except:
-            break
-
-        block_index_data = detach(block_index_data)
-        block_indices = block_index_data[:, 3]
-        block_meta = block_index_data[:, :3]
-
-        block_logits = model(None, None, block_tokens, block_pad_mask, only_block=True)
-        all_block_data.add_block_data(block_indices, block_logits, block_meta)
-
-        total += block_indices.size
-        i += 1
-        if i % 20 == 0:
-            print('Batch {:10d} | Total {:10d}'.format(i, total), flush=True)
-            if args.debug:
-                break
-
-    all_block_data.save_shard(args.rank)
-    torch.distributed.barrier()
-    del model
-
-    if args.rank == 0:
-        all_block_data.consolidate_shards_and_save()
-        hashed_index.hash_whitened_block_embeds(all_block_data)
-        hashed_index.save_to_file()
-    else:
-        all_block_data.clear()
+    index_builder = IndexBuilder()
+    index_builder.build_and_save_index()
 
 
 def load_ict_checkpoint(only_query_model=False, only_block_model=False, no_grad=False):
