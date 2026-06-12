@@ -725,6 +725,7 @@ def get_grad_zeros(parameters, mpu=None):
     Returns:
         Total number of params with zero values (viewed as a single vector).
     """
+    print('[M597]')
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
     parameters = list(filter(lambda p: p.grad is not None, parameters))
