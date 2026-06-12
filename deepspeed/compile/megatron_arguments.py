@@ -297,3 +297,87 @@ def set_input_defaults_early(args, defaults):
             setattr(args, key, defaults[key])
     print(f'[M512] set_input_defaults_early: applied {len(defaults)} default(s)')
     return args
+
+# ---------------------------------------------------------------------------
+# M544: Megatron 78a3dc323 — fixed arguments
+# Source: megatron/arguments.py (NVIDIA/Megatron-LM commit 78a3dc323f9da3c4f)
+# Author: Mostofa Patwary <mostofa.patwary@gmail.com>  Date: 2021-02-03
+#
+# Mapping: megatron/arguments.py → deepspeed/compile/megatron_arguments.py
+#
+# Changes ported from arguments.py _add_biencoder_args():
+#   Fix --report-topk-accuracies help string: double-quote → single-quote
+#   Fix --retriever-score-scaling help string: double-quote → single-quote
+#
+#   Before (broken — double-quoted string containing unescaped single quotes):
+#     help="Which top-k accuracies to report '(e.g. '1 5 20')"
+#     help="Whether to scale retriever scores by inverse 'square root of hidden size"
+#   After (correct — single-quoted multi-line string concatenation):
+#     help='Which top-k accuracies to report ' '(e.g. '1 5 20')'
+#     help='Whether to scale retriever scores by inverse ' 'square root of hidden size'
+#
+# DeepSpeed adaptation: surfaced as add_biencoder_args(parser) helper
+# callable from compile/initialize to register biencoder CLI arguments.
+# ---------------------------------------------------------------------------
+
+print('[M544]')
+
+
+def add_biencoder_args(parser):
+    """Register biencoder argument group with corrected help strings.
+
+    Megatron 78a3dc323 _add_biencoder_args() — fixed quote style on two args:
+
+      group.add_argument('--report-topk-accuracies', nargs='+', type=int,
+                          default=[], help='Which top-k accuracies to report '
+                          '(e.g. 1 5 20)')
+      group.add_argument('--retriever-score-scaling', action='store_true',
+                         help='Whether to scale retriever scores by inverse '
+                          'square root of hidden size')
+
+    The original used double-quoted help strings which caused syntactic
+    confusion with embedded single quotes; the fix uses single-quoted
+    implicit string concatenation throughout _add_biencoder_args().
+    """
+    group = parser.add_argument_group(title='biencoder arguments')
+
+    # checkpointing
+    group.add_argument('--ict-load', type=str, default=None,
+                       help='Directory containing an ICTBertModel checkpoint')
+    group.add_argument('--bert-load', type=str, default=None,
+                       help='Directory containing an BertModel checkpoint '
+                       '(needed to start ICT and REALM)')
+
+    # data
+    group.add_argument('--titles-data-path', type=str, default=None,
+                       help='Path to titles dataset used for ICT')
+    group.add_argument('--query-in-block-prob', type=float, default=0.1,
+                       help='Probability of keeping query in block for '
+                       'ICT dataset')
+    group.add_argument('--use-one-sent-docs', action='store_true',
+                       help='Whether to use one sentence documents in ICT')
+
+    # training — fixed: double-quote → single-quote (Megatron 78a3dc323)
+    group.add_argument('--report-topk-accuracies', nargs='+', type=int,
+                       default=[], help='Which top-k accuracies to report '
+                       '(e.g. 1 5 20)')
+    group.add_argument('--retriever-score-scaling', action='store_true',
+                       help='Whether to scale retriever scores by inverse '
+                       'square root of hidden size')
+
+    # faiss index
+    group.add_argument('--faiss-use-gpu', action='store_true',
+                       help='Whether create the FaissMIPSIndex on GPU')
+    group.add_argument('--block-data-path', type=str, default=None,
+                       help='Where to save/load BlockData to/from')
+
+    # indexer
+    group.add_argument('--indexer-batch-size', type=int, default=128,
+                       help='How large of batches to use when doing indexing '
+                       'jobs')
+    group.add_argument('--indexer-log-interval', type=int, default=1000,
+                       help='After how many batches should the indexer '
+                       'report progress')
+
+    print('[M544] add_biencoder_args: biencoder arguments registered')
+    return parser
