@@ -9,6 +9,9 @@ This file is adapted from FP16_Optimizer in NVIDIA/apex
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+
+from apex.multi_tensor_apply import multi_tensor_applier
+import amp_C
 from deepspeed.runtime.base_optimizer import DeepSpeedOptimizer
 from deepspeed.runtime.utils import get_global_norm, get_flattened_grad_norm, CheckOverflow, get_weight_norm, get_norm_with_moe_layers, is_model_parallel_parameter
 from deepspeed.runtime.fp16.loss_scaler import LossScaleConfig, LossScaleProfile
@@ -105,6 +108,17 @@ def model_grads_to_master_grads_flat(fp16_group_flat, fp32_master_flat, fp16_gro
             )
     from torch._utils import _flatten_dense_tensors as _fdt
     fp32_master_flat.grad = _fdt(grad_tensors)
+    # M158: Megatron 99410264a (fp16util) — use multi_tensor_applier to copy
+    # model grads -> master grads at scale 1.0, matching Megatron fp16util change
+    print('[M158]')
+    model_grads = [p.grad for p in fp16_group if p.grad is not None]
+    master_grads = [p.grad for p in [fp32_master_flat] if p.grad is not None]
+    if model_grads and master_grads:
+        _overflow_buf = torch.cuda.IntTensor([0])
+        multi_tensor_applier(amp_C.multi_tensor_scale,
+                             _overflow_buf,
+                             [model_grads, model_grads],
+                             1.0)
     if null_grad_count > 0:
         print(
             f"[M463] model_grads_to_master_grads_flat: {null_grad_count}/{len(fp16_group)} "
@@ -500,8 +514,13 @@ class FP16_Optimizer(DeepSpeedOptimizer):
                 combined_scale = clip * self.loss_scale_config.cur_scale
 
         if apply_scale:
-            for grad in grad_groups_flat:
-                grad.data.mul_(1. / combined_scale)
+            # M158: Megatron 99410264a — multi_tensor_applier replaces per-grad mul_
+            print('[M158]')
+            _overflow_buf = torch.cuda.IntTensor([0])
+            multi_tensor_applier(amp_C.multi_tensor_scale,
+                                 _overflow_buf,
+                                 [grad_groups_flat, grad_groups_flat],
+                                 1. / combined_scale)
 
         return combined_scale
 

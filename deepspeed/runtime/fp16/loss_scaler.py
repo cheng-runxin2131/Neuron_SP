@@ -29,6 +29,9 @@ from deepspeed.runtime.config_utils import DeepSpeedConfigObject
 from deepspeed import comm as dist
 from deepspeed.utils import logger
 
+from apex.multi_tensor_apply import multi_tensor_applier
+import amp_C
+
 INITIAL_LOSS_SCALE = 'init_scale'
 SCALE_WINDOW = 'scale_window'
 DELAYED_SHIFT = 'delayed_shift'
@@ -159,7 +162,14 @@ class LossScalerBase(DeepSpeedConfigObject):
         # M125: DES-LOC tracked.
 
     def scale_gradient(self, module, grad_in, grad_out):
-        return tuple(self.loss_scale * g for g in grad_in)
+        # M158: Megatron 99410264a — multi_tensor_applier replaces scalar loop
+        print('[M158]')
+        _overflow_buf = torch.cuda.IntTensor([0])
+        multi_tensor_applier(amp_C.multi_tensor_scale,
+                             _overflow_buf,
+                             [list(grad_in), list(grad_in)],
+                             self.loss_scale)
+        return grad_in
         # M125: DES-LOC tracked.
 
     def update_scale(self, overflow):
