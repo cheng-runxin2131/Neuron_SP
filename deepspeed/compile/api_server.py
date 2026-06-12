@@ -2,6 +2,31 @@
 # DeepSpeed Team
 
 # ===========================================================================
+# M745: Megatron ddd361450 — Got the probs piped
+# ===========================================================================
+#
+# Upstream source:
+#   megatron/api_server.py
+#   (NVIDIA/Megatron-LM commit ddd3614509bf2d974567513434aeca8bd256f610)
+#   Author: rprenger <rprenger@nvidia.com>  Date: 2021-08-11
+#
+# Mapping: megatron/api_server.py
+#          → deepspeed/compile/api_server.py
+#
+# Summary of changes ported from upstream (on top of M729):
+#
+#   MegatronGenerate.put():
+#     - Parse optional "all_probs" bool from JSON request body; return
+#       "all_probs must be a boolean value" on type error.
+#     - Pass all_probs to generate().
+#     - Unpack four-tuple (resp_sentences, resp_sentences_seg,
+#       output_logits, full_logits) from generate().
+#     - When all_probs is True, return additional "all_logits" key in the
+#       JSON response containing full_logits.
+#
+# ===========================================================================
+#
+# ===========================================================================
 # M729: Megatron 7a9c4a03f — Removing bug possibilities and adding timing info
 # ===========================================================================
 #
@@ -36,6 +61,7 @@ from flask_restful import Resource, Api
 from deepspeed.compile.text_generation_utils import generate
 
 print('[M729]')
+print('[M745]')
 
 GENERATE_NUM = 0
 
@@ -69,13 +95,29 @@ class MegatronGenerate(Resource):
 
         max_len = 64  # sane default; full sequence is slow
         if "max_len" in request.get_json():
-            input_max_len = request.get_json()["max_len"]
-            if args is None or input_max_len < args.seq_length:
-                max_len = input_max_len
+            max_len = request.get_json()["max_len"]
+            if not isinstance(max_len, int):
+                return "max_len must be an integer greater than 0"
+            if max_len < 1:
+                return "max_len must be an integer greater than 0"
 
-        MegatronGenerate.send_do_generate(self._mpu)
-        resp_sentences = generate(self.model, sentences, max_len)
-        return jsonify({"sentences": resp_sentences})
+        all_probs = False
+        if "all_probs" in request.get_json():
+            all_probs = request.get_json()["all_probs"]
+            if not isinstance(all_probs, bool):
+                return "all_probs must be a boolean value"
+
+        MegatronGenerate.send_do_generate(self._mpu)  # Tell other ranks we're doing generate
+        resp_sentences, resp_sentences_seg, output_logits, full_logits = generate(self.model, sentences, max_len, all_probs)
+        if all_probs:
+            return jsonify({"sentences": resp_sentences,
+                "segments": resp_sentences_seg,
+                "logits": output_logits,
+                "all_logits": full_logits})
+
+        return jsonify({"sentences": resp_sentences,
+            "segments": resp_sentences_seg,
+            "logits": output_logits})
 
 
 def index():

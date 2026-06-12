@@ -2,6 +2,40 @@
 # DeepSpeed Team
 
 # ===========================================================================
+# M745: Megatron ddd361450 — Got the probs piped
+# ===========================================================================
+#
+# Upstream source:
+#   megatron/text_generation_utils.py
+#   (NVIDIA/Megatron-LM commit ddd3614509bf2d974567513434aeca8bd256f610)
+#   Author: rprenger <rprenger@nvidia.com>  Date: 2021-08-11
+#
+# Mapping: megatron/text_generation_utils.py
+#          → deepspeed/compile/text_generation_utils.py
+#
+# Summary of changes ported from upstream (on top of M447):
+#
+#   sample_sequence_batch():
+#     - Add all_probs=False parameter (between maxlen and type_ids).
+#     - Initialise output_logits = None before the generation loop.
+#     - On is_pipeline_last_stage(), first iteration: compute
+#       output_context = F.log_softmax(output[:, :context_length, :], 2),
+#       gather per-token log-probs into output_logits; when all_probs,
+#       also capture full_logits = output_context.
+#     - Subsequent iterations: compute output_context = F.log_softmax(output, 2),
+#       gather new_output_logits and cat into output_logits; when all_probs,
+#       cat output_context into full_logits.
+#     - yield four-tuple (tokens, lengths, output_logits, full_logits) on
+#       last stage (all_probs branch yields full_logits, else None); yield
+#       (tokens, None, None, None) on first stage; yield (None, None, None,
+#       None) on middle stages.
+#
+#   get_token_stream():
+#     - Unpack four-tuple from sample_sequence_batch iterator.
+#
+# ===========================================================================
+#
+# ===========================================================================
 # M447: Megatron 5c45db4a7 — Initial implementation of pipelined text
 #       generation
 # ===========================================================================
@@ -90,6 +124,7 @@ import torch.nn.functional as F
 import deepspeed.comm as dist
 
 print('[M447]')
+print('[M745]')
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +327,7 @@ def get_token_stream(model, context_tokens, args, tokenizer, mpu,
         args=args, tokenizer=tokenizer, mpu=mpu,
         communicate=communicate)
 
-    for tokens, lengths in batch_token_iterator:
+    for tokens, lengths, output_logits, full_logits in batch_token_iterator:
         context_length += 1
         # Megatron 5c45db4a7: yield None pair on non-last stages so the
         # caller loop is uniform across all ranks.
@@ -308,7 +343,7 @@ def get_token_stream(model, context_tokens, args, tokenizer, mpu,
 
 def sample_sequence_batch(model, context_tokens, context_lengths,
                           attention_mask, position_ids,
-                          maxlen=None, type_ids=None,
+                          maxlen=None, all_probs=False, type_ids=None,
                           args=None, tokenizer=None, mpu=None, communicate=None):
     """Generate tokens one step at a time, pipeline-parallel aware.
 
@@ -341,6 +376,7 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
     context_length = context_lengths.min().item()
     done = False
     layer_past = None
+    output_logits = None
 
     while context_length <= maxlen:
         if args.recompute:
@@ -376,6 +412,7 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
             if mpu.is_pipeline_last_stage():
                 # 'output' not defined for non-recompute path; guard with assert
                 assert logits is not None
+                output = logits
                 logits = logits[:, -1].view(batch_size, -1).contiguous()
 
         if mpu.is_pipeline_last_stage():
@@ -393,6 +430,21 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
             new_tokens = switch(tokens[:, context_length].view(-1), prev, started)
             tokens[:, context_length] = new_tokens
 
+            if output_logits is None:
+                output_context = F.log_softmax(output[:, :context_length, :], 2)
+                indices = torch.unsqueeze(tokens[:, 1:context_length+1], 2)
+                output_logits = torch.gather(output_context, 2, indices).squeeze(2)
+                if all_probs:
+                    full_logits = output_context
+            else:
+                output_context = F.log_softmax(output, 2)
+                indices = torch.unsqueeze(new_tokens, 1).unsqueeze(2)
+                new_output_logits = torch.gather(output_context, 2, indices).squeeze(2)
+                # TODO(rprenger) we're copying output_logits every time.  Should pre-allocate
+                output_logits = torch.cat([output_logits, new_output_logits], 1)
+                if all_probs:
+                    full_logits = torch.cat([full_logits, output_context], 1)
+
             # Broadcast new tokens from last stage to first stage via embedding group.
             src = mpu.get_pipeline_model_parallel_last_rank()
             group = mpu.get_embedding_group()
@@ -407,7 +459,10 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
             src = mpu.get_pipeline_model_parallel_last_rank()
             group = mpu.get_pipeline_model_parallel_group()
             dist.broadcast(done, src, group)
-            yield tokens, lengths
+            if all_probs:
+                yield tokens, lengths, output_logits, full_logits
+            else:
+                yield tokens, lengths, output_logits, None
 
         else:
             if mpu.is_pipeline_first_stage():
@@ -417,9 +472,9 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
                 new_tokens = torch.empty_like(tokens[:, context_length])
                 dist.broadcast(new_tokens, src, group)
                 tokens[:, context_length] = new_tokens
-                yield tokens, None
+                yield tokens, None, None, None
             else:
-                yield None, None
+                yield None, None, None, None
 
             done = torch.cuda.ByteTensor([0])
             src = mpu.get_pipeline_model_parallel_last_rank()
