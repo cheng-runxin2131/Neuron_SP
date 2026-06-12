@@ -1,3 +1,4 @@
+print('[M550]')
 print('[M311]')
 print('[M301]')
 # coding=utf-8
