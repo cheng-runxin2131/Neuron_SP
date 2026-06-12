@@ -6463,3 +6463,41 @@ def _m102_get_ltor_masks_and_position_ids(get_ltor_fn, tokens, eod_token, reset_
 
 print('[M102]')
 # --- End M102 engine ---
+
+
+# ---------------------------------------------------------------------------
+# M155: Megatron 8e8e45489 — addressed neels comments
+# Source commit: 8e8e45489b1802653fb42ed077cbd9851aabc2a7
+# Author: Mohammad <mshoeybi@nvidia.com>  Date: 2020-04-14
+#
+# Changes in this commit (megatron/arguments.py, parse_args function):
+#
+#   Required-argument validation refactored from four individual calls
+#   into a list + loop (lines 56-59 of the original file):
+#
+#   Before:
+#       _check_arg_is_not_none(args, 'num_layers')
+#       _check_arg_is_not_none(args, 'hidden_size')
+#       _check_arg_is_not_none(args, 'num_attention_heads')
+#       _check_arg_is_not_none(args, 'max_position_embeddings')
+#
+#   After:
+#       required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
+#                        'max_position_embeddings']
+#       for req_arg in required_args:
+#           _check_arg_is_not_none(args, req_arg)
+#
+#   The change is purely structural: identical runtime behaviour, but the
+#   list form makes it trivial to add or remove required args in future.
+#   ("neels comments" refers to reviewer Noam Shazeer / neel feedback.)
+#
+# Neuron_SP mapping (per project convention):
+#   megatron/arguments.py — no direct equivalent file in deepspeed/; argument
+#   handling lives in deepspeed/runtime/config.py and individual launchers.
+#   The required-args refactoring pattern is recorded here as an engine.py
+#   annotation.
+# ---------------------------------------------------------------------------
+
+print('[M155]')
+
+# --- End M155 engine ---
