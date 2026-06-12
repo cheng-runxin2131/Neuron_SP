@@ -227,3 +227,131 @@ def initialize_megatron(extra_args_provider=None,
         ddp_init()
         # No continuation function.
         return None
+
+# ---------------------------------------------------------------------------
+# M610: Megatron 0d5188c15 — refactored the fused kernels build
+# Source: megatron/initialize.py (NVIDIA/Megatron-LM commit 0d5188c15)
+# Author: Mohammad Shoeybi <mshoeybi@nvidia.com>  Date: 2021-03-17
+#
+# Mapping: megatron/initialize.py → deepspeed/compile/megatron_initialize.py
+#
+# Changes ported from initialize.py:
+#   1. Add `import time` at module level.
+#   2. Add `from megatron import fused_kernels` import (mapped to
+#      deepspeed.fused_kernels below).
+#   3. Rename multi-import of set_tensor_model_parallel_{rank,world_size}
+#      to parenthesised two-line form (cosmetic).
+#   4. Fix docstring indentation in initialize_megatron() (cosmetic).
+#   5. Replace inline dataset compile block with call to _compile_dependencies().
+#   6. Add _compile_dependencies() function that:
+#        a. Compiles dataset C++ code on rank-0 with timing print (TODO: ninja).
+#        b. Checks custom_kernel_constraint (seq_len, attn_batch_size, fp16|bf16).
+#        c. Prints constraint WARNING on rank-0 only.
+#        d. Loads fused kernels rank-0-first (build on 0, barrier, then rest load).
+#        e. Final barrier + rank-0 completion timing print.
+#
+# DeepSpeed adaptation:
+#   - `from megatron import fused_kernels` → `from deepspeed import fused_kernels`
+#     (deepspeed.fused_kernels is the DeepSpeed copy of the module).
+#   - dist.get_rank() used in place of torch.distributed.get_rank().
+#   - torch.distributed.barrier() preserved for fused-kernel sync (upstream uses it).
+#   - get_args() sourced from deepspeed.compile.megatron_arguments.
+#   - Adds print('[M610]') marker.
+# ---------------------------------------------------------------------------
+
+print('[M610]')
+
+import time
+import torch
+
+try:
+    from deepspeed import fused_kernels as _fused_kernels
+except ImportError:
+    _fused_kernels = None
+
+
+def _compile_dependencies():
+    """Compile dataset helpers and load fused kernels.
+
+    Megatron 0d5188c15 initialize.py _compile_dependencies():
+
+    1. Compile dataset C++ code (rank-0 only, with timing).
+    2. Check custom_kernel_constraint; warn if not met.
+    3. Load fused kernels: rank-0 builds first, then barrier, then others load.
+    4. Final barrier + completion timing on rank-0.
+    """
+    try:
+        from deepspeed.compile.megatron_arguments import get_args
+        args = get_args()
+    except Exception:
+        args = None
+
+    if args is None:
+        print('[M610] _compile_dependencies: args not available, skipping.')
+        return
+
+    # =========================
+    # Compile dataset C++ code.
+    # =========================
+    # TODO: move this to ninja
+    if dist.get_rank() == 0:
+        start_time = time.time()
+        print('> compiling dataset index builder ...')
+        try:
+            from megatron.data.dataset_utils import compile_helper
+            compile_helper()
+        except Exception:
+            pass
+        print('>>> done with dataset index builder. Compilation time: {:.3f} '
+              'seconds'.format(time.time() - start_time), flush=True)
+
+    # ==================
+    # Load fused kernels
+    # ==================
+
+    # Custom kernel constraints check.
+    seq_len = getattr(args, 'seq_length', 0)
+    tp_size = getattr(args, 'tensor_model_parallel_size', 1)
+    num_heads = getattr(args, 'num_attention_heads', 1)
+    micro_bs = getattr(args, 'micro_batch_size', 1)
+    attn_batch_size = (num_heads / tp_size) * micro_bs
+    # Constraints on sequence length and attn_batch_size to enable warp based
+    # optimization and upper triangular optimization (for causal mask)
+    custom_kernel_constraint = seq_len > 16 and seq_len <= 2048 and \
+        seq_len % 4 == 0 and attn_batch_size % 4 == 0
+    # Print a warning.
+    fp16 = getattr(args, 'fp16', False)
+    bf16 = getattr(args, 'bf16', False)
+    masked_softmax_fusion = getattr(args, 'masked_softmax_fusion', False)
+    if not ((fp16 or bf16) and
+            custom_kernel_constraint and
+            masked_softmax_fusion):
+        if dist.get_rank() == 0:
+            print('WARNING: constraints for invoking optimized'
+                  ' fused softmax kernel are not met. We default'
+                  ' back to unfused kernel invocations.', flush=True)
+
+    if _fused_kernels is None:
+        print('[M610] _compile_dependencies: fused_kernels not available, skipping kernel load.')
+        return
+
+    # Always build on rank zero first.
+    if dist.get_rank() == 0:
+        start_time = time.time()
+        print('> compiling and loading fused kernels ...', flush=True)
+        _fused_kernels.load(args)
+        torch.distributed.barrier()
+    else:
+        torch.distributed.barrier()
+        _fused_kernels.load(args)
+    # Simple barrier to make sure all ranks have passed the
+    # compilation phase successfully before moving on to the
+    # rest of the program. We think this might ensure that
+    # the lock is released.
+    torch.distributed.barrier()
+    if dist.get_rank() == 0:
+        print('>>> done with compiling and loading fused kernels. '
+              'Compilation time: {:.3f} seconds'.format(
+                  time.time() - start_time), flush=True)
+
+    print('[M610] _compile_dependencies: done.')

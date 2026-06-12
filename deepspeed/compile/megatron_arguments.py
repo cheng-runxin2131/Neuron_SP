@@ -564,3 +564,30 @@ def add_virtual_pipeline_arg(parser):
                        help='Number of layers per virtual pipeline stage')
     print('[M565] add_virtual_pipeline_arg: --num-layers-per-virtual-pipeline-stage registered')
     return parser
+
+# ---------------------------------------------------------------------------
+# M610: Megatron 0d5188c15 — refactored the fused kernels build
+# Source: megatron/arguments.py (NVIDIA/Megatron-LM commit 0d5188c15)
+# Author: Mohammad Shoeybi <mshoeybi@nvidia.com>  Date: 2021-03-17
+#
+# Mapping: megatron/arguments.py → deepspeed/compile/megatron_arguments.py
+#
+# Changes ported from arguments.py:
+#   1. Remove `from megatron import fused_kernels` import at top of module.
+#   2. Remove the custom-kernel constraints check block from parse_args():
+#        seq_len / attn_batch_size / custom_kernel_constraint computation,
+#        the WARNING print for unmet constraints, and the three
+#        fused_kernels.load_* calls conditional on args.masked_softmax_fusion
+#        and args.fp32_residual_connection.
+#      All of this logic is now consolidated in initialize.py's
+#      _compile_dependencies() (ported in megatron_initialize.py).
+#
+# DeepSpeed adaptation:
+#   - In deepspeed the kernel constraint check and load call are performed
+#     by _compile_dependencies() inside megatron_initialize.py, mirroring
+#     the upstream move from arguments.py → initialize.py.
+#   - No new helpers needed here; this file documents the removal.
+#   - Adds print('[M610]') marker.
+# ---------------------------------------------------------------------------
+
+print('[M610]')
