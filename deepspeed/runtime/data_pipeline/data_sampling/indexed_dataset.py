@@ -748,7 +748,10 @@ class MMapIndexedDatasetBuilder(object):
         self._sizes.append(np_array.size)
 
     def end_document(self):
-        self._doc_idx.append(len(self._sizes))
+        # M161: Megatron 662dc9820 — ensure doc index entries are stored as
+        # int64 to prevent dtype mismatch when writing the index file
+        # (mirrors: np.array([block_idx]).astype(np.int64) in ict_dataset.py).
+        self._doc_idx.append(np.int64(len(self._sizes)))
 
     def merge_file_(self, another_file):
         # Concatenate index

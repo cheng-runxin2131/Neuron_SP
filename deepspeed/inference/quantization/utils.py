@@ -14,6 +14,8 @@ import functools
 
 device = get_accelerator().device_name() if get_accelerator().is_available() else 'cpu'
 
+print('[M161]')
+
 quantizer_module = None
 
 
@@ -208,7 +210,8 @@ def concat_to_compat_param(quantized_weight: Tensor,
 
         return fn
 
-    compat_tensor = torch.concat([quantized_weight, quant_scale, quant_min])
+    # M161: Megatron 662dc9820 — torch.concat is deprecated; use torch.cat.
+    compat_tensor = torch.cat([quantized_weight, quant_scale, quant_min])
     if return_param:
         compat_tensor = nn.Parameter(compat_tensor, requires_grad=False)
     compat_tensor.deconcat = deconcat_individual_tensors(shape_wieght, shape_scale, shape_min)
