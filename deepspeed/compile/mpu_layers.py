@@ -116,11 +116,15 @@ def maybe_mark_bias_parallel(bias: nn.Parameter,
       self.bias.partition_dim  = 0      (NEW in 57c2060fe)
       self.bias.stride         = stride (NEW in 57c2060fe)
 
+    M512 (78066ab08): renamed bias.stride → bias.partition_stride
+      (mirrors the weight.stride → weight.partition_stride rename in M343).
+
     Also used by BertLMHead.bias (bert_model.py → engine.py mapping).
     """
     bias.model_parallel = True
     bias.partition_dim = partition_dim
-    bias.stride = stride
+    bias.partition_stride = stride  # M512: renamed from .stride → .partition_stride
+    print('[M512]')
     print(f'[M54-LAYERS] maybe_mark_bias_parallel: '
           f'shape={list(bias.shape)} '
           f'partition_dim={partition_dim} stride={stride}')
@@ -332,11 +336,16 @@ def _initialize_affine_weight_cpu(weight, output_size, input_size,
     per_partition_per_stride_size = per_partition_size // stride
 
     # Get model parallel rank for selecting the correct partition.
+    # M512 (78066ab08): use get_tensor_model_parallel_rank (renamed API).
     try:
-        from .mpu_initialize import get_model_parallel_rank
-        rank = get_model_parallel_rank()
+        from .mpu_initialize import get_tensor_model_parallel_rank
+        rank = get_tensor_model_parallel_rank()
     except (ImportError, AttributeError):
-        rank = 0
+        try:
+            from .mpu_initialize import get_model_parallel_rank
+            rank = get_model_parallel_rank()
+        except (ImportError, AttributeError):
+            rank = 0
 
     # Scatter: copy the appropriate slice into weight.
     weight_list = torch.split(master_weight, per_partition_per_stride_size,

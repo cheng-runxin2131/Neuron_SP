@@ -218,3 +218,82 @@ def add_deprecated_args(parser):
                        '--tensor-model-parallel-size instead.')
     print('[M451] add_deprecated_args: deprecated argument stubs registered')
     return parser
+
+# ---------------------------------------------------------------------------
+# M512: Megatron 78066ab08 — Fixing merge_mp_partitions
+# Source: megatron/arguments.py (NVIDIA/Megatron-LM commit 78066ab08)
+# Author: Jared Casper <jcasper@nvidia.com>  Date: 2021-01-20
+#
+# Mapping: megatron/arguments.py → deepspeed/compile/megatron_arguments.py
+#
+# Changes ported from arguments.py:
+#   1. parse_args(): move "Set input defaults" block BEFORE the
+#      micro_batch_size assertion (was after consumed_*_samples init).
+#      This ensures defaults are set before any assertions run against them.
+#
+#   2. _add_checkpointing_args():
+#        --no-load-optim: add default=None
+#        --no-load-rng:   add default=None
+#      (So the "set input defaults" block can override them via defaults dict.)
+#
+#   3. _add_distributed_args():
+#        --use-cpu-initialization: action='store_true' → type=bool, required=False
+#      (Allows merge_mp_partitions to inject via defaults dict, not CLI flag.)
+#
+# DeepSpeed adaptation: exposed as helper functions callable from compile/init.
+# ---------------------------------------------------------------------------
+
+print('[M512]')
+
+
+def patch_checkpointing_args(parser):
+    """Re-register --no-load-optim and --no-load-rng with default=None.
+
+    Megatron 78066ab08 _add_checkpointing_args():
+      group.add_argument('--no-load-optim', action='store_true', default=None)
+      group.add_argument('--no-load-rng',   action='store_true', default=None)
+    """
+    group = parser.add_argument_group(title='M512 checkpointing patches')
+    group.add_argument('--no-load-optim', action='store_true', default=None,
+                       help='Do not load optimizer when loading checkpoint.')
+    group.add_argument('--no-load-rng', action='store_true', default=None,
+                       help='Do not load rng state when loading checkpoint.')
+    print('[M512] patch_checkpointing_args: no-load-optim/rng with default=None')
+    return parser
+
+
+def patch_distributed_args(parser):
+    """Re-register --use-cpu-initialization as type=bool, required=False.
+
+    Megatron 78066ab08 _add_distributed_args():
+      group.add_argument('--use-cpu-initialization', type=bool, required=False)
+    """
+    group = parser.add_argument_group(title='M512 distributed patches')
+    group.add_argument('--use-cpu-initialization', type=bool, required=False,
+                       help='If set, affine parallel weights initialization uses CPU')
+    print('[M512] patch_distributed_args: use-cpu-initialization as type=bool')
+    return parser
+
+
+def set_input_defaults_early(args, defaults):
+    """Apply defaults dict BEFORE micro_batch_size and other assertions.
+
+    Megatron 78066ab08 parse_args(): "Set input defaults" block moved BEFORE
+    the micro_batch_size assertion so that defaults can override args checked
+    by early assertions (e.g. no_load_optim, no_load_rng, use_cpu_initialization).
+
+    Sets args.<key> = defaults[key] only when attribute is currently None.
+    Emits WARNING when user explicitly provided a value differing from default.
+    """
+    rank = getattr(args, 'rank', 0)
+    for key in defaults:
+        if getattr(args, key, None) is not None:
+            if rank == 0:
+                print('WARNING: overriding default arguments for {key}:{v} \
+                       with {key}:{v2}'.format(key=key, v=defaults[key],
+                                               v2=getattr(args, key)),
+                       flush=True)
+        else:
+            setattr(args, key, defaults[key])
+    print(f'[M512] set_input_defaults_early: applied {len(defaults)} default(s)')
+    return args

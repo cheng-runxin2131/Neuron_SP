@@ -309,13 +309,16 @@ def merge_model_parallel_checkpoints(
                 with torch.no_grad():
                     merged_param.data.copy_(partitions_param[0].data)
             else:
-                print('     parallel parameter merge with stride {} along '
-                      'dimention {}'.format(merged_param.stride,
-                                            merged_param.partition_dim))
+                # M512 (78066ab08): use partition_stride (renamed from .stride)
+                dim = merged_param.partition_dim
+                stride = merged_param.partition_stride
+                print(f'     parallel parameter merge with stride {stride} along '
+                      f'dimention {dim}')
+                print('[M512]')
                 merge_partitions(merged_param,
                                  partitions_param,
-                                 merged_param.partition_dim,
-                                 merged_param.stride)
+                                 dim,
+                                 stride)
         except StopIteration:
             break
 
