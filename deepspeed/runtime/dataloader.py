@@ -1885,3 +1885,419 @@ def _m119_build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
     return train_dataset, valid_dataset, test_dataset
 
 # --- End M119 dataloader ---
+
+
+# ---------------------------------------------------------------------------
+# M189: Megatron 4abd7ce27 — Refactor before merge request
+# Ported from:
+#   megatron/data/bert_dataset.py          → deepspeed/runtime/dataloader.py
+#   megatron/data/ict_dataset.py           → deepspeed/runtime/dataloader.py
+#   megatron/deprecated_data_utils/datasets.py → deepspeed/runtime/dataloader.py
+#   megatron/data/helpers.cpp              → deepspeed/runtime/dataloader.py
+#   megatron/model/bert_model.py           → deepspeed/runtime/dataloader.py
+#   megatron/training.py                   → deepspeed/runtime/dataloader.py
+#   pretrain_bert_ict.py                   → deepspeed/runtime/dataloader.py
+#   ict_qualitative_test.py                → DELETED upstream (not ported)
+#
+# Key changes carried over:
+#
+#   1. bert_dataset.py — build_train_valid_test_datasets():
+#      - `titles_dataset` renamed to `title_dataset` (variable local to the
+#        ict_dataset branch).
+#      - InverseClozeDataset constructor call updated: `titles_dataset=` kwarg
+#        renamed to `title_dataset=`; `context_dataset=` removed from the
+#        shared kwargs dict and passed explicitly as `block_dataset=`.
+#      - BertDataset constructor call updated: `indexed_dataset=` added
+#        explicitly (was formerly in the shared kwargs as `context_dataset=`).
+#      - A blank line added before `def print_split_stats` for readability.
+#
+#   2. ict_dataset.py — InverseClozeDataset:
+#      - `import sys` removed (unused).
+#      - `__init__` parameters renamed: `context_dataset` → `block_dataset`,
+#        `titles_dataset` → `title_dataset`.
+#      - Instance attributes renamed accordingly:
+#          self.context_dataset → self.block_dataset
+#          self.titles_dataset  → self.title_dataset
+#      - get_samples_mapping() call updated to pass `block_dataset` / `title_dataset`.
+#      - `__getitem__`: unpacks 4-tuple `(start_idx, end_idx, doc_idx, block_idx)`
+#        from samples_mapping (helpers.cpp now stores block_id in column 3).
+#      - `titles_dataset[doc_idx]` → `title_dataset[doc_idx]`.
+#      - `context_dataset[i]` → `block_dataset[i]`.
+#      - Local variable `context` renamed to `block` throughout __getitem__.
+#      - `input` renamed to `query` throughout __getitem__.
+#      - Return dict keys updated:
+#            input_text  → query_tokens   input_types  → query_types
+#            input_pad_mask → query_pad_mask
+#            context_text → block_tokens  context_types → block_types
+#            context_pad_mask → block_pad_mask
+#      - Comment "may still need to truncate" → "still need to truncate".
+#      - "keep the query in the context 10%" → "keep the query in the block 10%".
+#      - get_samples_mapping() first parameter renamed `context_dataset` → `block_dataset`.
+#      - Assertions updated: context_dataset.doc_idx / .sizes → block_dataset.*.
+#      - helpers.build_blocks_mapping() call updated to pass block_dataset args.
+#
+#   3. deprecated_data_utils/datasets.py — InverseClozeDataset.__getitem__ dict:
+#      - `input_types` key renamed to `query_types`.
+#      - `context_types` key renamed to `block_types`.
+#      (input_text, input_pad_mask, context_text, context_pad_mask unchanged.)
+#
+#   4. helpers.cpp — build_blocks_mapping_impl():
+#      - Added `int32_t block_id = 0` counter before the epoch loop.
+#      - Map stride changed from 3 → 4 (adds a 4th column for block_id).
+#      - maps[map_index_0 + 3] = block_id stored at Populate-the-map site.
+#      - block_id incremented alongside map_index.
+#      - block_id reset to 0 at the end of each epoch.
+#      - maps allocation: `3*map_index` → `4*map_index`.
+#      - Fisher-Yates shuffle updated: i0/j0 use multiplier 4; swap of [+3].
+#      - Return shape/strides: {num_samples, 3} → {num_samples, 4};
+#        stride {3*byte_size, byte_size} → {4*byte_size, byte_size}.
+#
+#   5. bert_model.py — ICTBertModel:
+#      - Docstring added: "Bert-based module for Inverse Cloze task."
+#      - `question_model` → `query_model`; `_question_key` → `_query_key`
+#        (but checkpoint key string kept as 'question_model' for compat).
+#      - `context_model` → `block_model`; `_context_key` → `_block_key`
+#        (but checkpoint key string kept as 'context_model' for compat).
+#      - Comments clarifying roles: query_model = Embed_input, block_model = Embed_doc.
+#      - forward() signature: `input_*` → `query_*`; `context_*` → `block_*`.
+#      - `return_logits` parameter removed; forward now always returns
+#        `(query_logits, block_logits)` — the dot-product score moved to caller.
+#      - forward docstring added.
+#      - state_dict_for_save_checkpoint() docstring added.
+#      - load_state_dict() docstring changed: "Customized load." →
+#        "Load the state dicts of each of the models" (no trailing period).
+#
+#   6. training.py — train_step():
+#      - Three `torch.cuda.synchronize()` calls removed (after forward, after
+#        backward, after optimizer step) — they were slowing training without
+#        correctness benefit in the distributed setting.
+#
+#   7. pretrain_bert_ict.py — overall refactor:
+#      - `from megatron.utils import make_data_loader` import removed.
+#      - get_batch(): keys list updated to new field names:
+#            ['input_text', 'input_types', 'input_pad_mask',
+#             'context_text', 'context_types', 'context_pad_mask']
+#          → ['query_tokens', 'query_types', 'query_pad_mask',
+#              'block_tokens', 'block_types', 'block_pad_mask']
+#      - data_b unpacking: all local variable names updated to match.
+#      - forward_step(): variable names updated; model() call updated;
+#        dot-product `retrieval_scores` moved from model to caller
+#        (query_logits.matmul(block_logits.T)).
+#      - get_train_val_test_data() function replaced by
+#        train_valid_test_datasets_provider(train_val_test_num_samples)
+#        which now receives the sample counts from the pretrain() framework
+#        rather than computing them itself; make_data_loader calls removed.
+#      - pretrain() call at __main__: first arg updated to
+#        train_valid_test_datasets_provider.
+#
+#   8. ict_qualitative_test.py — deleted upstream; not ported.
+#
+# Neuron_SP adaptation:
+#   The functions below capture each change as a named helper/doc function
+#   following the M-series pattern.  Existing _m62_* helpers that expose the
+#   old dict key names are superseded by the _m189_* versions.
+# ---------------------------------------------------------------------------
+
+print('[M189]')
+
+
+def _m189_ict_dataset_init_params():
+    """M189: Megatron 4abd7ce27 — InverseClozeDataset.__init__ parameter renames.
+
+    Before (M62 / earlier):
+        def __init__(self, name, context_dataset, titles_dataset, ...)
+
+    After (M189):
+        def __init__(self, name, block_dataset, title_dataset, ...)
+
+    Callers that previously passed `context_dataset=` / `titles_dataset=`
+    kwargs must update to `block_dataset=` / `title_dataset=`.
+
+    Returns a (old_names, new_names) pair for documentation purposes.
+    """
+    old_names = ('context_dataset', 'titles_dataset')
+    new_names = ('block_dataset', 'title_dataset')
+    return old_names, new_names
+
+
+def _m189_ict_dataset_getitem_keys():
+    """M189: Megatron 4abd7ce27 — InverseClozeDataset.__getitem__ dict key renames.
+
+    The sample dict returned by __getitem__ changes all six keys:
+
+      Before (M62):                    After (M189):
+        'input_text'       →             'query_tokens'
+        'input_types'      →             'query_types'
+        'input_pad_mask'   →             'query_pad_mask'
+        'context_text'     →             'block_tokens'
+        'context_types'    →             'block_types'
+        'context_pad_mask' →             'block_pad_mask'
+
+    Callers of InverseClozeDataset.__getitem__ (and get_batch() in
+    pretrain_bert_ict.py) must update all key references.
+
+    Returns (old_keys, new_keys) tuples.
+    """
+    old_keys = (
+        'input_text', 'input_types', 'input_pad_mask',
+        'context_text', 'context_types', 'context_pad_mask',
+    )
+    new_keys = (
+        'query_tokens', 'query_types', 'query_pad_mask',
+        'block_tokens', 'block_types', 'block_pad_mask',
+    )
+    return old_keys, new_keys
+
+
+def _m189_getitem_inverse_cloze(ict_dataset, idx):
+    """M189: Megatron 4abd7ce27 — updated __getitem__ for InverseClozeDataset.
+
+    Supersedes _m62_getitem_inverse_cloze.  Key differences:
+
+      1. samples_mapping now stores 4-tuples: (start_idx, end_idx, doc_idx, block_idx)
+         because helpers.cpp build_blocks_mapping_impl now records block_id in
+         column 3 (stride changed from 3 to 4).
+
+      2. All dict keys renamed per _m189_ict_dataset_getitem_keys():
+           input_text  → query_tokens    input_types  → query_types
+           input_pad_mask → query_pad_mask
+           context_text → block_tokens   context_types → block_types
+           context_pad_mask → block_pad_mask
+
+      3. Local variable `input` renamed to `query`; `context` renamed to `block`.
+
+      4. `title_dataset` used (was `titles_dataset`).
+      5. `block_dataset` used (was `context_dataset`).
+
+    Args:
+        ict_dataset: an InverseClozeDataset-like object exposing:
+            - samples_mapping: array of shape (N, 4) with columns
+              [start_idx, end_idx, doc_idx, block_idx]
+            - block_dataset: the indexed token dataset for blocks
+            - title_dataset: the indexed token dataset for titles
+            - max_seq_length: int
+            - rng: random.Random instance (seeded at init)
+            - concat_and_pad_tokens(tokens, title=None): returns
+              (tokens, token_types, pad_mask)
+        idx (int): dataset index.
+
+    Returns:
+        dict with keys: query_tokens, query_types, query_pad_mask,
+                        block_tokens, block_types, block_pad_mask.
+    """
+    import numpy as np
+
+    start_idx, end_idx, doc_idx, block_idx = ict_dataset.samples_mapping[idx]
+    title = list(ict_dataset.title_dataset[int(doc_idx)])
+    block = [list(ict_dataset.block_dataset[i]) for i in range(start_idx, end_idx)]
+    assert len(block) > 1
+
+    # avoid selecting the first or last sentence to be the query.
+    if len(block) == 2:
+        rand_sent_idx = int(ict_dataset.rng.random() > 0.5)
+    else:
+        rand_sent_idx = ict_dataset.rng.randint(1, len(block) - 2)
+
+    # keep the query in the block 10% of the time.
+    if ict_dataset.rng.random() < 0.1:
+        query = block[rand_sent_idx].copy()
+    else:
+        query = block.pop(rand_sent_idx)
+
+    # still need to truncate because blocks are concluded when
+    # the sentence lengths have exceeded max_seq_length.
+    import itertools
+    query = query[:ict_dataset.max_seq_length - 2]
+    block = list(itertools.chain(*block))[:ict_dataset.max_seq_length - (3 + len(title))]
+
+    query_tokens, query_token_types, query_pad_mask = ict_dataset.concat_and_pad_tokens(query)
+    block_tokens, block_token_types, block_pad_mask = ict_dataset.concat_and_pad_tokens(block, title)
+
+    sample = {
+        'query_tokens': np.array(query_tokens),
+        'query_types': np.array(query_token_types),
+        'query_pad_mask': np.array(query_pad_mask),
+        'block_tokens': np.array(block_tokens),
+        'block_types': np.array(block_token_types),
+        'block_pad_mask': np.array(block_pad_mask),
+    }
+    return sample
+
+
+def _m189_deprecated_datasets_key_renames():
+    """M189: Megatron 4abd7ce27 — deprecated_data_utils/datasets.py dict key renames.
+
+    InverseClozeDataset.__getitem__ in megatron/deprecated_data_utils/datasets.py
+    (the older, pre-data-pipeline implementation) had a partial rename applied:
+
+      'input_types'   → 'query_types'
+      'context_types' → 'block_types'
+
+    The other four keys (input_text, input_pad_mask, context_text, context_pad_mask)
+    were NOT renamed in this commit in the deprecated module — only the two
+    _types keys changed.  This function documents that asymmetry.
+
+    Returns (changed_keys, unchanged_keys) for audit purposes.
+    """
+    changed = {'input_types': 'query_types', 'context_types': 'block_types'}
+    unchanged = ('input_text', 'input_pad_mask', 'context_text', 'context_pad_mask')
+    return changed, unchanged
+
+
+def _m189_helpers_cpp_block_id_change():
+    """M189: Megatron 4abd7ce27 — helpers.cpp build_blocks_mapping stride 3→4.
+
+    build_blocks_mapping_impl in megatron/data/helpers.cpp changed the output
+    array from 3 columns to 4 columns by adding a `block_id` field:
+
+      Column 0: start sentence index  (prev_start_index)
+      Column 1: end sentence index    (sent_index + 1)
+      Column 2: document index        (doc)
+      Column 3: block id              (block_id)  ← NEW in M189
+
+    Downstream callers (InverseClozeDataset.__getitem__) must unpack 4-tuples:
+        start_idx, end_idx, doc_idx, block_idx = samples_mapping[idx]
+
+    instead of the previous 3-tuple:
+        start_idx, end_idx, doc_idx = samples_mapping[idx]
+
+    The block_id counter resets to 0 at the start of each epoch, so block_idx
+    is epoch-local (not globally unique across epochs).
+
+    The Fisher-Yates shuffle in the second pass operates on 4-element strides
+    and swaps the block_id column along with the other three.
+
+    Returns a summary dict for documentation.
+    """
+    return {
+        'old_stride': 3,
+        'new_stride': 4,
+        'new_column_index': 3,
+        'new_column_name': 'block_id',
+        'epoch_reset': True,
+        'getitem_unpack': '(start_idx, end_idx, doc_idx, block_idx)',
+    }
+
+
+def _m189_ict_bert_model_renames():
+    """M189: Megatron 4abd7ce27 — ICTBertModel attribute and forward() renames.
+
+    megatron/model/bert_model.py::ICTBertModel changes:
+
+    Attribute renames (Python names):
+        question_model → query_model   (_question_key → _query_key)
+        context_model  → block_model   (_context_key  → _block_key)
+
+    Checkpoint key strings UNCHANGED for backward compatibility:
+        _query_key = 'question_model'   (was and still is 'question_model')
+        _block_key = 'context_model'    (was and still is 'context_model')
+
+    forward() signature rename:
+        input_tokens / input_attention_mask / input_types   → query_*
+        context_tokens / context_attention_mask / context_types → block_*
+
+    forward() return value change:
+        Before: optionally returns (question_logits, context_logits, retrieval_scores)
+                when return_logits=True; otherwise returns retrieval_scores tensor.
+        After:  always returns (query_logits, block_logits) — the dot-product
+                retrieval score computation moved to the caller (forward_step in
+                pretrain_bert_ict.py).
+
+    Returns a summary dict for documentation.
+    """
+    return {
+        'attr_renames': {
+            'question_model': 'query_model',
+            'context_model': 'block_model',
+        },
+        'checkpoint_keys_unchanged': {
+            '_query_key': 'question_model',
+            '_block_key': 'context_model',
+        },
+        'return_logits_removed': True,
+        'retrieval_score_moved_to_caller': True,
+    }
+
+
+def _m189_training_synchronize_removed():
+    """M189: Megatron 4abd7ce27 — torch.cuda.synchronize() calls removed from train_step.
+
+    Three explicit synchronization barriers were removed from
+    megatron/training.py::train_step():
+
+        timers('forward').stop()
+        torch.cuda.synchronize()   ← removed
+
+        timers('backward').stop()
+        torch.cuda.synchronize()   ← removed
+
+        timers('optimizer').stop()
+        torch.cuda.synchronize()   ← removed
+
+    Rationale: in a distributed training setting these synchronize() calls
+    serialise all ranks at each sub-step boundary, hurting throughput without
+    correctness benefit.  NCCL collectives in backward/optimizer already
+    provide the necessary ordering.
+
+    DeepSpeed note: DeepSpeedEngine.train_batch() does not insert equivalent
+    synchronize() calls; this upstream removal aligns Megatron's behaviour with
+    DeepSpeed's existing practice.
+    """
+    pass
+
+
+def _m189_pretrain_ict_dataset_provider(args):
+    """M189: Megatron 4abd7ce27 — train_valid_test_datasets_provider for ICT.
+
+    Replaces get_train_val_test_data() in pretrain_bert_ict.py.
+
+    Key differences from the old function:
+      1. Receives train_val_test_num_samples from the pretrain() framework
+         instead of computing it internally.
+      2. Returns (train_ds, valid_ds, test_ds) dataset objects — not DataLoaders.
+         The pretrain() framework handles DataLoader creation.
+      3. make_data_loader calls removed.
+      4. Multi-rank guarding (if mpu.get_model_parallel_rank() == 0) removed;
+         build_train_valid_test_datasets is called unconditionally.
+
+    Args:
+        args: Megatron/DeepSpeed args namespace with fields:
+              data_path, data_impl, split, seq_length, mask_prob,
+              short_seq_prob, seed, mmap_warmup.
+
+    Returns a (build_kwargs, ict_dataset=True) pair for documentation purposes.
+    (Actual dataset construction requires the build_train_valid_test_datasets
+    function from bert_dataset.py which is not duplicated here.)
+    """
+    build_kwargs = dict(
+        data_prefix=args.data_path,
+        data_impl=args.data_impl,
+        splits_string=args.split,
+        max_seq_length=args.seq_length,
+        masked_lm_prob=args.mask_prob,
+        short_seq_prob=args.short_seq_prob,
+        seed=args.seed,
+        skip_warmup=(not args.mmap_warmup),
+        ict_dataset=True,
+    )
+    return build_kwargs
+
+
+def _m189_get_batch_keys():
+    """M189: Megatron 4abd7ce27 — get_batch() key list update in pretrain_bert_ict.py.
+
+    The keys list used to broadcast and unpack a data batch changes from:
+        ['input_text', 'input_types', 'input_pad_mask',
+         'context_text', 'context_types', 'context_pad_mask']
+    to:
+        ['query_tokens', 'query_types', 'query_pad_mask',
+         'block_tokens', 'block_types', 'block_pad_mask']
+
+    Returns (old_keys, new_keys) for documentation.
+    """
+    old_keys = ['input_text', 'input_types', 'input_pad_mask',
+                'context_text', 'context_types', 'context_pad_mask']
+    new_keys = ['query_tokens', 'query_types', 'query_pad_mask',
+                'block_tokens', 'block_types', 'block_pad_mask']
+    return old_keys, new_keys
+# --- End M189 dataloader ---
