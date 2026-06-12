@@ -3021,3 +3021,64 @@ def _m328_gpt2_get_train_valid_test_split_import_source():
     return get_train_valid_test_split_
 
 # --- End M328 dataloader ---
+
+
+# ===========================================================================
+# M408: Megatron 7ce373f3d — Bugfix in megatron/training.py: correct
+#       global_batch_size computation
+# ===========================================================================
+#
+# Upstream source:
+#   megatron/training.py  → deepspeed/runtime/dataloader.py
+#
+# Key change carried over:
+#   training.py, build_train_valid_test_data_iterators(), line ~719:
+#     Before: global_batch_size = args.batch_size * data_parallel_size
+#     After:  global_batch_size = args.batch_size * data_parallel_size \
+#                                  * args.num_microbatches_in_minibatch
+#
+#   Without the num_microbatches_in_minibatch factor the number of training
+#   samples requested from the dataset was under-counted, causing the
+#   DataLoader to exhaust examples before training completed.
+#
+# Neuron_SP adaptation:
+#   Neuron_SP mirrors the fixed computation in
+#   _m408_build_train_valid_test_data_iterators_global_batch_size().
+#   The helper reproduces the corrected formula and is the canonical
+#   reference for any caller that needs to pre-compute the global batch
+#   size for dataset sizing purposes (e.g. train_val_test_num_samples).
+# ---------------------------------------------------------------------------
+
+print('[M408]')
+
+
+def _m408_build_train_valid_test_data_iterators_global_batch_size(args,
+                                                                   data_parallel_size):
+    """M408: Megatron 7ce373f3d — correct global_batch_size for dataset sizing.
+
+    Before this fix global_batch_size was computed as:
+        global_batch_size = args.batch_size * data_parallel_size
+
+    This under-counted the true number of samples consumed per iteration
+    when num_microbatches_in_minibatch > 1, causing the data loader to run
+    out of training examples prematurely.
+
+    The corrected formula:
+        global_batch_size = args.batch_size
+                            * data_parallel_size
+                            * args.num_microbatches_in_minibatch
+
+    Args:
+        args: parsed argument namespace; must expose .batch_size and
+              .num_microbatches_in_minibatch.
+        data_parallel_size (int): result of mpu.get_data_parallel_world_size().
+
+    Returns:
+        int: corrected global batch size to use when computing
+             train_val_test_num_samples.
+    """
+    num_microbatches = getattr(args, 'num_microbatches_in_minibatch', 1)
+    global_batch_size = args.batch_size * data_parallel_size * num_microbatches
+    return global_batch_size
+
+# --- End M408 dataloader ---
