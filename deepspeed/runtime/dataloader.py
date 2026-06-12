@@ -1543,9 +1543,12 @@ def m120_preprocess_data(args):
     print('[M120] Time to startup:', startup_end - startup_start)
 
     log_interval = getattr(args, 'log_interval', 100)
+    print('[M539]')
     for i, (doc, bytes_processed) in enumerate(encoded_docs, start=1):
         total_bytes_processed += bytes_processed
         for key, sentences in doc.items():
+            if len(sentences) == 0:
+                continue
             for sentence in sentences:
                 builders[key].add_item(_torch.IntTensor(sentence))
             builders[key].end_document()
