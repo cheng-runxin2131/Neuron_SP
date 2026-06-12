@@ -36,6 +36,7 @@ from deepspeed.utils import logger
 from deepspeed.runtime.utils import copy_to_device, move_to_device, see_memory_usage
 from deepspeed.utils.timer import SynchronizedWallClockTimer as Timers, FORWARD_GLOBAL_TIMER
 from deepspeed.utils.bwc import bwc_tensor_model_parallel_rank
+from deepspeed.runtime.activation_checkpointing.memory import allocate_mem_buff
 from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime import compiler
 
@@ -71,6 +72,51 @@ PROFILE_TIME = False
 
 # Default name for the model parallel rng tracker.
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
+
+# M358: Whether apply model parallelism to checkpointed hidden states.
+# Megatron commit d6c4248b7 — added splitting checkpointed activations
+_CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER = None
+DISTRIBUTE_CHECKPOINTED_ACTIVATIONS = False
+
+
+def init_checkpointed_activations_memory_buffer(numel, dtype):
+    """Initialize the memory buffer for the checkpointed activations.
+    Ported from Megatron-LM mpu/random.py (M358)."""
+    print('[M358]')
+    global _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER
+    _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER = allocate_mem_buff(
+        'checkpointed activations', numel, dtype, track_usage=False)
+
+
+def reset_checkpointed_activations_memory_buffer():
+    """Reset the memory used for checkpointing.
+    Ported from Megatron-LM mpu/random.py (M358)."""
+    if _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER is not None:
+        _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER.reset()
+
+
+def split_tensor_into_1d_equal_chunks(tensor):
+    """Break a tensor into equal 1D chunks across model parallel group.
+    Ported from Megatron-LM mpu/random.py (M358)."""
+    data = tensor.view(-1)
+    partition_size = torch.numel(data) // mp_size
+    start_index = partition_size * mp_rank
+    end_index = start_index + partition_size
+    return data[start_index:end_index]
+
+
+def gather_split_1d_tensor(tensor):
+    """Opposite of split_tensor_into_1d_equal_chunks; gather across model parallel ranks.
+    Ported from Megatron-LM mpu/random.py (M358)."""
+    numel = torch.numel(tensor)
+    numel_gathered = mp_size * numel
+    gathered = torch.empty(numel_gathered, dtype=tensor.dtype,
+                           device=get_accelerator().current_device_name(),
+                           requires_grad=False)
+    chunks = [gathered[i * numel:(i + 1) * numel] for i in range(mp_size)]
+    torch.distributed.all_gather(chunks, tensor, group=mp_group)
+    return gathered
+
 
 # Sentinel: populated on first RNG state capture; used for Knuth invariant checks.
 # A value of None means "not yet observed" (first add() call sets it).
@@ -664,6 +710,15 @@ class CheckpointFunction(torch.autograd.Function):
         with torch.no_grad():
             outputs = run_function(*inputs_cuda)
 
+        # M358: Divide hidden states across model parallel group and only keep
+        # the chunk corresponding to the current rank.
+        # Ported from Megatron-LM CheckpointFunction.forward (d6c4248b7).
+        if _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER is not None:
+            ctx.input_0_shape = args[0].data.shape
+            args[0].data = split_tensor_into_1d_equal_chunks(args[0].data)
+            args[0].data = _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER.add(
+                args[0].data)
+
         see_memory_usage("After running forward on the layer", force=False)
         del inputs_cuda
 
@@ -741,6 +796,14 @@ class CheckpointFunction(torch.autograd.Function):
             if t is not None and hasattr(t, 'saved_data') and t.saved_data is not None:
                 t.data = t.saved_data.to(t.device)
                 t.saved_data = None
+
+        # M358: Gather split checkpointed activations back across model parallel group.
+        # Ported from Megatron-LM CheckpointFunction.backward (d6c4248b7).
+        if _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER is not None:
+            ctx.deepspeed_saved_tensors[0].data = gather_split_1d_tensor(
+                ctx.deepspeed_saved_tensors[0].data)
+            ctx.deepspeed_saved_tensors[0].data = \
+                ctx.deepspeed_saved_tensors[0].data.view(ctx.input_0_shape)
 
         if PARTITION_ACTIVATIONS:
             # with get_accelerator().stream(transport_stream):
@@ -1080,6 +1143,10 @@ def checkpoint(function, *args):
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint. """
 
+    # M358: Make sure memory is freed before running checkpointed forward.
+    # Mirrors Megatron-LM ParallelTransformer.forward (d6c4248b7).
+    reset_checkpointed_activations_memory_buffer()
+
     all_outputs = []
     CheckpointFunction.apply(function, all_outputs, *args)
     if len(all_outputs) == 1:
@@ -1146,7 +1213,7 @@ def _configure_defaults():
     global mpu, num_layers, deepspeed_checkpointing_enabled
 
     global PARTITION_ACTIVATIONS, CONTIGUOUS_CHECKPOINTING, \
-        CPU_CHECKPOINT, SYNCHRONIZE, PROFILE_TIME
+        CPU_CHECKPOINT, SYNCHRONIZE, PROFILE_TIME, DISTRIBUTE_CHECKPOINTED_ACTIVATIONS
 
     PARTITION_ACTIVATIONS = False
     CONTIGUOUS_CHECKPOINTING = False
@@ -1154,6 +1221,7 @@ def _configure_defaults():
     CPU_CHECKPOINT = False
     SYNCHRONIZE = False
     PROFILE_TIME = False
+    DISTRIBUTE_CHECKPOINTED_ACTIVATIONS = False
     deepspeed_checkpointing_enabled = True
 
 
@@ -1166,6 +1234,7 @@ def configure(
     checkpoint_in_cpu=None,
     synchronize=None,
     profile=None,
+    distribute_checkpointed_activations=None,
 ):
     """Configure DeepSpeed Activation Checkpointing.
 
@@ -1205,7 +1274,7 @@ def configure(
     global mpu, num_layers, deepspeed_checkpointing_enabled
 
     global PARTITION_ACTIVATIONS, CONTIGUOUS_CHECKPOINTING, \
-        CPU_CHECKPOINT, SYNCHRONIZE, PROFILE_TIME
+        CPU_CHECKPOINT, SYNCHRONIZE, PROFILE_TIME, DISTRIBUTE_CHECKPOINTED_ACTIVATIONS
 
     _configure_defaults()
 
@@ -1232,6 +1301,11 @@ def configure(
 
     if profile is not None:
         PROFILE_TIME = profile
+
+    # M358: distribute checkpointed activations across model parallel group.
+    # Ported from Megatron-LM arguments.py / initialize.py (d6c4248b7).
+    if distribute_checkpointed_activations is not None:
+        DISTRIBUTE_CHECKPOINTED_ACTIVATIONS = distribute_checkpointed_activations
 
     if CONTIGUOUS_CHECKPOINTING:
         assert PARTITION_ACTIVATIONS, "Contiguous Checkpointing is only available with partitioned activations. Set partitioned activations to true in deepspeed config"
