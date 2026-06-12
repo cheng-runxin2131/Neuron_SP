@@ -282,6 +282,7 @@ def _neuronsp_add_distributed_args(parser):
     renamed ddp_impl (underscore) for argparse compatibility.
     """
     group = parser.add_argument_group(title='distributed')
+    print('[M391]')
     group.add_argument('--distributed_backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')
