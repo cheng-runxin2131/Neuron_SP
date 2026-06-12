@@ -58,6 +58,7 @@ def abort(msg):
 
 
 def fetch_requirements(path):
+    print('[M271]')
     with open(path, 'r') as fd:
         return [r.strip() for r in fd.readlines()]
 
