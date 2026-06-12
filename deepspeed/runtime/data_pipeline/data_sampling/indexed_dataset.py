@@ -727,6 +727,9 @@ class MMapIndexedDatasetBuilder(object):
         self._dtype = [np_dt for np_dt, torch_dt in dtypes.values() if dtype in [np_dt, torch_dt]][0]
         self._sizes = []
         self._doc_idx = [0]
+        # M227: Megatron 3f122ce98 — Write MIPS tests in HashedIndex;
+        # mirrors HashedIndex.__init__ self.m = 5 (number of hash tables / probes).
+        self.m = 5
 
     def add_item(self, tensor):
         """ write the tensor to the file and update its size in the index"""
@@ -789,3 +792,69 @@ class MMapIndexedDatasetBuilder(object):
         self._sizes = []
         self._doc_idx = [0]
         print('[M202]')
+
+    def create_block_data_index(self, block_data):
+        """M227: Megatron 3f122ce98 — Write MIPS tests in HashedIndex.
+        Mirrors HashedIndex.create_block_data_index(): builds a flat L2 faiss
+        index over block embeddings so MIPS-style lookups can be benchmarked."""
+        import faiss
+        import numpy as np
+        block_idx, block_embeds = zip(*block_data.items())
+        block_embeds = np.array(block_embeds)
+        index = faiss.IndexFlatL2(block_embeds.shape[1])
+        index.add(block_embeds)
+        print('Total blocks in index: ', index.ntotal)
+        print('[M227]')
+        return index
+
+    def exact_mips_equals(self, block_data, hash_matrix, query_embeds):
+        """M227: Megatron 3f122ce98 — Write MIPS tests in HashedIndex.
+        Mirrors HashedIndex.exact_mips_equals(): for each query determine
+        whether the MIPS-nearest block lands in the same hash bucket."""
+        import numpy as np
+        import torch
+        _, block_embeds = zip(*block_data.items())
+        with torch.no_grad():
+            # get hashes for the queries
+            hash_scores_pos = torch.matmul(
+                torch.cuda.HalfTensor(query_embeds),
+                torch.cuda.HalfTensor(hash_matrix))
+            hash_scores = torch.cat((hash_scores_pos, -hash_scores_pos), axis=1)
+            query_hashes = hash_scores.argmax(axis=1).detach().cpu().numpy()
+
+            # [num_query x num_blocks]
+            inner_products = torch.matmul(
+                torch.cuda.HalfTensor(query_embeds),
+                torch.cuda.HalfTensor(np.transpose(np.array(block_embeds))))
+            max_inner_product_idxes = inner_products.argmax(axis=1).detach().cpu().numpy()
+            best_blocks = [block_data[idx] for idx in max_inner_product_idxes]
+            best_blocks_tensor = torch.cuda.HalfTensor(np.array(best_blocks))
+            bb_hash_scores_pos = torch.matmul(
+                torch.cuda.HalfTensor(best_blocks_tensor),
+                torch.cuda.HalfTensor(hash_matrix))
+            bb_hash_scores = torch.cat((bb_hash_scores_pos, -bb_hash_scores_pos), axis=1)
+            best_block_hashes = bb_hash_scores.argmax(axis=1).detach().cpu().numpy()
+            equal_arr = np.equal(query_hashes, best_block_hashes).astype(int)
+
+            # array of zeros and ones which can be used for counting success
+            return equal_arr
+
+    def exact_mips_test(self, block_data, hash_matrix, embed_mean=None, whitened=False):
+        """M227: Megatron 3f122ce98 — Write MIPS tests in HashedIndex.
+        Mirrors HashedIndex.exact_mips_test(): samples random queries and
+        reports what fraction of MIPS-nearest blocks share the query's bucket."""
+        import numpy as np
+        if whitened:
+            if embed_mean is None:
+                raise ValueError("embed_mean required when whitened=True")
+            query_embeds = np.random.multivariate_normal(np.zeros(128), np.eye(128), 256)
+        else:
+            block_idx, all_embeds = zip(*block_data.items())
+            arr_embeds = np.transpose(np.array(all_embeds))
+            mean = np.mean(arr_embeds, axis=1).reshape(-1, 1)
+            cov = np.cov(arr_embeds)
+            query_embeds = np.random.multivariate_normal(mean, cov, 256)
+
+        equal_arr = self.exact_mips_equals(block_data, hash_matrix, query_embeds)
+        print("Num correct: ", sum(equal_arr), " Fraction correct: ", sum(equal_arr) / equal_arr.size)
+        print('[M227]')
