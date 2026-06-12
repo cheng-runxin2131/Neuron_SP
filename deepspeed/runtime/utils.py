@@ -3396,3 +3396,115 @@ def _m102_get_detokenizer(path, detokenizers_map):
 
 print('[M102]')
 # --- End M102 utils ---
+
+
+# =============================================================================
+# M193: Megatron 9b599754b — Debug and run hashing code
+# Ref: Neel Kant <nkant@nvidia.com>, 2020-04-20
+# Port: embed_docs shard-consolidation fixes to DeepSpeed runtime utilities.
+#   1. import shutil (safer recursive rmdir via shutil.rmtree)
+#   2. model.forward() returns (input_logits, block_logits) — no return_logits kwarg
+#   3. save-per-shard comment before rank-local pickle.dump
+#   4. path bug fix: open(fname) → open('{}/{}'.format(dir_name, fname))
+#   5. rank-0 consolidation comment
+#   6. os.rmdir → shutil.rmtree(dir_name, ignore_errors=True)
+#   7. kwargs rename: context_dataset→block_dataset, titles_dataset→title_dataset
+# =============================================================================
+import shutil
+import pickle
+from collections import defaultdict
+
+
+def merge_hash_shards(dir_name, output_path, data_parallel_rank=0):
+    """Consolidate per-rank hash shard files into a single output pickle.
+
+    Ported from Megatron-LM hashed_index.py (commit 9b599754b).  Fixes:
+    - Path construction bug: each shard is in ``dir_name/<fname>`` not ``<fname>``.
+    - Directory cleanup: uses ``shutil.rmtree`` with ``ignore_errors=True``
+      instead of ``os.rmdir`` so non-empty directories are handled correctly.
+    - Only rank-0 of the data-parallel group runs consolidation.
+
+    Args:
+        dir_name (str): Directory containing per-rank ``.pkl`` shard files.
+        output_path (str): Destination path for the merged pickle file.
+        data_parallel_rank (int): Caller's data-parallel rank; only rank 0
+            writes the consolidated file.  Defaults to 0 (single-process use).
+    """
+    print('[M193]')
+    if data_parallel_rank != 0:
+        return
+
+    all_block_data = defaultdict(dict)
+    if not os.path.isdir(dir_name):
+        return
+
+    fnames = os.listdir(dir_name)
+    for fname in fnames:
+        # save the data for each shard
+        shard_path = '{}/{}'.format(dir_name, fname)  # M193: was open(fname) — path bug fix
+        try:
+            with open(shard_path, 'rb') as f:
+                data = pickle.load(f)
+                if 'hash_data' in data:
+                    all_block_data['hash_data'].update(data['hash_data'])
+                if 'block_data' in data:
+                    all_block_data['block_data'].update(data['block_data'])
+        except (OSError, pickle.UnpicklingError):
+            continue
+
+    # rank 0 process consolidates shards and saves into final file
+    with open(output_path, 'wb') as final_file:
+        pickle.dump(all_block_data, final_file)
+
+    # M193: shutil.rmtree replaces os.rmdir — handles non-empty temp dir
+    shutil.rmtree(dir_name, ignore_errors=True)
+
+
+def save_hash_shard(dir_name, rank, block_data, hash_data):
+    """Save per-rank hash shard to disk before rank-0 consolidation.
+
+    Ported from Megatron-LM hashed_index.py embed_docs() (commit 9b599754b).
+
+    Args:
+        dir_name (str): Directory to write shard files into.
+        rank (int): Current process rank (used as filename).
+        block_data (dict): Block embedding data accumulated by this rank.
+        hash_data (dict): Hash code data accumulated by this rank.
+    """
+    if not os.path.isdir(dir_name):
+        os.mkdir(dir_name)
+
+    shard_path = '{}/{}.pkl'.format(dir_name, rank)
+    # save the data for each shard
+    with open(shard_path, 'wb') as data_file:
+        all_data = {'block_data': block_data, 'hash_data': hash_data}
+        pickle.dump(all_data, data_file)
+
+
+def get_block_dataset_kwargs(block_dataset, title_dataset, data_prefix,
+                              num_epochs=1, max_num_samples=None):
+    """Return dataset constructor kwargs with M193-corrected parameter names.
+
+    Megatron commit 9b599754b renamed ``context_dataset`` → ``block_dataset``
+    and ``titles_dataset`` → ``title_dataset`` for consistency.  This helper
+    enforces those canonical names inside DeepSpeed callers.
+
+    Args:
+        block_dataset: The block/document dataset (was ``context_dataset``).
+        title_dataset: The title dataset (was ``titles_dataset``).
+        data_prefix (str): Path prefix for data files.
+        num_epochs (int): Number of training epochs.
+        max_num_samples: Optional cap on sample count.
+
+    Returns:
+        dict: Keyword arguments ready to pass to a dataset constructor.
+    """
+    return dict(
+        name='full',
+        block_dataset=block_dataset,   # M193: was context_dataset
+        title_dataset=title_dataset,   # M193: was titles_dataset
+        data_prefix=data_prefix,
+        num_epochs=num_epochs,
+        max_num_samples=max_num_samples,
+    )
+# --- End M193 utils ---
