@@ -2306,6 +2306,161 @@ def _m189_get_batch_keys():
     return old_keys, new_keys
 # --- End M189 dataloader ---
 
+# ---------------------------------------------------------------------------
+# M212: Megatron 24034e036 — Revise dataset_type
+# Ported from:
+#   megatron/data/bert_dataset.py  → deepspeed/runtime/dataloader.py
+#   pretrain_realm.py              → deepspeed/runtime/dataloader.py
+#
+# Key changes carried over:
+#
+#   1. bert_dataset.py — build_train_valid_test_datasets():
+#      - Added `from megatron.data.realm_dataset import RealmDataset` import.
+#      - Introduced module-level constant:
+#            DATASET_TYPES = ['standard_bert', 'ict', 'realm']
+#      - Function signature: `ict_dataset=False` parameter replaced by
+#            `dataset_type='standard_bert'`
+#        (keyword-only default; callers passing ict_dataset=True must now pass
+#         dataset_type='ict' instead).
+#      - Guard added immediately after the parameter:
+#            if dataset_type not in DATASET_TYPES:
+#                raise ValueError("Invalid dataset_type: ", dataset_type)
+#      - Branch condition: `if ict_dataset:` → `if dataset_type == 'ict':`
+#        (controls title_dataset creation for ICT path; unchanged logic).
+#      - Inner per-split branch `if ict_dataset:` → `if dataset_type == 'ict':`
+#        (selects InverseClozeDataset; unchanged logic).
+#      - else-branch: single `dataset = BertDataset(...)` replaced by
+#            dataset_cls = BertDataset if dataset_type == 'standard_bert' else RealmDataset
+#            dataset = dataset_cls(indexed_dataset=indexed_dataset,
+#                                  masked_lm_prob=masked_lm_prob, **kwargs)
+#        so that dataset_type='realm' routes to RealmDataset without a
+#        separate conditional branch.
+#      - Blank line added after the dataset_cls assignment for readability.
+#
+#   2. pretrain_realm.py — train_valid_test_datasets_provider():
+#      - Call to build_train_valid_test_datasets() updated:
+#            skip_warmup=(not args.mmap_warmup)
+#        → skip_warmup=(not args.mmap_warmup),
+#           dataset_type='realm'
+#        (trailing comma added; new kwarg appended on a new line).
+#      - This replaces any implicit ict_dataset=False default and explicitly
+#        routes REALM pretraining to RealmDataset via the new dispatch path.
+#
+# Neuron_SP adaptation:
+#   _m212_dataset_types() — documents the new DATASET_TYPES constant.
+#   _m212_build_train_valid_test_datasets_sig() — documents the signature change.
+#   _m212_build_bert_datasets_kwargs_realm() — builds kwargs for realm pretrain,
+#     mirroring _m189_pretrain_ict_dataset_provider() for the 'realm' case.
+#   _m212_pretrain_realm_dataset_provider() — documents the pretrain_realm.py
+#     train_valid_test_datasets_provider() with dataset_type='realm'.
+# ---------------------------------------------------------------------------
+
+print('[M212]')
+
+
+def _m212_dataset_types():
+    """M212: Megatron 24034e036 — DATASET_TYPES constant in bert_dataset.py.
+
+    The module-level constant introduced by this commit enumerates all valid
+    values for the new `dataset_type` parameter of build_train_valid_test_datasets().
+
+    Returns:
+        list[str]: the three recognised dataset type strings.
+    """
+    return ['standard_bert', 'ict', 'realm']
+
+
+def _m212_build_train_valid_test_datasets_sig():
+    """M212: Megatron 24034e036 — signature change in bert_dataset.py.
+
+    Before this commit the function accepted a boolean flag:
+        build_train_valid_test_datasets(..., ict_dataset=False)
+
+    After this commit it accepts a string discriminator with validation:
+        build_train_valid_test_datasets(..., dataset_type='standard_bert')
+        # raises ValueError if dataset_type not in DATASET_TYPES
+
+    The new dispatch logic in the else-branch:
+        dataset_cls = BertDataset if dataset_type == 'standard_bert' else RealmDataset
+        dataset = dataset_cls(indexed_dataset=indexed_dataset,
+                              masked_lm_prob=masked_lm_prob, **kwargs)
+
+    Returns a (old_param, new_param, dispatch_logic) tuple for documentation.
+    """
+    old_param = ('ict_dataset', False)
+    new_param = ('dataset_type', 'standard_bert')
+    dispatch_logic = {
+        'ict': 'InverseClozeDataset (title_dataset path)',
+        'standard_bert': 'BertDataset',
+        'realm': 'RealmDataset',
+    }
+    return old_param, new_param, dispatch_logic
+
+
+def _m212_build_bert_datasets_kwargs_realm(args):
+    """M212: Megatron 24034e036 — build kwargs for REALM pretrain dataset provider.
+
+    Mirrors _m189_pretrain_ict_dataset_provider() but sets dataset_type='realm'
+    instead of ict_dataset=True, reflecting the new build_train_valid_test_datasets()
+    signature introduced in this commit.
+
+    The REALM provider in pretrain_realm.py now passes:
+        skip_warmup=(not args.mmap_warmup),
+        dataset_type='realm',
+    where previously it omitted dataset_type entirely (defaulting to the old
+    ict_dataset=False behaviour which mapped to BertDataset, not RealmDataset).
+
+    Args:
+        args: Namespace with fields:
+              data_path, data_impl, split, seq_length, mask_prob,
+              short_seq_prob, seed, mmap_warmup.
+
+    Returns:
+        dict: keyword arguments ready to unpack into
+              build_train_valid_test_datasets(**kwargs).
+    """
+    return dict(
+        data_prefix=args.data_path,
+        data_impl=args.data_impl,
+        splits_string=args.split,
+        max_seq_length=args.seq_length,
+        masked_lm_prob=args.mask_prob,
+        short_seq_prob=args.short_seq_prob,
+        seed=args.seed,
+        skip_warmup=(not args.mmap_warmup),
+        dataset_type='realm',
+    )
+
+
+def _m212_pretrain_realm_dataset_provider(args):
+    """M212: Megatron 24034e036 — updated train_valid_test_datasets_provider in pretrain_realm.py.
+
+    Before this commit the provider called build_train_valid_test_datasets()
+    without a dataset_type argument, inadvertently routing REALM pretraining
+    through the standard BertDataset path (ict_dataset defaulted to False).
+
+    After this commit dataset_type='realm' is passed explicitly, routing the
+    call to RealmDataset via the new dispatch logic in bert_dataset.py.
+
+    The change in pretrain_realm.py is minimal — one new kwarg line:
+        skip_warmup=(not args.mmap_warmup)           # before
+        skip_warmup=(not args.mmap_warmup),           # after (trailing comma)
+        dataset_type='realm'                          # after (new line)
+
+    DeepSpeed/Neuron_SP note: callers that construct BERT-family dataset kwargs
+    for REALM workloads should use _m212_build_bert_datasets_kwargs_realm()
+    rather than _m70_build_bert_datasets_kwargs() or
+    _m189_pretrain_ict_dataset_provider(), as neither of those sets
+    dataset_type='realm'.
+
+    Args:
+        args: Namespace — same contract as _m189_pretrain_ict_dataset_provider().
+
+    Returns:
+        dict: build kwargs with dataset_type='realm'.
+    """
+    return _m212_build_bert_datasets_kwargs_realm(args)
+# --- End M212 dataloader ---
 
 # ---------------------------------------------------------------------------
 # M214: Megatron f7f730e1d — Write pretrain_realm.py and misc dataset_type
