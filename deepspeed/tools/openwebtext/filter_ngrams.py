@@ -248,6 +248,8 @@ if __name__ == '__main__':
     parser.add_argument('--remove-char-each-side', type=int, default=200,
                        help='Maximum size of ngram to use.')
 
+    parser.add_argument('--num-threads', type=int, default=40,
+                       help='Number of threads to use')
     args = parser.parse_args()
 
     # Build ngrams
@@ -273,7 +275,8 @@ if __name__ == '__main__':
             len(ngrams), ngrams_freq_sorted[0][0], ngrams_freq_sorted[len(\
             ngrams_freq_sorted) -1 ][0]), flush=True)
 
-    id_prefix = '-'.join(args.tasks[::2])
+    #id_prefix = '-'.join(args.tasks[::2])
+    id_prefix = '-'.join(args.tasks[::1])
 
     print('Reading file {} and deduping n-grams'.format(args.dedup_dataset))
 
@@ -287,7 +290,7 @@ if __name__ == '__main__':
     dedup_key = args.dedup_dataset[1]
 
     # Setup multi-processing.
-    num_workers = 1 #40
+    num_workers = args.num_threads
     fin = open(dedup_file, 'r', encoding='utf-8')
     pool = multiprocessing.Pool(num_workers)
     free_ngram_x=partial(free_ngram, args=args, key=dedup_key, ngrams=ngrams, \
@@ -311,11 +314,15 @@ if __name__ == '__main__':
                 split_mt_thld += 1
 
             for i in range(len(text_buf_ngram_free)):
+                if "split_id" in myjson:
+                    use_prefix = myjson["split_id"] + "-"
+                else:
+                    use_prefix = ""
                 split_id_string = id_prefix + '-{:010d}'.format(int(counter)) \
-                    + '-{:010d}'.format(int(i))
-                outjson = json.dumps({"text":text_buf_ngram_free[i], 
-                    id_prefix+"_split_id":split_id_string},
-                    ensure_ascii=False)
+                    + '-{:04d}'.format(int(i))
+                myjson["text"] = text_buf_ngram_free[i]
+                myjson["split_id"] = use_prefix + split_id_string
+                outjson = json.dumps(myjson, ensure_ascii=False)
                 out_f.write(outjson.encode('utf-8'))
                 out_f.write('\n'.encode('utf-8'))
 
@@ -332,4 +339,5 @@ if __name__ == '__main__':
     print("Total docs {} splitted {} ignored {} docs with many splits {}"\
         " trimmed {}".format(counter, splitted, ignored, split_mt_thld, \
         trimmed_count), flush=True)
+    print('[M623]')
     print('done :-)')

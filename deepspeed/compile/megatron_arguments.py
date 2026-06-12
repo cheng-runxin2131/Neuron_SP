@@ -565,6 +565,39 @@ def add_virtual_pipeline_arg(parser):
     return parser
 
 # ---------------------------------------------------------------------------
+# M598: Megatron 0aff3629e — Update argument names and fix merge error
+# Source: megatron/arguments.py (NVIDIA/Megatron-LM commit 0aff3629e)
+# Author: Rewon Child <rchild@nvidia.com>  Date: 2021-03-04
+#
+# Mapping: megatron/arguments.py → deepspeed/compile/megatron_arguments.py
+#
+# Change ported from arguments.py _add_logging_args():
+#   Before: group.add_argument('--log-zeros', action='store_true',
+#               help='If set, calculate and log the number of zeros in gradient.')
+#   After:  group.add_argument('--log-num-zeros-in-grad', action='store_true',
+#               help='If set, calculate and log the number of zeros in gradient.')
+#
+# Companion renames in optimizer/__init__.py and optimizer/optimizer.py:
+#   args.log_zeros → args.log_num_zeros_in_grad
+#   self.log_zeros → self.log_num_zeros_in_grad
+#   num_zeros      → num_zeros_in_grad  (local variable + return value)
+#
+# Also fixes a merge conflict in training.py train_step():
+#   <<<<<<< HEAD:  update_successfull, grad_norm, num_zeros = optimizer.step()
+#   >>>>>>> main:  update_successful, grad_norm = optimizer.step()
+#   Resolved to:   update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+#
+# DeepSpeed adaptation (documentation only — no functional code change):
+#   DeepSpeed's engine does not currently use `log_zeros` / `log_num_zeros_in_grad`
+#   as a direct argument; gradient-zero counting is handled internally in
+#   deepspeed/runtime/zero/ and deepspeed/runtime/engine.py.
+#   This block documents the upstream rename so future argument bridging
+#   (args → DeepSpeed config) uses the correct canonical name.
+# ---------------------------------------------------------------------------
+
+print('[M598]')
+
+# ---------------------------------------------------------------------------
 # M610: Megatron 0d5188c15 — refactored the fused kernels build
 # Source: megatron/arguments.py (NVIDIA/Megatron-LM commit 0d5188c15)
 # Author: Mohammad Shoeybi <mshoeybi@nvidia.com>  Date: 2021-03-17
@@ -721,3 +754,58 @@ def validate_pipeline_mp_size_interleaved(args):
     print('[M616] validate_pipeline_mp_size_interleaved: '
           f'num_layers_per_virtual_pipeline_stage={num_layers_per_stage}, '
           f'pipeline_model_parallel_size={getattr(args, "pipeline_model_parallel_size", 1)}')
+
+# ---------------------------------------------------------------------------
+# M612: Megatron 0fa7175f0 — Bfloat fused softmax + fused layer norm
+# Source commit: 0fa7175f0936db7fbe303ca47b25fafca49ef032
+# Author: Mohammad Shoeybi <mshoeybi@nvidia.com>  Date: 2021-03-19
+#
+# Mapping:
+#   megatron/arguments.py           → deepspeed/compile/megatron_arguments.py
+#   megatron/fused_kernels/__init__ → deepspeed/fused_kernels/__init__.py
+#   megatron/model/__init__.py      → (no equivalent; LayerNorm import)
+#   megatron/model/fused_layer_norm → (no equivalent in this tree)
+#   megatron/model/fused_softmax.py → (no equivalent; FusedScaleMaskSoftmax)
+#   megatron/model/transformer.py   → deepspeed/model_implementations/transformers/
+#   megatron/optimizer/__init__     → (no equivalent)
+#   megatron/training.py            → deepspeed/runtime/engine.py
+#
+# Changes ported:
+#   1. megatron/arguments.py parse_args() bf16 block:
+#      REMOVED: `assert not args.masked_softmax_fusion`
+#      KEPT: `assert not args.bias_gelu_fusion`, `assert not args.bias_dropout_fusion`
+#      Rationale: fused softmax now supports bfloat16 (DISPATCH_HALF_AND_BFLOAT
+#      macro added in type_shim.h), so the restriction is lifted.
+#
+#   2. megatron/fused_kernels/__init__.py load():
+#      Mixed-precision fused layer norm is now loaded unconditionally
+#      (previously guarded by `if args.fp32_residual_connection`).
+#      Ported to deepspeed/fused_kernels/__init__.py — guard removed.
+#
+#   3. megatron/model/__init__.py:
+#      Removed `import_layernorm(fp32_residual_connection, bf16)` factory.
+#      Now directly re-exports `MixedFusedLayerNorm as LayerNorm`.
+#      No DeepSpeed equivalent to port (no import_layernorm in this tree).
+#
+#   4. megatron/model/fused_softmax.py FusedScaleMaskSoftmax:
+#      Added `input_in_bf16` parameter; introduced `self.input_in_float16`
+#      (= fp16 OR bf16). Dispatch and cast paths updated for bf16.
+#      No DeepSpeed equivalent to port.
+#
+#   5. megatron/model/transformer.py ParallelTransformerLayer:
+#      Removed 3× `if self.bf16 and self.fp32_residual_connection: .bfloat16()`
+#      casts after layernorm (now unnecessary since MixedFusedLayerNorm
+#      preserves dtype).  No DeepSpeed equivalent to port.
+#
+#   6. megatron/training.py get_model():
+#      Removed the `for module_ in model_.modules()` block that called
+#      `module_.float()` on LayerNorm params when bf16+fp32_residual was active.
+#      No DeepSpeed equivalent to port.
+#
+# DeepSpeed adaptation:
+#   - Only the fused_kernels/__init__.py and the arguments constraint change
+#     have equivalents in this codebase.  The model/optimizer changes are
+#     documented here for traceability.
+# ---------------------------------------------------------------------------
+
+print('[M612]')
