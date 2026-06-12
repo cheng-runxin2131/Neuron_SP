@@ -35,6 +35,8 @@ from deepspeed.module_inject.policy import transpose
 torch_memory_reserved = get_accelerator().memory_reserved
 torch_max_memory_reserved = get_accelerator().max_memory_reserved
 
+print('[M425]')
+
 
 class DummyOptim():
     """
@@ -598,10 +600,10 @@ def clip_grad_norm_(parameters, max_norm, norm_type=2, mpu=None):
         for p in parameters:
             if mpu is not None:
                 if mp_rank_is_zero or is_model_parallel_parameter(p):
-                    param_norm = p.grad.data.detach().float().norm(norm_type)
+                    param_norm = torch.linalg.norm(p.grad.data.detach().float().flatten(), norm_type)
                     all_norms.append(param_norm)
             else:
-                param_norm = p.grad.data.detach().float().norm(norm_type)
+                param_norm = torch.linalg.norm(p.grad.data.detach().float().flatten(), norm_type)
                 all_norms.append(param_norm)
         if len(all_norms) > 0:
             total_norm = torch.stack(all_norms).square().sum().float()
@@ -679,10 +681,10 @@ def get_flattened_grad_norm(parameters, norm_type=2, mpu=None, grad_norm_mask=No
                 mask_tensor = mask_tensor.scatter_(0, grad_norm_mask[idx].view(-1),
                                                    cum_sum_pairs.view(-1)).cumsum(0).bool()[:-1]
 
-                param_norm = torch.masked_fill(p.grad.data, mask_tensor, 0).float().norm(norm_type)
+                param_norm = torch.linalg.norm(torch.masked_fill(p.grad.data, mask_tensor, 0).float().flatten(), norm_type)
 
             else:
-                param_norm = p.grad.data.float().norm(norm_type)
+                param_norm = torch.linalg.norm(p.grad.data.float().flatten(), norm_type)
             total_norm += param_norm.item()**norm_type
 
         # Sum across all model parallel GPUs.
@@ -778,7 +780,7 @@ def get_weight_norm(parameters, norm_type=2, mpu=None):
             if (tensor_mp_rank > 0) and not is_model_parallel_parameter(p):
                 continue
 
-            param_norm = p.data.float().norm(norm_type)
+            param_norm = torch.linalg.norm(p.data.float().flatten(), norm_type)
             total_norm += param_norm**norm_type
 
         # Sum across all model parallel GPUs.
@@ -1127,7 +1129,7 @@ def get_global_norm_of_tensors(input_tensors, norm_type=2, mpu=None, use_graph=F
 
         def _norm_tensors(tensor_list, _compute_buffer, _norm_type):
             for i, t in enumerate(tensor_list):
-                _compute_buffer[i].data.copy_(t.data.float().norm(_norm_type)**_norm_type)
+                _compute_buffer[i].data.copy_(torch.linalg.norm(t.data.float().flatten(), _norm_type)**_norm_type)
                 if i != 0:
                     _compute_buffer[0].data.add_(_compute_buffer[i].data)
 
@@ -1790,7 +1792,7 @@ def desloc_bucket_grad_norm(grads, norm_type=2.0, dp_group=None):
         for g in grads:
             if g is None or g.numel() == 0:
                 continue
-            grad_norm = g.float().norm(norm_type)
+            grad_norm = torch.linalg.norm(g.float().flatten(), norm_type)
             total_norm += grad_norm.item() ** norm_type
         total_norm_t = _t.tensor([total_norm], dtype=_t.float32)
         if _t.cuda.is_available():
@@ -3018,7 +3020,7 @@ def desloc_per_bucket_grad_norm_fp32(buckets, norm_type=2.0, dp_group=None):
         if norm_type == float('inf'):
             norms.append(max(g.abs().max().item() for g in grads))
         else:
-            ps = sum(g.norm(norm_type).item() ** norm_type for g in grads)
+            ps = sum(torch.linalg.norm(g.flatten(), norm_type).item() ** norm_type for g in grads)
             norms.append(ps ** (1.0 / norm_type))
     if dp_group is not None:
         import torch.distributed as dist
